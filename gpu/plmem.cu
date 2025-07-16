@@ -76,7 +76,8 @@ void plmem_free_long_mem(longMemPtr *long_mem) {
 }
 
 void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int range_grid_size, int num_cut){
-    // data array
+    // data array	
+    cudaSetDevice(5);
     cudaMalloc(&dev_mem->d_ax, anchor_per_batch * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_ay, anchor_per_batch * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_sid, anchor_per_batch * sizeof(int8_t));
@@ -97,7 +98,9 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_long_seg_og, dev_mem->buffer_size_long / (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit) * sizeof(seg_t));
     cudaMalloc(&dev_mem->d_mid_seg_count, sizeof(unsigned int));
     cudaMalloc(&dev_mem->d_mid_seg, num_cut/(score_kernel_config.mid_seg_cutoff + 1) * sizeof(seg_t));
-
+    int currentDevice;
+    cudaGetDevice(&currentDevice);
+    fprintf(stderr, "Device ID:%d\n", currentDevice);
     size_t gpu_free_mem, gpu_total_mem;
     cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
 #ifdef DEBUG_PRINT
@@ -423,7 +426,7 @@ void plmem_config_kernels(cJSON *json) {
 
     cJSON *score_config_json = cJSON_GetObjectItem(json, "score_kernel");
     cudaDeviceProp device_prop;
-    cudaGetDeviceProperties(&device_prop, 0);
+    cudaGetDeviceProperties(&device_prop, 5);
     score_kernel_config.short_blockdim = device_prop.warpSize;
     score_kernel_config.long_blockdim = device_prop.maxThreadsPerBlock;
     score_kernel_config.mid_blockdim =
@@ -459,7 +462,7 @@ void plmem_config_stream(size_t *max_range_grid_, size_t *max_num_cut_, size_t m
     *max_num_cut_ = max_num_cut;
 
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    cudaGetDeviceProperties(&prop, 5);
     cudaCheck();
 
     if (*max_range_grid_ > prop.maxGridSize[0]) {
@@ -496,7 +499,7 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
 
     /* Determine configuration smartly */
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
+    cudaGetDeviceProperties(&prop, 5);
 
     size_t avail_mem_per_stream = (prop.totalGlobalMem / *num_stream_ ) * 0.9;
 
@@ -558,6 +561,7 @@ void plmem_initialize(size_t *max_total_n_, int *max_read_,
 void plmem_stream_initialize(size_t *max_total_n_,
                              int *max_read_, int *min_anchors_, char* gpu_config_file) {
 
+    cudaSetDevice(5);
     int num_stream;
     size_t max_anchors_stream, max_range_grid, max_num_cut, long_seg_buffer_size;
 

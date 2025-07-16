@@ -290,6 +290,7 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id, Misc misc
  */
 
 void plchain_cal_score_async(chain_read_t **reads_, int *n_read_, Misc misc, streamSetup_t stream_setup, int thread_id, void* km){
+	cudaSetDevice(5);
     chain_read_t* reads = *reads_;
     *reads_ = NULL;
     int n_read = *n_read_;
@@ -322,6 +323,10 @@ void plchain_cal_score_async(chain_read_t **reads_, int *n_read_, Misc misc, str
     fprintf(stderr, "[Info] %s (%s:%d) Launching Batch: n_read %d, total anchors %lu (mem usage: %.2f%%)\n", __func__, __FILE__, __LINE__, n_read, total_n, (float)total_n/stream_setup.max_anchors_stream*100);
 #endif // DEBUG_PRINT
 
+     /*int currentDevice;
+     cudaGetDevice(&currentDevice);
+     fprintf(stderr, "current Device %d\n", currentDevice);
+     */
     // reset long seg counters
     cudaMemsetAsync(stream_setup.streams[stream_id].dev_mem.d_long_seg_count, 0, sizeof(unsigned int),
                     stream_setup.streams[stream_id].cudastream);

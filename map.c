@@ -10,7 +10,9 @@
 #include "bseq.h"
 #include "khash.h"
 #include "gpu/plmanager.cuh"
+#include "ksw2.h"
 
+#define __AMD_SPLIT_KERNELS__ 1
 struct mm_tbuf_s {
 	void *km;
 	int rep_len, frag_gap; // updated per read. 
@@ -29,6 +31,7 @@ typedef struct{
     int count;			// number of reads in the batch
     size_t total_n;		// total number of anchors in the batch
     chain_read_t *reads;
+	align_read_t *reads_after_chain;
 } mm_batch_trbuf_t;
 
 // local variables required for each read processed by a CPU thread
@@ -71,7 +74,9 @@ void mm_trbuf_batch_init(mm_batch_trbuf_t *batch_, int batch_max_reads) {
     batch_->count = 0;
     batch_->total_n = 0;
     batch_->reads = (chain_read_t *)malloc(sizeof(chain_read_t) * batch_max_reads);
+	batch_->reads_after_chain = (align_read_t *)malloc(sizeof(align_read_t) * batch_max_reads);
     memset(batch_->reads, 0, sizeof(chain_read_t) * batch_max_reads);
+	memset(batch_->reads_after_chain, 0, sizeof(align_read_t) * batch_max_reads);
     batch_->batchid = -1;
     batch_->km = km_init();
 }
@@ -563,8 +568,20 @@ void mm_map_chain(const mm_idx_t *mi, const mm_mapopt_t *opt,
 	*frag_gap = max_chain_gap_ref;
 }
 
-void mm_map_align(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                  chain_read_t *read_, mm_reg1_t **regs, int *n_regs, mm_tbuf_t *b, void *km) {
+static inline mm_reg1_t *mm_insert_reg(const mm_reg1_t *r, int i, int *n_regs, mm_reg1_t *regs)
+{
+	regs = (mm_reg1_t*)realloc(regs, (*n_regs + 1) * sizeof(mm_reg1_t));
+	if (i + 1 != *n_regs)
+		memmove(&regs[i + 2], &regs[i + 1], sizeof(mm_reg1_t) * (*n_regs - i - 1));
+	regs[i + 1] = *r;
+	++*n_regs;
+	return regs;
+}
+extern int mm_align1_inv(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi, int qlen, uint8_t *qseq0[2], const mm_reg1_t *r1, const mm_reg1_t *r2, mm_reg1_t *r_inv, ksw_extz_t *ez);
+extern void mm_align1(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi, int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2, int n_a, mm128_t *a, ksw_extz_t *ez, int splice_flag);
+
+void pre_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                  chain_read_t *read_, align_read_t *read_after_chain,mm_reg1_t **regs, int *n_regs, mm_tbuf_t *b, void *km) {
     int n_segs = read_->n_seg;
     const int *qlens = read_->qlens;
     const char **seqs = read_->qseqs;
@@ -582,7 +599,8 @@ void mm_map_align(const mm_idx_t *mi, const mm_mapopt_t *opt,
     int max_chain_gap_ref = frag_gap;
 	int is_sr = !!(opt->flag & MM_F_SR);
 	uint32_t hash;
-	mm_reg1_t *regs0;
+	//mm_reg1_t *regs0;
+	mm_reg1_t **regs_align = &read_after_chain->regs0;
 	double *timers = b->timers;
 	double t1 = realtime();
 
@@ -592,25 +610,91 @@ void mm_map_align(const mm_idx_t *mi, const mm_mapopt_t *opt,
 	hash ^= __ac_Wang_hash(qlen_sum) + __ac_Wang_hash(opt->seed);
 	hash  = __ac_Wang_hash(hash);
 
-    regs0 = mm_gen_regs(km, hash, qlen_sum, *n_regs0, u, a, !!(opt->flag&MM_F_QSTRAND));
+    *regs_align = mm_gen_regs(km, hash, qlen_sum, *n_regs0, u, a, !!(opt->flag&MM_F_QSTRAND));
+	//regs0 = *regs_align;
 	if (mi->n_alt) {
-		mm_mark_alt(mi, *n_regs0, regs0);
-		mm_hit_sort(km, n_regs0, regs0, opt->alt_drop); // this step can be merged into mm_gen_regs(); will do if this shows up in profile
+		mm_mark_alt(mi, *n_regs0, *regs_align);
+		mm_hit_sort(km, n_regs0, *regs_align, opt->alt_drop); // this step can be merged into mm_gen_regs(); will do if this shows up in profile
 	}
 
 	if (mm_dbg_flag & (MM_DBG_PRINT_SEED|MM_DBG_PRINT_CHAIN))
 		for (j = 0; j < *n_regs0; ++j)
-			for (i = regs0[j].as; i < regs0[j].as + regs0[j].cnt; ++i)
+			for (i = (*regs_align)[j].as; i < (*regs_align)[j].as + (*regs_align)[j].cnt; ++i)
 				fprintf(stderr, "CN\t%d\t%s\t%d\t%c\t%d\t%d\t%d\n", j, mi->seq[a[i].x<<1>>33].name, (int32_t)a[i].x, "+-"[a[i].x>>63], (int32_t)a[i].y, (int32_t)(a[i].y>>32&0xff),
-						i == regs0[j].as? 0 : ((int32_t)a[i].y - (int32_t)a[i-1].y) - ((int32_t)a[i].x - (int32_t)a[i-1].x));
+						i == (*regs_align)[j].as? 0 : ((int32_t)a[i].y - (int32_t)a[i-1].y) - ((int32_t)a[i].x - (int32_t)a[i-1].x));
 
-	chain_post(opt, max_chain_gap_ref, mi, km, qlen_sum, n_segs, qlens, n_regs0, regs0, a);
+	chain_post(opt, max_chain_gap_ref, mi, km, qlen_sum, n_segs, qlens, n_regs0, *regs_align, a);
 	if (!is_sr && !(opt->flag&MM_F_QSTRAND)) {
-		mm_est_err(mi, qlen_sum, *n_regs0, regs0, a, n_mini_pos, *mini_pos);
-		*n_regs0 = mm_filter_strand_retained(*n_regs0, regs0);
+		mm_est_err(mi, qlen_sum, *n_regs0, *regs_align, a, n_mini_pos, *mini_pos);
+		*n_regs0 = mm_filter_strand_retained(*n_regs0, *regs_align);
 	}
 
-	if (n_segs == 1) { // uni-segment
+	assert(n_segs == 1); // only for uni-segment
+	assert((opt->flag & MM_F_CIGAR));
+	/*******************************
+	 * put part of mm_align_skeletion here for simplicity.
+	 * **************************************/
+
+	extern unsigned char seq_nt4_table[256];
+	int32_t skele_n_regs = *n_regs0, n_a;
+	uint8_t *qseq0[2];
+	ksw_extz_t ez;
+
+	// encode the query sequence
+	qseq0[0] = (uint8_t*)kmalloc(km, qlens[0] * 2);
+	qseq0[1] = qseq0[0] + qlens[0];
+	for (i = 0; i < qlens[0]; ++i) {
+		qseq0[0][i] = seq_nt4_table[(uint8_t)seqs[0][i]];
+		qseq0[1][qlens[0] - 1 - i] = qseq0[0][i] < 4? 3 - qseq0[0][i] : 4;
+	}
+
+	// align through seed hits
+	n_a = mm_squeeze_a(km, skele_n_regs, *regs_align, a);
+	memset(&ez, 0, sizeof(ksw_extz_t));
+	for (i = 0; i < skele_n_regs; ++i) {
+		mm_reg1_t r2;
+		if ((opt->flag&MM_F_SPLICE) && (opt->flag&MM_F_SPLICE_FOR) && (opt->flag&MM_F_SPLICE_REV)) { // then do two rounds of alignments for both strands
+			mm_reg1_t s[2], s2[2];
+			int which, trans_strand;
+			s[0] = s[1] = (*regs_align)[i];
+			mm_align1(km, opt, mi, qlens[0], qseq0, &s[0], &s2[0], n_a, a, &ez, MM_F_SPLICE_FOR);
+			mm_align1(km, opt, mi, qlens[0], qseq0, &s[1], &s2[1], n_a, a, &ez, MM_F_SPLICE_REV);
+			if (s[0].p->dp_score > s[1].p->dp_score) which = 0, trans_strand = 1;
+			else if (s[0].p->dp_score < s[1].p->dp_score) which = 1, trans_strand = 2;
+			else trans_strand = 3, which = (qlens[0] + s[0].p->dp_score) & 1; // randomly choose a strand, effectively
+			if (which == 0) {
+				(*regs_align)[i] = s[0], r2 = s2[0];
+				free(s[1].p);
+			} else {
+				(*regs_align)[i] = s[1], r2 = s2[1];
+				free(s[0].p);
+			}
+			(*regs_align)[i].p->trans_strand = trans_strand;
+		} else { // one round of alignment
+			/***************** now only this one round of alignment is taken into granted. *******************/
+			mm_align1(km, opt, mi, qlens[0], qseq0, &regs[i], &r2, n_a, a, &ez, opt->flag);
+			if (opt->flag&MM_F_SPLICE)
+				(*regs_align)[i].p->trans_strand = opt->flag&MM_F_SPLICE_FOR? 1 : 2;
+		}
+		if (r2.cnt > 0) regs = mm_insert_reg(&r2, i, &skele_n_regs, regs);
+		if (i > 0 && (*regs_align)[i].split_inv && !(opt->flag & MM_F_NO_INV)) {
+			if (mm_align1_inv(km, opt, mi, qlens[0], qseq0, &regs[i-1], &regs[i], &r2, &ez)) {
+				regs = mm_insert_reg(&r2, i, &skele_n_regs, regs);
+				++i; // skip the inserted INV alignment
+			}
+		}
+	}
+	*n_regs0 = skele_n_regs;
+	kfree(km, qseq0[0]);
+	kfree(km, ez.cigar);
+	mm_filter_regs(opt, qlens[0], n_regs0, regs);
+	if (!(opt->flag&MM_F_SR) && !opt->split_prefix && qlens[0] >= opt->rank_min_len) {
+		mm_update_dp_max(qlens[0], *n_regs0, regs, opt->rank_frac, opt->a, opt->b);
+		mm_filter_regs(opt, qlens[0], n_regs0, regs);
+	}
+	mm_hit_sort(km, n_regs0, regs, opt->alt_drop);
+
+	/*if (n_segs == 1) { // uni-segment
 		regs0 = align_regs(opt, mi, km, qlens[0], seqs[0], n_regs0, regs0, a);
 		regs0 = (mm_reg1_t*)realloc(regs0, sizeof(*regs0) * *n_regs0);
 		mm_set_mapq(km, *n_regs0, regs0, opt->min_chain_score, opt->a, rep_len, is_sr);
@@ -628,12 +712,22 @@ void mm_map_align(const mm_idx_t *mi, const mm_mapopt_t *opt,
 		if (n_segs == 2 && opt->pe_ori >= 0 && (opt->flag&MM_F_CIGAR))
 			mm_pair(km, max_chain_gap_ref, opt->pe_bonus, opt->a * 2 + opt->b, opt->a, qlens, n_regs, regs); // pairing
 	}
-	timers[MM_TIME_ALIGN] += realtime() - t1;
+	timers[MM_TIME_ALIGN] += realtime() - t1;*/
+}
+
+void mm_map_align(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                  chain_read_t *read_, align_read_t *read_after_chain,mm_reg1_t **regs, int *n_regs, mm_tbuf_t *b, void *km) {
+    int n_segs = read_->n_seg;
+    uint64_t **mini_pos = &read_->mini_pos;
+    uint64_t *u = read_->u;
+    mm128_t *a = read_->a;
+
 
 	kfree(km, a);
 	kfree(km, u);
 	kfree(km, *mini_pos);
 }
+
 #endif
 
 void mm_map_frag(const mm_idx_t *mi, int n_segs, const int *qlens, const char **seqs, int *n_regs, mm_reg1_t **regs, mm_tbuf_t *b, const mm_mapopt_t *opt, const char *qname)
@@ -1004,6 +1098,108 @@ static void worker_for(void *_data, long i_in, int tid) {
 	km_destroy(km);
 }
 
+static void prepare_align_batch(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s) {
+
+	int i, off, j;
+	for(int iread = 0; iread < batch->count; iread++) {
+		i = batch->reads[iread].seq.i;	
+		off = s->seg_off[i];
+		j = batch->reads[iread].seq.seg_id;
+		pre_align_helper(s->p->mi, s->p->opt, &batch->reads[iread], &batch->reads_after_chain[iread],&s->reg[off + j], &s->n_reg[off + j], b, batch->km) ;
+	}
+
+
+    
+}
+/*
+static void launch_gpu_align_batch(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s) {
+    if (batch->count == 0) return;
+
+    int max_qlen = 0, max_tlen = 0;
+    for (int i = 0; i < batch->count; ++i) {
+        chain_read_t *cr = &batch->reads[i];
+        max_qlen = max(max_qlen, cr->seq.qlen_sum);
+        for (int j = 0; j < cr->n_regs; ++j) {  // Assume one reg per read for batch; extend if multi
+            max_tlen = max(max_tlen, cr->regs[j].tlen);
+        }
+    }
+
+    // Pack batch data (similar to chain pack: packed_query_batch etc.)
+    uint32_t *h_packed_q = (uint32_t*)kmalloc(km, batch->count * ((max_qlen + 3)/4) * sizeof(uint32_t));  // Pack uint8_t to uint32 (2 nt per 16-bit? adjust for NT4)
+    uint32_t *h_packed_t = (uint32_t*)kmalloc(km, batch->count * ((max_tlen + 3)/4) * sizeof(uint32_t));
+    uint32_t *h_q_lens = (uint32_t*)kmalloc(km, batch->count * sizeof(uint32_t));
+    uint32_t *h_t_lens = (uint32_t*)kmalloc(km, batch->count * sizeof(uint32_t));
+    uint32_t *h_q_offs = (uint32_t*)kmalloc(km, batch->count * sizeof(uint32_t));
+    uint32_t *h_t_offs = (uint32_t*)kmalloc(km, batch->count * sizeof(uint32_t));
+    // Pack loops: for each read, pack qseq0[0], tseq from regs[0] (primary), cumulative offsets
+
+    int off_q = 0, off_t = 0;
+    for (int i = 0; i < batch->count; ++i) {
+        chain_read_t *cr = &batch->reads[i];
+        h_q_lens[i] = cr->seq.qlen_sum;
+        h_t_lens[i] = cr->regs[0].tlen;  // Primary
+        h_q_offs[i] = off_q;
+        h_t_offs[i] = off_t;
+
+        // Pack qseq (simplified: memcpy uint8 to uint32, bit-pack 2 nt/byte)
+        // ... (implement pack: for(j=0; j<qlen; j+=2) h_packed_q[off_q++] = (qseq[j]<<4 | qseq[j+1]) <<16 | ... adjust for agatha)
+        off_q += (cr->seq.qlen_sum + 3)/4;
+        // Similar for tseq
+        off_t += (cr->regs[0].tlen + 3)/4;
+    }
+
+    // Device alloc & copy
+    uint32_t *d_packed_q, *d_packed_t, *d_q_lens, *d_t_lens, *d_q_offs, *d_t_offs;
+    gasal_res_t *d_res;
+    cudaMalloc(&d_packed_q, off_q * sizeof(uint32_t));
+    cudaMalloc(&d_packed_t, off_t * sizeof(uint32_t));
+    cudaMalloc(&d_q_lens, batch->count * sizeof(uint32_t));
+    cudaMalloc(&d_t_lens, batch->count * sizeof(uint32_t));
+    cudaMalloc(&d_q_offs, batch->count * sizeof(uint32_t));
+    cudaMalloc(&d_t_offs, batch->count * sizeof(uint32_t));
+    cudaMalloc(&d_res, batch->count * sizeof(gasal_res_t));
+    cudaMemcpy(d_packed_q, h_packed_q, off_q * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    // ... similar cudaMemcpy for others
+
+    // Mat & params to device
+    int8_t *d_mat;
+    cudaMalloc(&d_mat, 25 * sizeof(int8_t));
+    int8_t h_mat[25];
+    ksw_gen_simple_mat(5, h_mat, opt->a, opt->b, opt->sc_ambi);
+    cudaMemcpy(d_mat, h_mat, 25 * sizeof(int8_t), cudaMemcpyHostToDevice);
+
+    // Global buffer for agatha
+    short2 *d_global_top;
+    cudaMalloc(&d_global_top, max_qlen * (256/8) * 1 * 3 * sizeof(short2));  // Assume grid=1, block=256
+
+    // Launch kernel (adapt sig for mat/gaps/zdrop)
+    dim3 block(256);
+    dim3 grid(1);  // Single block for simplicity; tune for batch
+    size_t shm = 1024 * sizeof(int32_t);  // antidiag_max etc.
+    agatha_kernel<<<grid, block, shm>>>(d_packed_q, d_packed_t, d_q_lens, d_t_lens, d_q_offs, d_t_offs,
+                                        d_res, NULL, (uint4*)d_mat, batch->count, max_qlen, d_global_top,
+                                        opt->q, opt->e, opt->zdrop);  // Pass gaps/zdrop
+
+    cudaDeviceSynchronize();
+    gasal_res_t *h_res = (gasal_res_t*)kmalloc(km, batch->count * sizeof(gasal_res_t));
+    cudaMemcpy(h_res, d_res, batch->count * sizeof(gasal_res_t), cudaMemcpyDeviceToHost);
+
+    // Update regs from results (score, ends for cigar backtrack)
+    for (int i = 0; i < batch->count; ++i) {
+        chain_read_t *cr = &batch->reads[i];
+        mm_reg1_t *r = &cr->regs[0];  // Primary
+        r->p->dp_score = h_res[i].aln_score;
+        // Backtrack cigar using ends (implement mm_backtrack_from_ends or similar)
+        // e.g., ksw_backtrack_scattered(...) using h_res[i].query_batch_end, h_res[i].target_batch_end
+        // Assume: mm_update_cigar_from_ends(km, opt, r, h_res[i].query_batch_end, h_res[i].target_batch_end);
+    }
+
+    // Cleanup
+    kfree(km, h_packed_q); kfree(km, h_packed_t); // ... others
+    kfree(km, h_res);
+    cudaFree(d_packed_q); // ... all d_*
+}
+*/
 static void old_worker_for(void *_data, long i_in, int tid) // kt_for() callback
 {
     step_t *s = (step_t *)_data;
@@ -1183,12 +1379,17 @@ static void old_worker_for(void *_data, long i_in, int tid) // kt_for() callback
 				s->frag_gap[off + k] = batch->reads[iread].frag_gap;
 			}
 		}
-		// Align
+		// GPU Align
+		prepare_align_batch(batch, b, s);	
+
+		//launch_gpu_align_batch(batch, b, s);	
+
+		// After Align
 		for (iread = 0; iread < batch->count; iread++) {
 			i = batch->reads[iread].seq.i;
 			off = s->seg_off[i];
 			j = batch->reads[iread].seq.seg_id;
-			mm_map_align(s->p->mi, s->p->opt, &batch->reads[iread], &s->reg[off + j], &s->n_reg[off + j], b, batch->km) ;
+			//mm_map_align(s->p->mi, s->p->opt, &batch->reads[iread], &s->reg[off + j], &s->n_reg[off + j], b, batch->km) ;
 			if (s->p->opt->flag & MM_F_INDEPEND_SEG) {
 				if (s->n_seg[i] == 2 && ((j == 0 && (pe_ori >> 1 & 1)) ||
 											(j == 1 && (pe_ori & 1)))) {

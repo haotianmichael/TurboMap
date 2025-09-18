@@ -84,6 +84,18 @@ typedef struct seg_t {
 #endif // DEBUG_VERBOSE
 } seg_t;
 
+/* Align Options */
+typedef struct{
+
+}gasal_res_t;
+
+typedef struct {
+    mm_reg1_t *regs0;  // regions to be aligned after chaining
+
+   
+}align_read_t;
+
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus

@@ -17,7 +17,7 @@
 #include "planalyze.cuh"
 #include "debug.h"
 #endif // DEBUG_CHECK
-
+#define CUDA_DEVICE 0
 // utils functions
 struct
 {
@@ -290,7 +290,7 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id, Misc misc
  */
 
 void plchain_cal_score_async(chain_read_t **reads_, int *n_read_, Misc misc, streamSetup_t stream_setup, int thread_id, void* km){
-	cudaSetDevice(5);
+	cudaSetDevice(CUDA_DEVICE);
     chain_read_t* reads = *reads_;
     *reads_ = NULL;
     int n_read = *n_read_;

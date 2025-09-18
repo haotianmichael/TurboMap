@@ -9,6 +9,7 @@
 #include "mmpriv.h"
 #include "bseq.h"
 #include "khash.h"
+#include "gpu/plmanager.cuh"
 
 struct mm_tbuf_s {
 	void *km;
@@ -921,7 +922,89 @@ void mm_trbuf_is_full(mm_trbuf_t* tr, step_t *s){
     }
 }
 
-static void worker_for(void *_data, long i_in, int tid) // kt_for() callback
+// Global queue instance
+static seeded_queue_t *g_seeded_queue = NULL;
+static void worker_for(void *_data, long i_in, int tid) {
+  	step_t *s = (step_t *)_data;
+    long i = i_in;
+    int j, iread, off, pe_ori = s->p->opt->pe_ori;
+	mm_tbuf_t *b = s->buf[tid];
+	void *km = km_init();
+
+	if(i == -1) {
+		mark_worker_finished(g_seeded_queue);
+		km_destroy(km);
+		return;
+	}
+
+	off  = s->seg_off[i];
+	assert(s->n_seg[i] <= MM_MAX_SEG);
+	if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+        fprintf(stderr, "QR\t%s\t%d\t%d\n", s->seq[off].name, tid, s->seq[off].l_seq);
+    }
+    
+    int n_indep_reads = (s->p->opt->flag & MM_F_INDEPEND_SEG) ? s->n_seg[i] : 1;
+
+	// Process each independent read
+    for (int read_idx = 0; read_idx < n_indep_reads; read_idx++) {
+        chain_read_t read;
+        memset(&read, 0, sizeof(chain_read_t));
+        
+        if (s->p->opt->flag & MM_F_INDEPEND_SEG) {
+            // Handle independent segments
+            j = read_idx;
+            read.qlens = (int *)kmalloc(km, sizeof(int));
+            read.qseqs = (const char **)kmalloc(km, sizeof(const char *));
+            
+            if (s->n_seg[i] == 2 && ((j == 0 && (pe_ori>>1&1)) || (j == 1 && (pe_ori&1))))
+                mm_revcomp_bseq(&s->seq[off + j]);
+                
+            read.qlens[0] = s->seq[off + j].l_seq;
+            read.qseqs[0] = s->seq[off + j].seq;
+            read.n_seg = 1;
+            
+            read.seq.i = i;
+            read.seq.seg_id = j;
+            strcpy(read.seq.name, s->seq[off + j].name);
+            read.seq.n_alt = s->p->mi->n_alt;
+            read.seq.is_alt = 0;
+        } else {
+            // Handle all segments together
+            read.qlens = (int *)kmalloc(km, s->n_seg[i] * sizeof(int));
+            read.qseqs = (const char **)kmalloc(km, s->n_seg[i] * sizeof(const char *));
+            read.n_seg = s->n_seg[i];
+            
+            for (j = 0; j < s->n_seg[i]; ++j) {
+                if (s->n_seg[i] == 2 && ((j == 0 && (pe_ori>>1&1)) || (j == 1 && (pe_ori&1))))
+                    mm_revcomp_bseq(&s->seq[off + j]);
+                read.qlens[j] = s->seq[off + j].l_seq;
+                read.qseqs[j] = s->seq[off + j].seq;
+            }
+            
+            read.seq.i = i;
+            read.seq.seg_id = 0;
+            strcpy(read.seq.name, s->seq[off].name);
+            read.seq.n_alt = s->p->mi->n_alt;
+            read.seq.is_alt = 0;
+        }
+        
+        // Perform seeding
+        mm_map_seed(s->p->mi, s->p->opt, &read, b, km);
+        
+        if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+            fprintf(stderr, "SEED\t%s\t%d\t%d_anchors\n", read.seq.name, tid, read.n);
+        }
+        
+        // Store thread ID for later use
+        read.thread_id = tid;
+        
+        // Push to global seeded queue
+        push_seeded_read(g_seeded_queue, &read);
+    }
+	km_destroy(km);
+}
+
+static void old_worker_for(void *_data, long i_in, int tid) // kt_for() callback
 {
     step_t *s = (step_t *)_data;
     long i = i_in;
@@ -1267,6 +1350,83 @@ static void merge_hits(step_t *s)
 	km_destroy(km);
 }
 
+#if defined(__AMD_SPLIT_KERNELS__)
+
+// GPU batch consumer function
+static void* gpu_batch_consumer(void *data) {
+    step_t *s = (step_t*)data;
+    chain_read_t batch[10];
+    int batch_count = 0;
+    chain_read_t read;
+    
+    while (pop_seeded_read(g_seeded_queue, &read)) {
+        batch[batch_count] = read;
+        
+        // Check if batch is full or should be dispatched
+        if (batch_count >= 100) {
+            // Dispatch batch to GPU
+            if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                fprintf(stderr, "DISPATCH_BATCH\t%d_reads\tto_GPU\n", batch_count);
+            }
+            
+            // TODO: Call your GPU chaining+alignment function here
+            // gpu_chain_align_batch(s->p->mi, s->p->opt, batch, batch_count);
+            
+            batch_count = 0;
+        }
+    }
+    
+    // Process remaining reads in partial batch
+    if (batch_count > 0) {
+        if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+            fprintf(stderr, "DISPATCH_FINAL_BATCH\t%d_reads\tto_GPU\n", batch_count);
+        }
+        // TODO: Call your GPU chaining+alignment function here
+        // gpu_chain_align_batch(s->p->mi, s->p->opt, batch, batch_count);
+    }
+    
+    return NULL;
+}
+
+static void* kt_worker_manager(void *shared, void *in) {
+	pipeline_t *p = (pipeline_t*)shared;
+
+	step_t *s = (step_t *)in;
+    
+    /* Initialize global seeded queue if not exists
+    if (g_seeded_queue == NULL) {
+        int queue_capacity = p->opt->gpu_chain_max_reads; // allocate only one chunk
+        g_seeded_queue = init_seeded_queue(queue_capacity, p->n_threads);
+    }*/
+    
+    // Set batch parameters
+    if (p->opt->flag & MM_F_GPU_CHAIN) {
+        s->batch_max_anchors = p->opt->gpu_chain_max_anchors;  // 2000000000
+        s->batch_max_reads = p->opt->gpu_chain_max_reads; // 2000000
+        s->gpu_min_n = p->opt->gpu_chain_min_n; // 512
+    } else {
+        s->batch_max_anchors = SIZE_MAX;
+        s->batch_max_reads = N_ACCUM;
+    }
+    
+    //Reset finished workers counter
+    /*pthread_mutex_lock(&g_seeded_queue->mutex);
+    g_seeded_queue->finished_workers = 0;
+    pthread_mutex_unlock(&g_seeded_queue->mutex);*/
+	
+
+	for (int i = 0; i < p->n_threads; ++i)
+		s->trbuf[i] = mm_trbuf_init(s->batch_max_reads, p->opt);
+
+	if (p->n_parts > 0) merge_hits((step_t*)in);
+	else kt_for(p->n_threads, old_worker_for, in, s->n_frag);
+	/*else kt_for_async(p->n_threads, worker_for, in, s->n_frag, 
+                    gpu_batch_consumer, s);*/
+
+	return in;
+}
+#endif
+
 static void *worker_pipeline(void *shared, int step, void *in)
 {
 	int i, j, k;
@@ -1306,22 +1466,8 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		} else free(s);
     } else if (step == 1) { // step 1: map
 #if defined(__AMD_SPLIT_KERNELS__)
-        step_t *s = (step_t *)in;
-        if (p->opt->flag & MM_F_GPU_CHAIN) {
-            s->batch_max_anchors = p->opt->gpu_chain_max_anchors;
-			// fprintf(stderr, "s->batch_max_anchors = %lu, p->opt->gpu_chain_max_anchors = %lu\n", s->batch_max_anchors, p->opt->gpu_chain_max_anchors);
-            s->batch_max_reads = p->opt->gpu_chain_max_reads;
-            s->gpu_min_n = p->opt->gpu_chain_min_n;
-        } else {
-            s->batch_max_anchors = SIZE_MAX;
-            s->batch_max_reads = N_ACCUM;
-        }
-        for (i = 0; i < p->n_threads; ++i)
-            s->trbuf[i] = mm_trbuf_init(s->batch_max_reads, p->opt);
+		return kt_worker_manager(shared, in);
 #endif
-		if (p->n_parts > 0) merge_hits((step_t*)in);
-		else kt_for(p->n_threads, worker_for, in, ((step_t*)in)->n_frag);
-		return in;
     } else if (step == 2) { // step 2: output
 		void *km = 0;
 		step_t *s = (step_t*)in;

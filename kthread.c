@@ -81,6 +81,54 @@ void kt_for(int n_threads, void (*func)(void*,long,int), void *data, long n)
 	}
 }
 
+// Async kt_for with consumer callback
+void kt_for_async(int n_threads, void (*producer_func)(void*,long,int), void *producer_data, long n,
+                  void (*consumer_func)(void*), void *consumer_data) {
+    if (n_threads > 1) {
+        int i;
+        kt_for_t t;
+        pthread_t *tid, consumer_tid;
+        
+        t.func = producer_func;
+        t.data = producer_data;
+        t.n_threads = n_threads;
+        t.n = n;
+        t.w = (ktf_worker_t*)calloc(n_threads, sizeof(ktf_worker_t));
+        tid = (pthread_t*)calloc(n_threads, sizeof(pthread_t));
+        
+        for (i = 0; i < n_threads; ++i)
+            t.w[i].t = &t, t.w[i].i = i;
+        
+        // Start consumer thread first
+        //pthread_create(&consumer_tid, 0, (void *(*)(void *))consumer_func, consumer_data);
+        
+        // Start producer threads
+        for (i = 0; i < n_threads; ++i) 
+            pthread_create(&tid[i], 0, ktf_worker, &t.w[i]);
+        
+        // Wait for all producer threads to finish
+        for (i = 0; i < n_threads; ++i) 
+            pthread_join(tid[i], 0);
+        
+        // Wait for consumer thread to finish
+        pthread_join(consumer_tid, 0);
+        
+        free(tid);
+        free(t.w);
+    } else {
+        // Single threaded case
+        pthread_t consumer_tid;
+        pthread_create(&consumer_tid, 0, (void *(*)(void *))consumer_func, consumer_data);
+        
+        long j;
+        for (j = 0; j < n; ++j) 
+            producer_func(producer_data, j, 0);
+        producer_func(producer_data, -1, 0); // signal end
+        
+        pthread_join(consumer_tid, 0);
+    }
+}
+
 /*****************
  * kt_pipeline() *
  *****************/

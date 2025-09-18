@@ -9,6 +9,7 @@
 #include "plrange.cuh"
 #include "plscore.cuh"
 #include <time.h>
+#define CUDA_DEVICE 0
 void plmem_malloc_host_mem(hostMemPtr *host_mem, size_t anchor_per_batch,
                            int range_grid_size, size_t buffer_size_long) {
 #ifdef DEBUG_PRINT
@@ -77,7 +78,7 @@ void plmem_free_long_mem(longMemPtr *long_mem) {
 
 void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int range_grid_size, int num_cut){
     // data array	
-    cudaSetDevice(5);
+    cudaSetDevice(CUDA_DEVICE);
     cudaMalloc(&dev_mem->d_ax, anchor_per_batch * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_ay, anchor_per_batch * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_sid, anchor_per_batch * sizeof(int8_t));
@@ -426,7 +427,7 @@ void plmem_config_kernels(cJSON *json) {
 
     cJSON *score_config_json = cJSON_GetObjectItem(json, "score_kernel");
     cudaDeviceProp device_prop;
-    cudaGetDeviceProperties(&device_prop, 5);
+    cudaGetDeviceProperties(&device_prop, CUDA_DEVICE);
     score_kernel_config.short_blockdim = device_prop.warpSize;
     score_kernel_config.long_blockdim = device_prop.maxThreadsPerBlock;
     score_kernel_config.mid_blockdim =
@@ -462,7 +463,7 @@ void plmem_config_stream(size_t *max_range_grid_, size_t *max_num_cut_, size_t m
     *max_num_cut_ = max_num_cut;
 
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 5);
+    cudaGetDeviceProperties(&prop, CUDA_DEVICE);
     cudaCheck();
 
     if (*max_range_grid_ > prop.maxGridSize[0]) {
@@ -499,7 +500,7 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
 
     /* Determine configuration smartly */
     cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 5);
+    cudaGetDeviceProperties(&prop, CUDA_DEVICE);
 
     size_t avail_mem_per_stream = (prop.totalGlobalMem / *num_stream_ ) * 0.9;
 
@@ -561,7 +562,7 @@ void plmem_initialize(size_t *max_total_n_, int *max_read_,
 void plmem_stream_initialize(size_t *max_total_n_,
                              int *max_read_, int *min_anchors_, char* gpu_config_file) {
 
-    cudaSetDevice(5);
+    cudaSetDevice(CUDA_DEVICE);
     int num_stream;
     size_t max_anchors_stream, max_range_grid, max_num_cut, long_seg_buffer_size;
 

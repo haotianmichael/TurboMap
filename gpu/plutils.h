@@ -70,6 +70,8 @@ typedef struct {
     uint64_t *u;      // scores for chains
     int n_u;          // number of chains formed from anchors == n_reg0
 
+    int thread_id;
+
 } chain_read_t;
 
 typedef struct seg_t {

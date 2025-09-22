@@ -581,7 +581,7 @@ extern int mm_align1_inv(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi, i
 extern void mm_align1(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi, int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2, int n_a, mm128_t *a, ksw_extz_t *ez, int splice_flag);
 
 void pre_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                  chain_read_t *read_, align_read_t *read_after_chain,mm_reg1_t **regs, int *n_regs, mm_tbuf_t *b, void *km) {
+                  chain_read_t *read_, align_read_t *read_after_chain, mm_tbuf_t *b, void *km) {
     int n_segs = read_->n_seg;
     const int *qlens = read_->qlens;
     const char **seqs = read_->qseqs;
@@ -599,40 +599,42 @@ void pre_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
     int max_chain_gap_ref = frag_gap;
 	int is_sr = !!(opt->flag & MM_F_SR);
 	uint32_t hash;
-	//mm_reg1_t *regs0;
-	mm_reg1_t **regs_align = &read_after_chain->regs0;
+	mm_reg1_t *regs0;
+	mm_reg1_t **regs_align = &read_after_chain->reg;
+	int *n_regs_align = &read_after_chain->n_reg;
 	double *timers = b->timers;
 	double t1 = realtime();
 
-	for (i = 0; i < n_segs; ++i) n_regs[i] = 0, regs[i] = 0; // initialize regs 
+	for (i = 0; i < n_segs; ++i) regs_align[i] = 0, n_regs_align[i] = 0; // initialize regs 
 
 	hash  = qname && !(opt->flag & MM_F_NO_HASH_NAME)? __ac_X31_hash_string(qname) : 0;
 	hash ^= __ac_Wang_hash(qlen_sum) + __ac_Wang_hash(opt->seed);
 	hash  = __ac_Wang_hash(hash);
 
-    *regs_align = mm_gen_regs(km, hash, qlen_sum, *n_regs0, u, a, !!(opt->flag&MM_F_QSTRAND));
+    regs0 = mm_gen_regs(km, hash, qlen_sum, *n_regs0, u, a, !!(opt->flag&MM_F_QSTRAND));
 	//regs0 = *regs_align;
 	if (mi->n_alt) {
-		mm_mark_alt(mi, *n_regs0, *regs_align);
-		mm_hit_sort(km, n_regs0, *regs_align, opt->alt_drop); // this step can be merged into mm_gen_regs(); will do if this shows up in profile
+		mm_mark_alt(mi, *n_regs0, regs0);
+		mm_hit_sort(km, n_regs0, regs0, opt->alt_drop); // this step can be merged into mm_gen_regs(); will do if this shows up in profile
 	}
 
 	if (mm_dbg_flag & (MM_DBG_PRINT_SEED|MM_DBG_PRINT_CHAIN))
 		for (j = 0; j < *n_regs0; ++j)
-			for (i = (*regs_align)[j].as; i < (*regs_align)[j].as + (*regs_align)[j].cnt; ++i)
+			for (i = regs0[j].as; i < regs0[j].as + regs0[j].cnt; ++i)
 				fprintf(stderr, "CN\t%d\t%s\t%d\t%c\t%d\t%d\t%d\n", j, mi->seq[a[i].x<<1>>33].name, (int32_t)a[i].x, "+-"[a[i].x>>63], (int32_t)a[i].y, (int32_t)(a[i].y>>32&0xff),
-						i == (*regs_align)[j].as? 0 : ((int32_t)a[i].y - (int32_t)a[i-1].y) - ((int32_t)a[i].x - (int32_t)a[i-1].x));
+						i == regs0[j].as? 0 : ((int32_t)a[i].y - (int32_t)a[i-1].y) - ((int32_t)a[i].x - (int32_t)a[i-1].x));
 
-	chain_post(opt, max_chain_gap_ref, mi, km, qlen_sum, n_segs, qlens, n_regs0, *regs_align, a);
+	chain_post(opt, max_chain_gap_ref, mi, km, qlen_sum, n_segs, qlens, n_regs0, regs0, a);
 	if (!is_sr && !(opt->flag&MM_F_QSTRAND)) {
-		mm_est_err(mi, qlen_sum, *n_regs0, *regs_align, a, n_mini_pos, *mini_pos);
-		*n_regs0 = mm_filter_strand_retained(*n_regs0, *regs_align);
+		mm_est_err(mi, qlen_sum, *n_regs0, regs0, a, n_mini_pos, *mini_pos);
+		*n_regs0 = mm_filter_strand_retained(*n_regs0, regs0);
 	}
 
-	assert(n_segs == 1); // only for uni-segment
+	//@FIXME: only for uni-segment
+	assert(n_segs == 1); 
 	assert((opt->flag & MM_F_CIGAR));
 	/*******************************
-	 * put part of mm_align_skeletion here for simplicity.
+	 *START: put part of mm_align_skeletion here for simplicity.
 	 * **************************************/
 
 	extern unsigned char seq_nt4_table[256];
@@ -649,70 +651,58 @@ void pre_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
 	}
 
 	// align through seed hits
-	n_a = mm_squeeze_a(km, skele_n_regs, *regs_align, a);
+	n_a = mm_squeeze_a(km, skele_n_regs, regs0, a);
 	memset(&ez, 0, sizeof(ksw_extz_t));
 	for (i = 0; i < skele_n_regs; ++i) {
 		mm_reg1_t r2;
-		if ((opt->flag&MM_F_SPLICE) && (opt->flag&MM_F_SPLICE_FOR) && (opt->flag&MM_F_SPLICE_REV)) { // then do two rounds of alignments for both strands
-			mm_reg1_t s[2], s2[2];
-			int which, trans_strand;
-			s[0] = s[1] = (*regs_align)[i];
-			mm_align1(km, opt, mi, qlens[0], qseq0, &s[0], &s2[0], n_a, a, &ez, MM_F_SPLICE_FOR);
-			mm_align1(km, opt, mi, qlens[0], qseq0, &s[1], &s2[1], n_a, a, &ez, MM_F_SPLICE_REV);
-			if (s[0].p->dp_score > s[1].p->dp_score) which = 0, trans_strand = 1;
-			else if (s[0].p->dp_score < s[1].p->dp_score) which = 1, trans_strand = 2;
-			else trans_strand = 3, which = (qlens[0] + s[0].p->dp_score) & 1; // randomly choose a strand, effectively
-			if (which == 0) {
-				(*regs_align)[i] = s[0], r2 = s2[0];
-				free(s[1].p);
-			} else {
-				(*regs_align)[i] = s[1], r2 = s2[1];
-				free(s[0].p);
-			}
-			(*regs_align)[i].p->trans_strand = trans_strand;
-		} else { // one round of alignment
-			/***************** now only this one round of alignment is taken into granted. *******************/
-			mm_align1(km, opt, mi, qlens[0], qseq0, &regs[i], &r2, n_a, a, &ez, opt->flag);
-			if (opt->flag&MM_F_SPLICE)
-				(*regs_align)[i].p->trans_strand = opt->flag&MM_F_SPLICE_FOR? 1 : 2;
-		}
-		if (r2.cnt > 0) regs = mm_insert_reg(&r2, i, &skele_n_regs, regs);
-		if (i > 0 && (*regs_align)[i].split_inv && !(opt->flag & MM_F_NO_INV)) {
-			if (mm_align1_inv(km, opt, mi, qlens[0], qseq0, &regs[i-1], &regs[i], &r2, &ez)) {
-				regs = mm_insert_reg(&r2, i, &skele_n_regs, regs);
+		/***************** now only this one round of alignment is taken into granted. *******************/
+		assert(!((opt->flag&MM_F_SPLICE) && (opt->flag&MM_F_SPLICE_FOR) && (opt->flag&MM_F_SPLICE_REV)));
+		mm_align1(km, opt, mi, qlens[0], qseq0, &regs0[i], &r2, n_a, a, &ez, opt->flag);
+
+		if (r2.cnt > 0) regs0 = mm_insert_reg(&r2, i, &skele_n_regs, regs0);
+		/*TODO: ingore INV alignment
+		if (i > 0 && regs0[i].split_inv && !(opt->flag & MM_F_NO_INV)) {
+			if (mm_align1_inv(km, opt, mi, qlens[0], qseq0, &regs0[i-1], &regs0[i], &r2, &ez)) {
+				regs0 = mm_insert_reg(&r2, i, &skele_n_regs, regs0);
 				++i; // skip the inserted INV alignment
 			}
-		}
+		}*/
 	}
+
 	*n_regs0 = skele_n_regs;
 	kfree(km, qseq0[0]);
 	kfree(km, ez.cigar);
-	mm_filter_regs(opt, qlens[0], n_regs0, regs);
-	if (!(opt->flag&MM_F_SR) && !opt->split_prefix && qlens[0] >= opt->rank_min_len) {
-		mm_update_dp_max(qlens[0], *n_regs0, regs, opt->rank_frac, opt->a, opt->b);
-		mm_filter_regs(opt, qlens[0], n_regs0, regs);
-	}
-	mm_hit_sort(km, n_regs0, regs, opt->alt_drop);
+	n_regs_align[0] = *n_regs0, *regs_align = regs0;
+}
 
-	/*if (n_segs == 1) { // uni-segment
-		regs0 = align_regs(opt, mi, km, qlens[0], seqs[0], n_regs0, regs0, a);
-		regs0 = (mm_reg1_t*)realloc(regs0, sizeof(*regs0) * *n_regs0);
-		mm_set_mapq(km, *n_regs0, regs0, opt->min_chain_score, opt->a, rep_len, is_sr);
-		n_regs[0] = *n_regs0, regs[0] = regs0;
-	} else { // multi-segment
-		mm_seg_t *seg;
-		seg = mm_seg_gen(km, hash, n_segs, qlens, *n_regs0, regs0, n_regs, regs, a); // split fragment chain to separate segment chains
-		free(regs0);
-		for (i = 0; i < n_segs; ++i) {
-			mm_set_parent(km, opt->mask_level, opt->mask_len, n_regs[i], regs[i], opt->a * 2 + opt->b, opt->flag&MM_F_HARD_MLEVEL, opt->alt_drop); // update mm_reg1_t::parent
-			regs[i] = align_regs(opt, mi, km, qlens[i], seqs[i], &n_regs[i], regs[i], seg[i].a);
-			mm_set_mapq(km, n_regs[i], regs[i], opt->min_chain_score, opt->a, rep_len, is_sr);
-		}
-		mm_seg_free(km, n_segs, seg);
-		if (n_segs == 2 && opt->pe_ori >= 0 && (opt->flag&MM_F_CIGAR))
-			mm_pair(km, max_chain_gap_ref, opt->pe_bonus, opt->a * 2 + opt->b, opt->a, qlens, n_regs, regs); // pairing
+
+void post_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                  chain_read_t *read_, align_read_t *read_after_chain, void *km) {
+
+	const int *qlens = read_->qlens;
+	int rep_len = read_->rep_len;
+	int is_sr = !!(opt->flag & MM_F_SR);
+	int *n_regs_after_align = &read_after_chain->n_reg;
+	mm_reg1_t *regs_after_align = &read_after_chain->reg;	
+
+	mm_filter_regs(opt, qlens[0], n_regs_after_align, regs_after_align);
+	if (!(opt->flag&MM_F_SR) && !opt->split_prefix && qlens[0] >= opt->rank_min_len) {
+	    mm_update_dp_max(qlens[0], *n_regs_after_align, regs_after_align, opt->rank_frac, opt->a, opt->b);
+	    mm_filter_regs(opt, qlens[0], n_regs_after_align, regs_after_align);
 	}
-	timers[MM_TIME_ALIGN] += realtime() - t1;*/
+
+	mm_hit_sort(km, n_regs_after_align, regs_after_align, opt->alt_drop);
+
+	if (!(opt->flag & MM_F_ALL_CHAINS)) { // don't choose primary mapping(s)
+		mm_set_parent(km, opt->mask_level, opt->mask_len, *n_regs_after_align, regs_after_align, opt->a * 2 + opt->b, opt->flag&MM_F_HARD_MLEVEL, opt->alt_drop);
+		mm_select_sub(km, opt->pri_ratio, mi->k*2, opt->best_n, 0, opt->max_gap * 0.8, n_regs_after_align, regs_after_align);
+		mm_set_sam_pri(*n_regs_after_align, regs_after_align);
+	}
+	/*******************************
+	 *END: put part of mm_align_skeletion here for simplicity.
+	 * **************************************/
+	regs_after_align = (mm_reg1_t*)realloc(regs_after_align, sizeof(*regs_after_align) * *n_regs_after_align);
+	mm_set_mapq(km, *n_regs_after_align, regs_after_align, opt->min_chain_score, opt->a, rep_len, is_sr);
 }
 
 void mm_map_align(const mm_idx_t *mi, const mm_mapopt_t *opt,
@@ -1105,11 +1095,17 @@ static void prepare_align_batch(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s
 		i = batch->reads[iread].seq.i;	
 		off = s->seg_off[i];
 		j = batch->reads[iread].seq.seg_id;
-		pre_align_helper(s->p->mi, s->p->opt, &batch->reads[iread], &batch->reads_after_chain[iread],&s->reg[off + j], &s->n_reg[off + j], b, batch->km) ;
+		pre_align_helper(s->p->mi, s->p->opt, &batch->reads[iread], &batch->reads_after_chain[iread], b, batch->km) ;
 	}
 
 
-    
+	for(int iread = 0; iread < batch->count; iread++) {
+		i = batch->reads[iread].seq.i;	
+		off = s->seg_off[i];
+		j = batch->reads[iread].seq.seg_id;
+		post_align_helper(s->p->mi, s->p->opt, &batch->reads[iread], &batch->reads_after_chain[iread], batch->km) ;
+	}
+	
 }
 /*
 static void launch_gpu_align_batch(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s) {
@@ -1390,6 +1386,8 @@ static void old_worker_for(void *_data, long i_in, int tid) // kt_for() callback
 			off = s->seg_off[i];
 			j = batch->reads[iread].seq.seg_id;
 			//mm_map_align(s->p->mi, s->p->opt, &batch->reads[iread], &s->reg[off + j], &s->n_reg[off + j], b, batch->km) ;
+			s->reg[off + j] = batch->reads_after_chain[iread].reg;
+			s->n_reg[off + j] = batch->reads_after_chain[iread].n_reg;
 			if (s->p->opt->flag & MM_F_INDEPEND_SEG) {
 				if (s->n_seg[i] == 2 && ((j == 0 && (pe_ori >> 1 & 1)) ||
 											(j == 1 && (pe_ori & 1)))) {

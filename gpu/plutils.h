@@ -90,8 +90,8 @@ typedef struct{
 }gasal_res_t;
 
 typedef struct {
-    mm_reg1_t *regs0;  // regions to be aligned after chaining
-
+    mm_reg1_t *reg;  // regions to be aligned after chaining
+    int n_reg;
    
 }align_read_t;
 

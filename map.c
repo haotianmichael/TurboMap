@@ -31,7 +31,6 @@ typedef struct{
     int count;			// number of reads in the batch
     size_t total_n;		// total number of anchors in the batch
     chain_read_t *reads;
-	align_read_t *reads_after_chain;
 } mm_batch_trbuf_t;
 
 // local variables required for each read processed by a CPU thread
@@ -74,9 +73,7 @@ void mm_trbuf_batch_init(mm_batch_trbuf_t *batch_, int batch_max_reads) {
     batch_->count = 0;
     batch_->total_n = 0;
     batch_->reads = (chain_read_t *)malloc(sizeof(chain_read_t) * batch_max_reads);
-	batch_->reads_after_chain = (align_read_t *)malloc(sizeof(align_read_t) * batch_max_reads);
     memset(batch_->reads, 0, sizeof(chain_read_t) * batch_max_reads);
-	memset(batch_->reads_after_chain, 0, sizeof(align_read_t) * batch_max_reads);
     batch_->batchid = -1;
     batch_->km = km_init();
 }
@@ -84,7 +81,7 @@ void mm_trbuf_batch_init(mm_batch_trbuf_t *batch_, int batch_max_reads) {
 void mm_trbuf_batch_reset(mm_batch_trbuf_t *batch_, int batch_max_reads, const mm_mapopt_t *opt) {
 	// free all the reads in the batch
     for (int i = 0; i < batch_->count; i++) {
-        free_read(&batch_->reads[i], &batch_->reads_after_chain[i], batch_->km);
+        free_read(&batch_->reads[i], batch_->km);
     }
 
 
@@ -115,7 +112,7 @@ void mm_trbuf_batch_reset(mm_batch_trbuf_t *batch_, int batch_max_reads, const m
 void mm_trbuf_batch_destroy(mm_batch_trbuf_t *batch_){
 	// free reads in the batch
     for (int i = 0; i < batch_->count; i++){
-        free_read(&batch_->reads[i], &batch_->reads_after_chain[i], batch_->km);
+        free_read(&batch_->reads[i], batch_->km);
     }
     batch_->batchid = -1;
     batch_->total_n = 0;
@@ -577,11 +574,81 @@ static inline mm_reg1_t *mm_insert_reg(const mm_reg1_t *r, int i, int *n_regs, m
 	++*n_regs;
 	return regs;
 }
-extern int mm_align1_inv(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi, int qlen, uint8_t *qseq0[2], const mm_reg1_t *r1, const mm_reg1_t *r2, mm_reg1_t *r_inv, ksw_extz_t *ez);
-extern void mm_align1(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi, int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2, int n_a, mm128_t *a, ksw_extz_t *ez, int splice_flag);
+extern void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks, 
+                                   uint8_t *seq_buffer, uint32_t *cigar_buffer);
+extern void mm_align1_batched(gpu_align_batch_t *gpu_batch,
+                             const mm_mapopt_t *opt, const mm_idx_t *mi, 
+                             int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
+                             int n_a, mm128_t *a, int read_idx, int reg_idx);
+extern void mm_append_cigar(mm_reg1_t *r, uint32_t n_cigar, uint32_t *cigar);
 
-void pre_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                  chain_read_t *read_, align_read_t *read_after_chain, mm_tbuf_t *b, void *km) {
+static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
+{
+    gpu_align_batch_t *gpu_batch = (gpu_align_batch_t*)kcalloc(km, 1, sizeof(gpu_align_batch_t));
+    
+    // Conservative estimates for task and buffer requirements
+    int estimated_tasks = n_reads * 20; // ~20 tasks per read on average
+    size_t estimated_seq_size = n_reads * 8192; // ~8KB sequences per read
+    size_t estimated_cigar_size = n_reads * 4096; // ~4KB CIGAR per read
+    
+    gpu_batch->max_tasks = estimated_tasks;
+    gpu_batch->tasks = (gpu_align_task_t*)kcalloc(km, estimated_tasks, sizeof(gpu_align_task_t));
+    
+    gpu_batch->seq_buffer_size = estimated_seq_size;
+    gpu_batch->seq_buffer = (uint8_t*)kmalloc(km, estimated_seq_size);
+    
+    gpu_batch->cigar_buffer_size = estimated_cigar_size;
+    gpu_batch->cigar_buffer = (uint32_t*)kmalloc(km, estimated_cigar_size);
+    
+    gpu_batch->n_reads = n_reads;
+    gpu_batch->read_ctxs = (read_align_ctx_t*)kcalloc(km, n_reads, sizeof(read_align_ctx_t));
+    gpu_batch->km = km;
+    
+    return gpu_batch;
+}
+
+
+static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch)
+{
+    for (int i = 0; i < gpu_batch->n_tasks; i++) {
+        gpu_align_task_t *task = &gpu_batch->tasks[i];
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[task->read_idx];
+        mm_reg1_t *r = &ctx->regs0[task->reg_idx];
+        
+        if (task->n_cigar > 0) {
+            uint32_t *cigar = gpu_batch->cigar_buffer + task->cigar_offset;
+            mm_append_cigar(r, task->n_cigar, cigar);
+            if (r->p) r->p->dp_score += task->score;
+        }
+        
+        // Handle Z-drop and other special cases
+        if (task->zdropped && task->task_type == GPU_TASK_GAP_FILL) {
+            // TODO: Handle region splitting - complex logic would go here
+            // For now, just mark as zdropped
+        }
+        
+        // Update region boundaries based on task results
+        // This requires mapping the GPU results back to the original mm_align1 logic
+        // The exact implementation would depend on your specific GPU kernel output format
+    }
+}
+
+// Submit batch to GPU and process results
+static void gpu_batch_submit_and_process(gpu_align_batch_t *gpu_batch)
+{
+    if (gpu_batch->n_tasks == 0) return;
+    
+    // Submit to GPU kernel
+    gpu_align_batch_execute(gpu_batch->tasks, gpu_batch->n_tasks, 
+                           gpu_batch->seq_buffer, gpu_batch->cigar_buffer);
+    
+    // Process results back to mm_reg1_t structures
+    gpu_batch_process_results(gpu_batch);
+}
+
+static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                                chain_read_t *read_, mm_tbuf_t *b, void *km, gpu_align_batch_t *gpu_batch, int read_idx) 
+{
     int n_segs = read_->n_seg;
     const int *qlens = read_->qlens;
     const char **seqs = read_->qseqs;
@@ -597,87 +664,83 @@ void pre_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
     int i, j;
     int max_chain_gap_ref = frag_gap;
-	int is_sr = !!(opt->flag & MM_F_SR);
-	uint32_t hash;
-	mm_reg1_t *regs0;
-	mm_reg1_t **regs_align = &read_after_chain->reg;
-	int *n_regs_align = &read_after_chain->n_reg;
-	double *timers = b->timers;
-	double t1 = realtime();
+    int is_sr = !!(opt->flag & MM_F_SR);
+    uint32_t hash;
+    mm_reg1_t *regs0;
+    double *timers = b->timers;
+    double t1 = realtime();
 
-	for (i = 0; i < n_segs; ++i) regs_align[i] = 0, n_regs_align[i] = 0; // initialize regs 
-
-	hash  = qname && !(opt->flag & MM_F_NO_HASH_NAME)? __ac_X31_hash_string(qname) : 0;
-	hash ^= __ac_Wang_hash(qlen_sum) + __ac_Wang_hash(opt->seed);
-	hash  = __ac_Wang_hash(hash);
+    hash  = qname && !(opt->flag & MM_F_NO_HASH_NAME)? __ac_X31_hash_string(qname) : 0;
+    hash ^= __ac_Wang_hash(qlen_sum) + __ac_Wang_hash(opt->seed);
+    hash  = __ac_Wang_hash(hash);
 
     regs0 = mm_gen_regs(km, hash, qlen_sum, *n_regs0, u, a, !!(opt->flag&MM_F_QSTRAND));
-	//regs0 = *regs_align;
-	if (mi->n_alt) {
-		mm_mark_alt(mi, *n_regs0, regs0);
-		mm_hit_sort(km, n_regs0, regs0, opt->alt_drop); // this step can be merged into mm_gen_regs(); will do if this shows up in profile
-	}
+    if (mi->n_alt) {
+        mm_mark_alt(mi, *n_regs0, regs0);
+        mm_hit_sort(km, n_regs0, regs0, opt->alt_drop);
+    }
 
-	if (mm_dbg_flag & (MM_DBG_PRINT_SEED|MM_DBG_PRINT_CHAIN))
-		for (j = 0; j < *n_regs0; ++j)
-			for (i = regs0[j].as; i < regs0[j].as + regs0[j].cnt; ++i)
-				fprintf(stderr, "CN\t%d\t%s\t%d\t%c\t%d\t%d\t%d\n", j, mi->seq[a[i].x<<1>>33].name, (int32_t)a[i].x, "+-"[a[i].x>>63], (int32_t)a[i].y, (int32_t)(a[i].y>>32&0xff),
-						i == regs0[j].as? 0 : ((int32_t)a[i].y - (int32_t)a[i-1].y) - ((int32_t)a[i].x - (int32_t)a[i-1].x));
+    if (mm_dbg_flag & (MM_DBG_PRINT_SEED|MM_DBG_PRINT_CHAIN))
+        for (j = 0; j < *n_regs0; ++j)
+            for (i = regs0[j].as; i < regs0[j].as + regs0[j].cnt; ++i)
+                fprintf(stderr, "CN\t%d\t%s\t%d\t%c\t%d\t%d\t%d\n", j, mi->seq[a[i].x<<1>>33].name, (int32_t)a[i].x, "+-"[a[i].x>>63], (int32_t)a[i].y, (int32_t)(a[i].y>>32&0xff),
+                        i == regs0[j].as? 0 : ((int32_t)a[i].y - (int32_t)a[i-1].y) - ((int32_t)a[i].x - (int32_t)a[i-1].x));
 
-	chain_post(opt, max_chain_gap_ref, mi, km, qlen_sum, n_segs, qlens, n_regs0, regs0, a);
-	if (!is_sr && !(opt->flag&MM_F_QSTRAND)) {
-		mm_est_err(mi, qlen_sum, *n_regs0, regs0, a, n_mini_pos, *mini_pos);
-		*n_regs0 = mm_filter_strand_retained(*n_regs0, regs0);
-	}
+    chain_post(opt, max_chain_gap_ref, mi, km, qlen_sum, n_segs, qlens, n_regs0, regs0, a);
+    if (!is_sr && !(opt->flag&MM_F_QSTRAND)) {
+        mm_est_err(mi, qlen_sum, *n_regs0, regs0, a, n_mini_pos, *mini_pos);
+        *n_regs0 = mm_filter_strand_retained(*n_regs0, regs0);
+    }
 
-	//@FIXME: only for uni-segment
-	assert(n_segs == 1); 
-	assert((opt->flag & MM_F_CIGAR));
-	/*******************************
-	 *START: put part of mm_align_skeletion here for simplicity.
-	 * **************************************/
+    assert(n_segs == 1); 
+    assert((opt->flag & MM_F_CIGAR));
 
-	extern unsigned char seq_nt4_table[256];
-	int32_t skele_n_regs = *n_regs0, n_a;
-	uint8_t *qseq0[2];
-	ksw_extz_t ez;
+    /*******************************
+     *START: GPU replacement for mm_align_skeleton logic
+     **************************************/
 
-	// encode the query sequence
-	qseq0[0] = (uint8_t*)kmalloc(km, qlens[0] * 2);
-	qseq0[1] = qseq0[0] + qlens[0];
-	for (i = 0; i < qlens[0]; ++i) {
-		qseq0[0][i] = seq_nt4_table[(uint8_t)seqs[0][i]];
-		qseq0[1][qlens[0] - 1 - i] = qseq0[0][i] < 4? 3 - qseq0[0][i] : 4;
-	}
+    extern unsigned char seq_nt4_table[256];
+    int32_t skele_n_regs = *n_regs0, n_a;
+    uint8_t *qseq0[2];
 
-	// align through seed hits
-	n_a = mm_squeeze_a(km, skele_n_regs, regs0, a);
-	memset(&ez, 0, sizeof(ksw_extz_t));
-	for (i = 0; i < skele_n_regs; ++i) {
-		mm_reg1_t r2;
-		/***************** now only this one round of alignment is taken into granted. *******************/
+    qseq0[0] = (uint8_t*)kmalloc(km, qlens[0] * 2);
+    qseq0[1] = qseq0[0] + qlens[0];
+    for (i = 0; i < qlens[0]; ++i) {
+        qseq0[0][i] = seq_nt4_table[(uint8_t)seqs[0][i]];
+        qseq0[1][qlens[0] - 1 - i] = qseq0[0][i] < 4? 3 - qseq0[0][i] : 4;
+    }
+
+    n_a = mm_squeeze_a(km, skele_n_regs, regs0, a);
+    
+    // Set up read context for GPU processing
+    read_align_ctx_t *ctx = &gpu_batch->read_ctxs[read_idx];
+    ctx->regs0 = regs0;
+    ctx->n_regs = skele_n_regs;
+    ctx->qseq0[0] = qseq0[0];
+    ctx->qseq0[1] = qseq0[1];
+    ctx->n_a = n_a;
+    ctx->a = a;
+    
+    for (i = 0; i < skele_n_regs; ++i) {
+        mm_reg1_t r2;
+        memset(&r2, 0, sizeof(mm_reg1_t));
+        
+        // This replaces the mm_align1 call with task collection
 		assert(!((opt->flag&MM_F_SPLICE) && (opt->flag&MM_F_SPLICE_FOR) && (opt->flag&MM_F_SPLICE_REV)));
-		mm_align1(km, opt, mi, qlens[0], qseq0, &regs0[i], &r2, n_a, a, &ez, opt->flag);
+        mm_align1_batched(gpu_batch, opt, mi, qlens[0], qseq0, &regs0[i], &r2, n_a, a, read_idx, i);
+        
+        // FIXME: Handle r2.cnt > 0 case after GPU processing
+        // if (r2.cnt > 0) regs0 = mm_insert_reg(&r2, i, &skele_n_regs, regs0);
+    }
 
-		if (r2.cnt > 0) regs0 = mm_insert_reg(&r2, i, &skele_n_regs, regs0);
-		/*TODO: ingore INV alignment
-		if (i > 0 && regs0[i].split_inv && !(opt->flag & MM_F_NO_INV)) {
-			if (mm_align1_inv(km, opt, mi, qlens[0], qseq0, &regs0[i-1], &regs0[i], &r2, &ez)) {
-				regs0 = mm_insert_reg(&r2, i, &skele_n_regs, regs0);
-				++i; // skip the inserted INV alignment
-			}
-		}*/
-	}
-
-	*n_regs0 = skele_n_regs;
-	kfree(km, qseq0[0]);
-	kfree(km, ez.cigar);
-	n_regs_align[0] = *n_regs0, *regs_align = regs0;
+    *n_regs0 = skele_n_regs;
+    
+    // Note: qseq0 cleanup and final processing will happen after GPU batch processing
 }
 
 
-void post_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                  chain_read_t *read_, align_read_t *read_after_chain, void *km) {
+static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                  chain_read_t *read_, gpu_align_batch_t *gpu_batch, void *km, int read_idx) {
 
 	const int *qlens = read_->qlens;
 	mm128_t *a = read_->a;
@@ -685,8 +748,9 @@ void post_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
 	uint64_t *mini_pos = &read_->mini_pos;
 	int rep_len = read_->rep_len;
 	int is_sr = !!(opt->flag & MM_F_SR);
-	int *n_regs_after_align = &read_after_chain->n_reg;
-	mm_reg1_t *regs_after_align = &read_after_chain->reg;	
+	read_align_ctx_t *ctx = &gpu_batch->read_ctxs[read_idx];
+	int *n_regs_after_align = ctx->n_regs;
+	mm_reg1_t *regs_after_align = ctx->regs0;
 	if(0 == *n_regs_after_align) return;
 
 	mm_filter_regs(opt, qlens[0], n_regs_after_align, regs_after_align);
@@ -713,7 +777,7 @@ void post_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
 }
 
 void mm_map_align(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                  chain_read_t *read_, align_read_t *read_after_chain,mm_reg1_t **regs, int *n_regs, mm_tbuf_t *b, void *km) {
+                  chain_read_t *read_, mm_reg1_t **regs, int *n_regs, mm_tbuf_t *b, void *km) {
     int n_segs = read_->n_seg;
     uint64_t **mini_pos = &read_->mini_pos;
     uint64_t *u = read_->u;
@@ -1095,114 +1159,82 @@ static void worker_for(void *_data, long i_in, int tid) {
 	km_destroy(km);
 }
 
-static void prepare_align_batch(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s) {
+static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s) 
+{
+    gpu_align_batch_t *gpu_batch = gpu_align_batch_init(batch->count, batch->km);
+    
+    // Process each read and collect alignment tasks
+    for (int iread = 0; iread < batch->count; iread++) {
+        pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread], 
+                            	b, batch->km, gpu_batch, iread);
+    }
+    
+    // Submit all tasks to GPU and process results
+    gpu_batch_submit_and_process(gpu_batch);
+    
+  
+	for (int iread = 0; iread < batch->count; iread++) {
+        post_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread], 
+                         		gpu_batch, batch->km, iread);
+    }
 
-	int i, off, j;
-	for(int iread = 0; iread < batch->count; iread++) {
-		i = batch->reads[iread].seq.i;	
-		off = s->seg_off[i];
-		j = batch->reads[iread].seq.seg_id;
-		pre_align_helper(s->p->mi, s->p->opt, &batch->reads[iread], &batch->reads_after_chain[iread], b, batch->km) ;
-	}
-
-
-	for(int iread = 0; iread < batch->count; iread++) {
-		i = batch->reads[iread].seq.i;	
-		off = s->seg_off[i];
-		j = batch->reads[iread].seq.seg_id;
-		post_align_helper(s->p->mi, s->p->opt, &batch->reads[iread], &batch->reads_after_chain[iread], batch->km) ;
-	}
-	
-}
-/*
-static void launch_gpu_align_batch(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s) {
-    if (batch->count == 0) return;
-
-    int max_qlen = 0, max_tlen = 0;
-    for (int i = 0; i < batch->count; ++i) {
-        chain_read_t *cr = &batch->reads[i];
-        max_qlen = max(max_qlen, cr->seq.qlen_sum);
-        for (int j = 0; j < cr->n_regs; ++j) {  // Assume one reg per read for batch; extend if multi
-            max_tlen = max(max_tlen, cr->regs[j].tlen);
+	// After Align
+	int pe_ori = s->p->opt->pe_ori;
+	for (int iread = 0; iread < batch->count; iread++) {
+		int i = batch->reads[iread].seq.i;
+		int off = s->seg_off[i];
+		int j = batch->reads[iread].seq.seg_id;
+	    read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
+		s->reg[off + j] =  ctx->regs0;
+		s->n_reg[off + j] = ctx->n_regs;
+		if (s->p->opt->flag & MM_F_INDEPEND_SEG) {
+			if (s->n_seg[i] == 2 && ((j == 0 && (pe_ori >> 1 & 1)) ||
+										(j == 1 && (pe_ori & 1)))) {
+				int k, t;
+				mm_revcomp_bseq(&s->seq[off + j]);
+				for (k = 0; k < s->n_reg[off + j]; ++k) {
+					mm_reg1_t *r = &s->reg[off + j][k];
+					t = r->qs;
+                       r->qs = batch->reads[iread].qlens[j] - r->qe;
+                       r->qe = batch->reads[iread].qlens[j] - t;
+                       r->rev = !r->rev;
+				}
+			}
+		} else {
+            for (j = 0; j < batch->reads[iread].n_seg; ++j) { 
+				 // flip the query strand and coordinate to the
+                 // original read strand
+                if (s->n_seg[i] == 2 &&
+					((j == 0 && (pe_ori >> 1 & 1)) ||
+					(j == 1 && (pe_ori & 1)))) {
+					int k, t;
+					mm_revcomp_bseq(&s->seq[off + j]);
+					for (k = 0; k < s->n_reg[off + j]; ++k) {
+						mm_reg1_t *r = &s->reg[off + j][k];
+						t = r->qs;
+                           r->qs = batch->reads[iread].qlens[j] - r->qe;
+                           r->qe = batch->reads[iread].qlens[j] - t;
+                           r->rev = !r->rev;
+					}
+				}
+            }
         }
+		//if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
+			//fprintf(stderr, "QT\t%s\t%d\t%.6f\n", s->seq[off].name, tid, realtime() - t);
     }
 
-    // Pack batch data (similar to chain pack: packed_query_batch etc.)
-    uint32_t *h_packed_q = (uint32_t*)kmalloc(km, batch->count * ((max_qlen + 3)/4) * sizeof(uint32_t));  // Pack uint8_t to uint32 (2 nt per 16-bit? adjust for NT4)
-    uint32_t *h_packed_t = (uint32_t*)kmalloc(km, batch->count * ((max_tlen + 3)/4) * sizeof(uint32_t));
-    uint32_t *h_q_lens = (uint32_t*)kmalloc(km, batch->count * sizeof(uint32_t));
-    uint32_t *h_t_lens = (uint32_t*)kmalloc(km, batch->count * sizeof(uint32_t));
-    uint32_t *h_q_offs = (uint32_t*)kmalloc(km, batch->count * sizeof(uint32_t));
-    uint32_t *h_t_offs = (uint32_t*)kmalloc(km, batch->count * sizeof(uint32_t));
-    // Pack loops: for each read, pack qseq0[0], tseq from regs[0] (primary), cumulative offsets
-
-    int off_q = 0, off_t = 0;
-    for (int i = 0; i < batch->count; ++i) {
-        chain_read_t *cr = &batch->reads[i];
-        h_q_lens[i] = cr->seq.qlen_sum;
-        h_t_lens[i] = cr->regs[0].tlen;  // Primary
-        h_q_offs[i] = off_q;
-        h_t_offs[i] = off_t;
-
-        // Pack qseq (simplified: memcpy uint8 to uint32, bit-pack 2 nt/byte)
-        // ... (implement pack: for(j=0; j<qlen; j+=2) h_packed_q[off_q++] = (qseq[j]<<4 | qseq[j+1]) <<16 | ... adjust for agatha)
-        off_q += (cr->seq.qlen_sum + 3)/4;
-        // Similar for tseq
-        off_t += (cr->regs[0].tlen + 3)/4;
+	// Final cleanup for each read
+    for (int iread = 0; iread < batch->count; iread++) {
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
+        kfree(batch->km, ctx->qseq0[0]);
     }
-
-    // Device alloc & copy
-    uint32_t *d_packed_q, *d_packed_t, *d_q_lens, *d_t_lens, *d_q_offs, *d_t_offs;
-    gasal_res_t *d_res;
-    cudaMalloc(&d_packed_q, off_q * sizeof(uint32_t));
-    cudaMalloc(&d_packed_t, off_t * sizeof(uint32_t));
-    cudaMalloc(&d_q_lens, batch->count * sizeof(uint32_t));
-    cudaMalloc(&d_t_lens, batch->count * sizeof(uint32_t));
-    cudaMalloc(&d_q_offs, batch->count * sizeof(uint32_t));
-    cudaMalloc(&d_t_offs, batch->count * sizeof(uint32_t));
-    cudaMalloc(&d_res, batch->count * sizeof(gasal_res_t));
-    cudaMemcpy(d_packed_q, h_packed_q, off_q * sizeof(uint32_t), cudaMemcpyHostToDevice);
-    // ... similar cudaMemcpy for others
-
-    // Mat & params to device
-    int8_t *d_mat;
-    cudaMalloc(&d_mat, 25 * sizeof(int8_t));
-    int8_t h_mat[25];
-    ksw_gen_simple_mat(5, h_mat, opt->a, opt->b, opt->sc_ambi);
-    cudaMemcpy(d_mat, h_mat, 25 * sizeof(int8_t), cudaMemcpyHostToDevice);
-
-    // Global buffer for agatha
-    short2 *d_global_top;
-    cudaMalloc(&d_global_top, max_qlen * (256/8) * 1 * 3 * sizeof(short2));  // Assume grid=1, block=256
-
-    // Launch kernel (adapt sig for mat/gaps/zdrop)
-    dim3 block(256);
-    dim3 grid(1);  // Single block for simplicity; tune for batch
-    size_t shm = 1024 * sizeof(int32_t);  // antidiag_max etc.
-    agatha_kernel<<<grid, block, shm>>>(d_packed_q, d_packed_t, d_q_lens, d_t_lens, d_q_offs, d_t_offs,
-                                        d_res, NULL, (uint4*)d_mat, batch->count, max_qlen, d_global_top,
-                                        opt->q, opt->e, opt->zdrop);  // Pass gaps/zdrop
-
-    cudaDeviceSynchronize();
-    gasal_res_t *h_res = (gasal_res_t*)kmalloc(km, batch->count * sizeof(gasal_res_t));
-    cudaMemcpy(h_res, d_res, batch->count * sizeof(gasal_res_t), cudaMemcpyDeviceToHost);
-
-    // Update regs from results (score, ends for cigar backtrack)
-    for (int i = 0; i < batch->count; ++i) {
-        chain_read_t *cr = &batch->reads[i];
-        mm_reg1_t *r = &cr->regs[0];  // Primary
-        r->p->dp_score = h_res[i].aln_score;
-        // Backtrack cigar using ends (implement mm_backtrack_from_ends or similar)
-        // e.g., ksw_backtrack_scattered(...) using h_res[i].query_batch_end, h_res[i].target_batch_end
-        // Assume: mm_update_cigar_from_ends(km, opt, r, h_res[i].query_batch_end, h_res[i].target_batch_end);
-    }
-
-    // Cleanup
-    kfree(km, h_packed_q); kfree(km, h_packed_t); // ... others
-    kfree(km, h_res);
-    cudaFree(d_packed_q); // ... all d_*
+    kfree(batch->km, gpu_batch->tasks);
+    kfree(batch->km, gpu_batch->seq_buffer);
+    kfree(batch->km, gpu_batch->cigar_buffer);
+    kfree(batch->km, gpu_batch->read_ctxs);
+    kfree(batch->km, gpu_batch);
 }
-*/
+
 static void old_worker_for(void *_data, long i_in, int tid) // kt_for() callback
 {
     step_t *s = (step_t *)_data;
@@ -1382,54 +1414,9 @@ static void old_worker_for(void *_data, long i_in, int tid) // kt_for() callback
 				s->frag_gap[off + k] = batch->reads[iread].frag_gap;
 			}
 		}
+
 		// GPU Align
-		prepare_align_batch(batch, b, s);	
-
-		//launch_gpu_align_batch(batch, b, s);	
-
-		// After Align
-		for (iread = 0; iread < batch->count; iread++) {
-			i = batch->reads[iread].seq.i;
-			off = s->seg_off[i];
-			j = batch->reads[iread].seq.seg_id;
-			//mm_map_align(s->p->mi, s->p->opt, &batch->reads[iread], &s->reg[off + j], &s->n_reg[off + j], b, batch->km) ;
-			s->reg[off + j] = batch->reads_after_chain[iread].reg;
-			s->n_reg[off + j] = batch->reads_after_chain[iread].n_reg;
-			if (s->p->opt->flag & MM_F_INDEPEND_SEG) {
-				if (s->n_seg[i] == 2 && ((j == 0 && (pe_ori >> 1 & 1)) ||
-											(j == 1 && (pe_ori & 1)))) {
-					int k, t;
-					mm_revcomp_bseq(&s->seq[off + j]);
-					for (k = 0; k < s->n_reg[off + j]; ++k) {
-						mm_reg1_t *r = &s->reg[off + j][k];
-						t = r->qs;
-                        r->qs = batch->reads[iread].qlens[j] - r->qe;
-                        r->qe = batch->reads[iread].qlens[j] - t;
-                        r->rev = !r->rev;
-					}
-				}
-			} else {
-                for (j = 0; j < batch->reads[iread].n_seg;
-                     ++j) {  // flip the query strand and coordinate to the
-                             // original read strand
-                    if (s->n_seg[i] == 2 &&
-						((j == 0 && (pe_ori >> 1 & 1)) ||
-							(j == 1 && (pe_ori & 1)))) {
-						int k, t;
-						mm_revcomp_bseq(&s->seq[off + j]);
-						for (k = 0; k < s->n_reg[off + j]; ++k) {
-							mm_reg1_t *r = &s->reg[off + j][k];
-							t = r->qs;
-                            r->qs = batch->reads[iread].qlens[j] - r->qe;
-                            r->qe = batch->reads[iread].qlens[j] - t;
-                            r->rev = !r->rev;
-						}
-					}
-                }
-            }
-			if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-				fprintf(stderr, "QT\t%s\t%d\t%.6f\n", s->seq[off].name, tid, realtime() - t);
-        }
+		prepare_align_batch_gpu(batch, b, s);	
 
         // reset pending batch
         mm_trbuf_batch_reset(batch, s->batch_max_reads, s->p->opt);

@@ -85,16 +85,84 @@ typedef struct seg_t {
 } seg_t;
 
 /* Align Options */
-typedef struct{
-
-}gasal_res_t;
-
+// Single GPU alignment task within a batch
 typedef struct {
-    mm_reg1_t *reg;  // regions to be aligned after chaining
-    int n_reg;
-   
-}align_read_t;
+    // Input sequences (offsets into batch buffers)
+    size_t qseq_offset;     // query sequence offset in batch buffer
+    size_t tseq_offset;     // target sequence offset in batch buffer
+    size_t junc_offset;     // junction info offset in batch buffer (0 if NULL)
+    
+    // Sequence lengths
+    int32_t qlen;           // query length
+    int32_t tlen;           // target length
+    
+    // Alignment parameters
+    int8_t mat[25];         // scoring matrix
+    int32_t w;              // bandwidth
+    int32_t end_bonus;      // end bonus
+    int32_t zdrop;          // z-drop
+    int32_t flag;           // alignment flags
+    
+    // Task identification
+    int32_t read_idx;       // which read this task belongs to
+    int32_t reg_idx;        // which region within the read
+    int32_t task_type;      // 0=left_ext, 1=gap_fill, 2=right_ext, 3=inv_align
+    int32_t task_sub_idx;   // sub-index for gap filling tasks
+    
+    // Result storage (to be filled by GPU)
+    int32_t score;          // alignment score
+    int32_t max_q, max_t;   // max positions
+    int32_t mqe_q, mqe_t;   // reached end positions
+    int32_t n_cigar;        // number of CIGAR operations
+    size_t cigar_offset;    // offset in batch CIGAR buffer
+    int32_t max_cigar;      // max CIGAR capacity
+    uint8_t zdropped;       // whether zdropped
+    uint8_t reach_end;      // whether reached end
+} gpu_align_task_t;
 
+// Per-read alignment context
+typedef struct {
+    // Original mm_align_skeleton state
+    mm_reg1_t *regs0;       // regions from chaining
+    int32_t n_regs;         // number of regions
+    uint8_t *qseq0[2];      // encoded query sequences
+    int32_t n_a;            // number of anchors after squeeze
+    mm128_t *a;             // anchor array
+    
+    // Results will be written back to regs0
+} read_align_ctx_t;
+
+// GPU alignment batch for multiple reads
+typedef struct {
+    // Tasks
+    int32_t n_tasks;        // number of alignment tasks
+    int32_t max_tasks;      // maximum tasks capacity
+    gpu_align_task_t *tasks; // array of alignment tasks
+    
+    // Unified sequence buffer for all tasks
+    uint8_t *seq_buffer;    // buffer for all sequences
+    size_t seq_buffer_size;
+    size_t seq_buffer_used;
+    
+    // Unified CIGAR buffer for all results
+    uint32_t *cigar_buffer; // buffer for all CIGAR results
+    size_t cigar_buffer_size;
+    size_t cigar_buffer_used;
+    
+    // Read contexts
+    int32_t n_reads;        // number of reads being processed
+    read_align_ctx_t *read_ctxs; // context for each read
+    
+    // Memory pool
+    void *km;              // memory pool for this batch
+} gpu_align_batch_t;
+
+
+// Task type definitions
+#define GPU_TASK_LEFT_EXT   0
+#define GPU_TASK_GAP_FILL   1
+#define GPU_TASK_RIGHT_EXT  2
+#define GPU_TASK_INV_ALIGN  3
 
 #ifdef __cplusplus
 extern "C" {
@@ -138,10 +206,9 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
 ///////////         Free Input Struct   /////////////
 /////////////////////////////////////////////////////
 // free input_iter pointers except a, because it is freed seperately.
-static inline void free_read(chain_read_t *in, align_read_t *in2, void* km) {
+static inline void free_read(chain_read_t *in, void* km) {
     if (in->qseqs) kfree(km, in->qseqs);
     if (in->qlens) kfree(km, in->qlens);
-    if(in2) kfree(km, in2);
 //DEBUG: for SCORE CHECK after chaining
 #if defined(DEBUG_CHECK) && 0 
     if (in->f) kfree(km, in->f);

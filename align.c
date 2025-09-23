@@ -5,6 +5,7 @@
 #include "minimap.h"
 #include "mmpriv.h"
 #include "ksw2.h"
+#include "gpu/plutils.h"
 
 static void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi)
 {
@@ -288,7 +289,7 @@ static void mm_update_extra(mm_reg1_t *r, const uint8_t *qseq, const uint8_t *ts
 	if (is_eqx) mm_update_cigar_eqx(r, qseq, tseq); // NB: it has to be called here as changes to qseq and tseq are not returned
 }
 
-static void mm_append_cigar(mm_reg1_t *r, uint32_t n_cigar, uint32_t *cigar) // TODO: this calls the libc realloc()
+void mm_append_cigar(mm_reg1_t *r, uint32_t n_cigar, uint32_t *cigar) // TODO: this calls the libc realloc()
 {
 	mm_extra_t *p;
 	if (n_cigar == 0) return;
@@ -568,6 +569,330 @@ static void mm_fix_bad_ends_splice(void *km, const mm_mapopt_t *opt, const mm_id
 		if ((double)score / mat[0] < log_gap + opt->anchor_ext_shift)
 			--(*cnt1);
 	}
+}
+
+void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks, 
+                                   uint8_t *seq_buffer, uint32_t *cigar_buffer){
+									;
+}
+
+static int gpu_batch_add_task(gpu_align_batch_t *gpu_batch,
+                             const uint8_t *qseq, int32_t qlen,
+                             const uint8_t *tseq, int32_t tlen,
+                             const uint8_t *junc,
+                             const int8_t *mat, int32_t w, int32_t end_bonus, 
+                             int32_t zdrop, int32_t flag,
+                             int32_t read_idx, int32_t reg_idx, 
+                             int32_t task_type, int32_t task_sub_idx)
+{
+    if (gpu_batch->n_tasks >= gpu_batch->max_tasks) {
+        fprintf(stderr, "[ERROR] GPU batch task overflow\n");
+        return -1;
+    }
+    
+    // Check buffer space
+    size_t seq_needed = qlen + tlen + (junc ? tlen : 0);
+    size_t cigar_needed = qlen + tlen + 100; // estimate max CIGAR ops
+    
+    if (gpu_batch->seq_buffer_used + seq_needed > gpu_batch->seq_buffer_size ||
+        gpu_batch->cigar_buffer_used + cigar_needed > gpu_batch->cigar_buffer_size) {
+        fprintf(stderr, "[ERROR] GPU batch buffer overflow\n");
+        return -1;
+    }
+    
+    gpu_align_task_t *task = &gpu_batch->tasks[gpu_batch->n_tasks];
+    
+    // Store sequences in batch buffer
+    task->qseq_offset = gpu_batch->seq_buffer_used;
+    memcpy(gpu_batch->seq_buffer + gpu_batch->seq_buffer_used, qseq, qlen);
+    gpu_batch->seq_buffer_used += qlen;
+    
+    task->tseq_offset = gpu_batch->seq_buffer_used;
+    memcpy(gpu_batch->seq_buffer + gpu_batch->seq_buffer_used, tseq, tlen);
+    gpu_batch->seq_buffer_used += tlen;
+    
+    if (junc) {
+        task->junc_offset = gpu_batch->seq_buffer_used;
+        memcpy(gpu_batch->seq_buffer + gpu_batch->seq_buffer_used, junc, tlen);
+        gpu_batch->seq_buffer_used += tlen;
+    } else {
+        task->junc_offset = 0;
+    }
+    
+    // Set parameters
+    task->qlen = qlen;
+    task->tlen = tlen;
+    memcpy(task->mat, mat, 25);
+    task->w = w;
+    task->end_bonus = end_bonus;
+    task->zdrop = zdrop;
+    task->flag = flag;
+    
+    // Set task identification
+    task->read_idx = read_idx;
+    task->reg_idx = reg_idx;
+    task->task_type = task_type;
+    task->task_sub_idx = task_sub_idx;
+    
+    // Allocate CIGAR space
+    task->cigar_offset = gpu_batch->cigar_buffer_used;
+    task->max_cigar = cigar_needed;
+    gpu_batch->cigar_buffer_used += cigar_needed;
+    
+    // Initialize results
+    task->score = 0;
+    task->max_q = task->max_t = 0;
+    task->mqe_q = task->mqe_t = 0;
+    task->n_cigar = 0;
+    task->zdropped = 0;
+    task->reach_end = 0;
+    
+    gpu_batch->n_tasks++;
+    return 0;
+}
+
+static void mm_align_pair_batched(gpu_align_batch_t *gpu_batch, 
+                                 const mm_mapopt_t *opt, 
+                                 int qlen, const uint8_t *qseq, 
+                                 int tlen, const uint8_t *tseq, 
+                                 const uint8_t *junc, const int8_t *mat, 
+                                 int w, int end_bonus, int zdrop, int flag,
+                                 int32_t read_idx, int32_t reg_idx, 
+                                 int32_t task_type, int32_t task_sub_idx)
+{
+    // For very large alignments, skip GPU (fallback handled later)
+    if (opt->max_sw_mat > 0 && (int64_t)tlen * qlen > opt->max_sw_mat) {
+        return;
+    }
+    
+    gpu_batch_add_task(gpu_batch, qseq, qlen, tseq, tlen, junc, mat, 
+                      w, end_bonus, zdrop, flag, read_idx, reg_idx, 
+                      task_type, task_sub_idx);
+}
+
+void mm_align1_batched(gpu_align_batch_t *gpu_batch,
+                             const mm_mapopt_t *opt, const mm_idx_t *mi, 
+                             int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
+                             int n_a, mm128_t *a, int read_idx, int reg_idx)
+{
+    int is_sr = !!(opt->flag & MM_F_SR), is_splice = !!(opt->flag & MM_F_SPLICE);
+    int32_t rid = a[r->as].x<<1>>33, rev = a[r->as].x>>63, as1, cnt1;
+    uint8_t *tseq, *qseq, *junc;
+    int32_t i, l, bw, bw_long, extra_flag = 0, rs0, re0, qs0, qe0;
+    int32_t rs, re, qs, qe;
+    int32_t rs1, qs1, re1, qe1;
+    int8_t mat[25];
+    void *km = gpu_batch->km;
+
+    if (is_sr) assert(!(mi->flag & MM_I_HPC));
+
+    r2->cnt = 0;
+    if (r->cnt == 0) return;
+    
+    ksw_gen_simple_mat(5, mat, opt->a, opt->b, opt->sc_ambi);
+    bw = (int)(opt->bw * 1.5 + 1.);
+    bw_long = (int)(opt->bw_long * 1.5 + 1.);
+    if (bw_long < bw) bw_long = bw;
+
+    // Same region computation logic as original mm_align1
+    if (is_sr && !(mi->flag & MM_I_HPC)) {
+        mm_max_stretch(r, a, &as1, &cnt1);
+        rs = (int32_t)a[as1].x + 1 - (int32_t)(a[as1].y>>32&0xff);
+        qs = (int32_t)a[as1].y + 1 - (int32_t)(a[as1].y>>32&0xff);
+        re = (int32_t)a[as1+cnt1-1].x + 1;
+        qe = (int32_t)a[as1+cnt1-1].y + 1;
+    } else {
+        if (!(opt->flag & MM_F_NO_END_FLT)) {
+            if (is_splice)
+                mm_fix_bad_ends_splice(km, opt, mi, r, mat, qlen, qseq0, a, &as1, &cnt1);
+            else
+                mm_fix_bad_ends(r, a, opt->bw, opt->min_chain_score * 2, &as1, &cnt1);
+        } else as1 = r->as, cnt1 = r->cnt;
+        mm_filter_bad_seeds(km, as1, cnt1, a, 10, 40, opt->max_gap>>1, 10);
+        mm_filter_bad_seeds_alt(km, as1, cnt1, a, 30, opt->max_gap>>1);
+        mm_adjust_minier(mi, qseq0, &a[as1], &rs, &qs);
+        mm_adjust_minier(mi, qseq0, &a[as1 + cnt1 - 1], &re, &qe);
+    }
+    assert(cnt1 > 0);
+
+    if (is_splice) {
+        if (opt->flag & MM_F_SPLICE_FOR) extra_flag |= rev? KSW_EZ_SPLICE_REV : KSW_EZ_SPLICE_FOR;
+        if (opt->flag & MM_F_SPLICE_REV) extra_flag |= rev? KSW_EZ_SPLICE_FOR : KSW_EZ_SPLICE_REV;
+        if (opt->flag & MM_F_SPLICE_FLANK) extra_flag |= KSW_EZ_SPLICE_FLANK;
+    }
+
+    // Compute alignment regions (same as original mm_align1)
+    if (is_sr) {
+        qs0 = 0, qe0 = qlen;
+        l = qs;
+        l += l * opt->a + opt->end_bonus > opt->q? (l * opt->a + opt->end_bonus - opt->q) / opt->e : 0;
+        rs0 = rs - l > 0? rs - l : 0;
+        l = qlen - qe;
+        l += l * opt->a + opt->end_bonus > opt->q? (l * opt->a + opt->end_bonus - opt->q) / opt->e : 0;
+        re0 = re + l < (int32_t)mi->seq[rid].len? re + l : mi->seq[rid].len;
+    } else {
+        // Complex region computation logic from original mm_align1
+        rs0 = (int32_t)a[r->as].x + 1 - (int32_t)(a[r->as].y>>32&0xff);
+        qs0 = (int32_t)a[r->as].y + 1 - (int32_t)(a[r->as].y>>32&0xff);
+        if (rs0 < 0) rs0 = 0;
+        assert(qs0 >= 0);
+        rs1 = qs1 = 0;
+        for (i = r->as - 1, l = 0; i >= 0 && a[i].x>>32 == a[r->as].x>>32; --i) {
+            int32_t x = (int32_t)a[i].x + 1 - (int32_t)(a[i].y>>32&0xff);
+            int32_t y = (int32_t)a[i].y + 1 - (int32_t)(a[i].y>>32&0xff);
+            if (x < rs0 && y < qs0) {
+                if (++l > opt->min_cnt) {
+                    l = rs0 - x > qs0 - y? rs0 - x : qs0 - y;
+                    rs1 = rs0 - l, qs1 = qs0 - l;
+                    if (rs1 < 0) rs1 = 0;
+                    break;
+                }
+            }
+        }
+        if (qs > 0 && rs > 0) {
+            l = qs < opt->max_gap? qs : opt->max_gap;
+            qs1 = qs1 > qs - l? qs1 : qs - l;
+            qs0 = qs0 < qs1? qs0 : qs1;
+            l += l * opt->a > opt->q? (l * opt->a - opt->q) / opt->e : 0;
+            l = l < opt->max_gap? l : opt->max_gap;
+            l = l < rs? l : rs;
+            rs1 = rs1 > rs - l? rs1 : rs - l;
+            rs0 = rs0 < rs1? rs0 : rs1;
+            rs0 = rs0 < rs? rs0 : rs;
+        } else rs0 = rs, qs0 = qs;
+        
+        re0 = (int32_t)a[r->as + r->cnt - 1].x + 1;
+        qe0 = (int32_t)a[r->as + r->cnt - 1].y + 1;
+        re1 = mi->seq[rid].len, qe1 = qlen;
+        for (i = r->as + r->cnt, l = 0; i < n_a && a[i].x>>32 == a[r->as].x>>32; ++i) {
+            int32_t x = (int32_t)a[i].x + 1;
+            int32_t y = (int32_t)a[i].y + 1;
+            if (x > re0 && y > qe0) {
+                if (++l > opt->min_cnt) {
+                    l = x - re0 > y - qe0? x - re0 : y - qe0;
+                    re1 = re0 + l, qe1 = qe0 + l;
+                    break;
+                }
+            }
+        }
+        if (qe < qlen && re < (int32_t)mi->seq[rid].len) {
+            l = qlen - qe < opt->max_gap? qlen - qe : opt->max_gap;
+            qe1 = qe1 < qe + l? qe1 : qe + l;
+            qe0 = qe0 > qe1? qe0 : qe1;
+            l += l * opt->a > opt->q? (l * opt->a - opt->q) / opt->e : 0;
+            l = l < opt->max_gap? l : opt->max_gap;
+            l = l < (int32_t)mi->seq[rid].len - re? l : mi->seq[rid].len - re;
+            re1 = re1 < re + l? re1 : re + l;
+            re0 = re0 > re1? re0 : re1;
+        } else re0 = re, qe0 = qe;
+    }
+
+    if (a[r->as].y & MM_SEED_SELF) {
+        int max_ext = r->qs > r->rs? r->qs - r->rs : r->rs - r->qs;
+        if (r->rs - rs0 > max_ext) rs0 = r->rs - max_ext;
+        if (r->qs - qs0 > max_ext) qs0 = r->qs - max_ext;
+        max_ext = r->qe > r->re? r->qe - r->re : r->re - r->qe;
+        if (re0 - r->re > max_ext) re0 = r->re + max_ext;
+        if (qe0 - r->qe > max_ext) qe0 = r->qe + max_ext;
+    }
+
+    assert(re0 > rs0);
+    tseq = (uint8_t*)kmalloc(km, re0 - rs0);
+    junc = (uint8_t*)kmalloc(km, re0 - rs0);
+
+    rs1 = rs, qs1 = qs;
+
+    // Left extension
+    if (qs > 0 && rs > 0) {
+        if (opt->flag & MM_F_QSTRAND) {
+            qseq = &qseq0[0][qs0];
+            mm_idx_getseq2(mi, rev, rid, rs0, rs, tseq);
+        } else {
+            qseq = &qseq0[rev][qs0];
+            mm_idx_getseq(mi, rid, rs0, rs, tseq);
+        }
+        mm_idx_bed_junc(mi, rid, rs0, rs, junc);
+        mm_seq_rev(qs - qs0, qseq);
+        mm_seq_rev(rs - rs0, tseq);
+        mm_seq_rev(rs - rs0, junc);
+        
+        mm_align_pair_batched(gpu_batch, opt, qs - qs0, qseq, rs - rs0, tseq, junc, mat,
+                             bw, opt->end_bonus, r->split_inv? opt->zdrop_inv : opt->zdrop,
+                             extra_flag|KSW_EZ_EXTZ_ONLY|KSW_EZ_RIGHT|KSW_EZ_REV_CIGAR,
+                             read_idx, reg_idx, GPU_TASK_LEFT_EXT, 0);
+        
+        mm_seq_rev(qs - qs0, qseq);
+    }
+
+    re1 = rs, qe1 = qs;
+
+    // Gap filling
+    for (i = is_sr? cnt1 - 1 : 1; i < cnt1; ++i) {
+        if ((a[as1+i].y & (MM_SEED_IGNORE|MM_SEED_TANDEM)) && i != cnt1 - 1) continue;
+        if (is_sr && !(mi->flag & MM_I_HPC)) {
+            re = (int32_t)a[as1 + i].x + 1;
+            qe = (int32_t)a[as1 + i].y + 1;
+        } else mm_adjust_minier(mi, qseq0, &a[as1 + i], &re, &qe);
+        re1 = re, qe1 = qe;
+        
+        if (i == cnt1 - 1 || (a[as1+i].y&MM_SEED_LONG_JOIN) || 
+            (qe - qs >= opt->min_ksw_len && re - rs >= opt->min_ksw_len)) {
+            int bw1 = bw_long;
+            if (a[as1+i].y & MM_SEED_LONG_JOIN)
+                bw1 = qe - qs > re - rs? qe - qs : re - rs;
+            
+            if (opt->flag & MM_F_QSTRAND) {
+                qseq = &qseq0[0][qs];
+                mm_idx_getseq2(mi, rev, rid, rs, re, tseq);
+            } else {
+                qseq = &qseq0[rev][qs];
+                mm_idx_getseq(mi, rid, rs, re, tseq);
+            }
+            mm_idx_bed_junc(mi, rid, rs, re, junc);
+            
+            if (is_sr) {
+                // Short read ungapped alignment - handle on CPU immediately
+                assert(qe - qs == re - rs);
+                int j, score = 0;
+                for (j = 0; j < qe - qs; ++j) {
+                    if (qseq[j] >= 4 || tseq[j] >= 4) score += opt->e2;
+                    else score += qseq[j] == tseq[j]? opt->a : -opt->b;
+                }
+                uint32_t cigar_op = (qe - qs) << 4 | MM_CIGAR_MATCH;
+                mm_append_cigar(r, 1, &cigar_op);
+                if (r->p) r->p->dp_score += score;
+            } else {
+                mm_align_pair_batched(gpu_batch, opt, qe - qs, qseq, re - rs, tseq, junc, mat,
+                                     bw1, -1, opt->zdrop, extra_flag|KSW_EZ_APPROX_MAX,
+                                     read_idx, reg_idx, GPU_TASK_GAP_FILL, i);
+            }
+            rs = re, qs = qe;
+        }
+    }
+
+    // Right extension
+    if (qe < qe0 && re < re0) {
+        if (opt->flag & MM_F_QSTRAND) {
+            qseq = &qseq0[0][qe];
+            mm_idx_getseq2(mi, rev, rid, re, re0, tseq);
+        } else {
+            qseq = &qseq0[rev][qe];
+            mm_idx_getseq(mi, rid, re, re0, tseq);
+        }
+        mm_idx_bed_junc(mi, rid, re, re0, junc);
+        
+        mm_align_pair_batched(gpu_batch, opt, qe0 - qe, qseq, re0 - re, tseq, junc, mat,
+                             bw, opt->end_bonus, opt->zdrop, extra_flag|KSW_EZ_EXTZ_ONLY,
+                             read_idx, reg_idx, GPU_TASK_RIGHT_EXT, 0);
+    }
+
+    kfree(km, tseq);
+    kfree(km, junc);
+
+    // Set region boundaries (this will be updated after GPU processing)
+    r->rs = rs1, r->re = re1;
+    if (!rev || (opt->flag & MM_F_QSTRAND)) r->qs = qs1, r->qe = qe1;
+    else r->qs = qlen - qe1, r->qe = qlen - qs1;
 }
 
 void mm_align1(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi, int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2, int n_a, mm128_t *a, ksw_extz_t *ez, int splice_flag)

@@ -84,7 +84,7 @@ void mm_trbuf_batch_init(mm_batch_trbuf_t *batch_, int batch_max_reads) {
 void mm_trbuf_batch_reset(mm_batch_trbuf_t *batch_, int batch_max_reads, const mm_mapopt_t *opt) {
 	// free all the reads in the batch
     for (int i = 0; i < batch_->count; i++) {
-        free_read(&batch_->reads[i], batch_->km);
+        free_read(&batch_->reads[i], &batch_->reads_after_chain[i], batch_->km);
     }
 
 
@@ -115,7 +115,7 @@ void mm_trbuf_batch_reset(mm_batch_trbuf_t *batch_, int batch_max_reads, const m
 void mm_trbuf_batch_destroy(mm_batch_trbuf_t *batch_){
 	// free reads in the batch
     for (int i = 0; i < batch_->count; i++){
-        free_read(&batch_->reads[i], batch_->km);
+        free_read(&batch_->reads[i], &batch_->reads_after_chain[i], batch_->km);
     }
     batch_->batchid = -1;
     batch_->total_n = 0;
@@ -680,10 +680,14 @@ void post_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
                   chain_read_t *read_, align_read_t *read_after_chain, void *km) {
 
 	const int *qlens = read_->qlens;
+	mm128_t *a = read_->a;
+	uint64_t *u = read_->u;
+	uint64_t *mini_pos = &read_->mini_pos;
 	int rep_len = read_->rep_len;
 	int is_sr = !!(opt->flag & MM_F_SR);
 	int *n_regs_after_align = &read_after_chain->n_reg;
 	mm_reg1_t *regs_after_align = &read_after_chain->reg;	
+	if(0 == *n_regs_after_align) return;
 
 	mm_filter_regs(opt, qlens[0], n_regs_after_align, regs_after_align);
 	if (!(opt->flag&MM_F_SR) && !opt->split_prefix && qlens[0] >= opt->rank_min_len) {
@@ -703,6 +707,9 @@ void post_align_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
 	 * **************************************/
 	regs_after_align = (mm_reg1_t*)realloc(regs_after_align, sizeof(*regs_after_align) * *n_regs_after_align);
 	mm_set_mapq(km, *n_regs_after_align, regs_after_align, opt->min_chain_score, opt->a, rep_len, is_sr);
+	kfree(km, a);
+	kfree(km, u);
+	kfree(km, *mini_pos);
 }
 
 void mm_map_align(const mm_idx_t *mi, const mm_mapopt_t *opt,

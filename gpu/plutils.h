@@ -138,10 +138,10 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
 ///////////         Free Input Struct   /////////////
 /////////////////////////////////////////////////////
 // free input_iter pointers except a, because it is freed seperately.
-static inline void free_read(chain_read_t *in, void* km) {
+static inline void free_read(chain_read_t *in, align_read_t *in2, void* km) {
     if (in->qseqs) kfree(km, in->qseqs);
     if (in->qlens) kfree(km, in->qlens);
-
+    if(in2) kfree(km, in2);
 //DEBUG: for SCORE CHECK after chaining
 #if defined(DEBUG_CHECK) && 0 
     if (in->f) kfree(km, in->f);

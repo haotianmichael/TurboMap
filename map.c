@@ -10,6 +10,7 @@
 #include "bseq.h"
 #include "khash.h"
 #include "gpu/plmanager.cuh"
+#include "gpu/plalign.h"
 #include "ksw2.h"
 
 #define __AMD_SPLIT_KERNELS__ 1
@@ -574,7 +575,7 @@ static inline mm_reg1_t *mm_insert_reg(const mm_reg1_t *r, int i, int *n_regs, m
 	++*n_regs;
 	return regs;
 }
-extern void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks, 
+void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks, 
                                    uint8_t *seq_buffer, uint32_t *cigar_buffer);
 extern void mm_align1_batched(gpu_align_batch_t *gpu_batch,
                              const mm_mapopt_t *opt, const mm_idx_t *mi, 

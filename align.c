@@ -571,11 +571,6 @@ static void mm_fix_bad_ends_splice(void *km, const mm_mapopt_t *opt, const mm_id
 	}
 }
 
-void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks, 
-                                   uint8_t *seq_buffer, uint32_t *cigar_buffer){
-									;
-}
-
 static int gpu_batch_add_task(gpu_align_batch_t *gpu_batch,
                              const uint8_t *qseq, int32_t qlen,
                              const uint8_t *tseq, int32_t tlen,

@@ -15,12 +15,12 @@
 static align_config_t g_config = {
     .blocks = 28,
     .threads = 256,
-    .slice_width = 32,
-    .z_threshold = 100,
-    .band_width = 500,
-    .match_score = 2,
-    .mismatch_score = -4,
-    .gap_open = 4,
+    .slice_width = 3,
+    .z_threshold = 400,
+    .band_width = 751,
+    .match_score = 1,
+    .mismatch_score = 4,
+    .gap_open = 6,
     .gap_extend = 2
 };
 
@@ -223,7 +223,7 @@ void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks,
     
     // Initialize storage if needed
     if (!g_initialized) {
-        if (init_gpu_storage(1024, 1024*1024) != 0) {
+        if (init_gpu_storage(20000, 100*1024*1024) != 0) {
             fprintf(stderr, "[ERROR] Failed to initialize GPU storage\n");
             return;
         }

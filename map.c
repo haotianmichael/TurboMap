@@ -588,9 +588,9 @@ static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
     gpu_align_batch_t *gpu_batch = (gpu_align_batch_t*)kcalloc(km, 1, sizeof(gpu_align_batch_t));
     
     // Conservative estimates for task and buffer requirements
-    int estimated_tasks = n_reads * 20; // ~20 tasks per read on average
-    size_t estimated_seq_size = n_reads * 8192; // ~8KB sequences per read
-    size_t estimated_cigar_size = n_reads * 4096; // ~4KB CIGAR per read
+    int estimated_tasks = n_reads * 5000; // ~200 tasks per read on average
+    size_t estimated_seq_size = n_reads * (1024 * 1024); // ~1MB sequences per read
+    size_t estimated_cigar_size = n_reads * (1024 * 1024); // ~1MB CIGAR per read
     
     gpu_batch->max_tasks = estimated_tasks;
     gpu_batch->tasks = (gpu_align_task_t*)kcalloc(km, estimated_tasks, sizeof(gpu_align_task_t));
@@ -750,7 +750,7 @@ static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 	int rep_len = read_->rep_len;
 	int is_sr = !!(opt->flag & MM_F_SR);
 	read_align_ctx_t *ctx = &gpu_batch->read_ctxs[read_idx];
-	int *n_regs_after_align = ctx->n_regs;
+	int *n_regs_after_align = &ctx->n_regs;
 	mm_reg1_t *regs_after_align = ctx->regs0;
 	if(0 == *n_regs_after_align) return;
 

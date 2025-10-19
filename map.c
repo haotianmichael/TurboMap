@@ -575,7 +575,7 @@ static inline mm_reg1_t *mm_insert_reg(const mm_reg1_t *r, int i, int *n_regs, m
 	++*n_regs;
 	return regs;
 }
-void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks, 
+void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks, 
                                    uint8_t *seq_buffer, uint32_t *cigar_buffer);
 extern void mm_align1_batched(gpu_align_batch_t *gpu_batch,
                              const mm_mapopt_t *opt, const mm_idx_t *mi, 
@@ -635,12 +635,12 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch)
 }
 
 // Submit batch to GPU and process results
-static void gpu_batch_submit_and_process(gpu_align_batch_t *gpu_batch)
+static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch_t *gpu_batch)
 {
     if (gpu_batch->n_tasks == 0) return;
     
     // Submit to GPU kernel
-    gpu_align_batch_execute(gpu_batch->tasks, gpu_batch->n_tasks, 
+    gpu_align_batch_execute(opt, gpu_batch->tasks, gpu_batch->n_tasks, 
                            gpu_batch->seq_buffer, gpu_batch->cigar_buffer);
     
     // Process results back to mm_reg1_t structures
@@ -1171,7 +1171,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     }
     
     // Submit all tasks to GPU and process results
-    gpu_batch_submit_and_process(gpu_batch);
+    gpu_batch_submit_and_process(s->p->opt, gpu_batch);
     
   
 	for (int iread = 0; iread < batch->count; iread++) {

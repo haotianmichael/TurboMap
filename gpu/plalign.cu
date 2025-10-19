@@ -27,6 +27,21 @@ static align_config_t g_config = {
 gpu_align_storage_t *g_storage = NULL;
 bool g_initialized = false;
 
+static void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi)
+{
+	int i, j;
+	a = a < 0? -a : a;
+	b = b > 0? -b : b;
+	sc_ambi = sc_ambi > 0? -sc_ambi : sc_ambi;
+	for (i = 0; i < m - 1; ++i) {
+		for (j = 0; j < m - 1; ++j)
+			mat[i * m + j] = i == j? a : b;
+		mat[i * m + m - 1] = sc_ambi;
+	}
+	for (j = 0; j < m; ++j)
+		mat[(m - 1) * m + j] = sc_ambi;
+}
+
 void gasal_copy_subst_scores(gasal_subst_scores *subst){
 
 	cudaError_t err;
@@ -61,7 +76,18 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     g_storage->max_query_bytes = initial_seq_bytes;
     g_storage->max_target_bytes = initial_seq_bytes;
     g_storage->max_query_len = 100000; // Default max query length
-    
+
+    // Calculate backtracking buffer sizes
+    // Backtrack matrix: for each task, (qlen + tlen) * n_col
+    // Worst case: n_col = bandwidth + 1, max_len = max_query_len
+    // Conservative estimate: 2 * max_query_len * (bandwidth + 1)
+
+    size_t max_antidiag = 2 * g_storage->max_query_len;
+    size_t max_n_col = (g_storage->band_width < 0) ? 
+                       g_storage->max_query_len : (g_storage->band_width + 1);
+    g_storage->max_backtrack_size = 1; //FIXME: max_antidiag * max_n_col;
+    g_storage->max_cigar_len = 1; //FIXME: 2 * g_storage->max_query_len; // Worst case: all indels
+
     // Create CUDA stream
     cudaStreamCreate(&g_storage->stream);
     
@@ -76,7 +102,25 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     cudaMalloc(&g_storage->d_target_offsets, g_storage->max_tasks * sizeof(uint32_t));
     cudaMalloc(&g_storage->d_query_lens, g_storage->max_tasks * sizeof(uint32_t));
     cudaMalloc(&g_storage->d_target_lens, g_storage->max_tasks * sizeof(uint32_t));
+
+    // Allocate KSW backtracking buffers FIXME: g_storage->max_tasks
+    cudaMalloc(&g_storage->d_backtrack_p, 
+               1 * g_storage->max_backtrack_size);
+    cudaMalloc(&g_storage->d_backtrack_off, 
+               1 * max_antidiag * sizeof(int));
+    cudaMalloc(&g_storage->d_backtrack_n_col, 
+               1 * sizeof(int));
+    cudaMalloc(&g_storage->d_cigar_buffer, 
+               1 * g_storage->max_cigar_len * sizeof(uint32_t));
+    cudaMalloc(&g_storage->d_cigar_lengths, 
+               1 * sizeof(int));
+    cudaMalloc(&g_storage->mat, 25 * sizeof(int8_t));
     
+    // Allocate host CIGAR buffers  FIXME: g_storage->max_tasks
+    g_storage->h_cigar_buffer = (uint32_t*)calloc(
+        1 * g_storage->max_cigar_len, sizeof(uint32_t));
+    g_storage->h_cigar_lengths = (int*)calloc(1 , sizeof(int));
+
     // Allocate task mapping
     cudaMalloc(&g_storage->d_task_to_align_id, g_storage->max_tasks * sizeof(int32_t));
     g_storage->h_task_to_align_id = (int32_t*)calloc(g_storage->max_tasks, sizeof(int32_t));
@@ -129,95 +173,116 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     return 0;
 }
 
-static int realloc_gpu_storage(size_t needed_tasks, size_t needed_seq_bytes) {
+static int realloc_gpu_storage(size_t new_tasks, size_t new_seq_bytes) {
     if (!g_initialized) return -1;
     
-    bool needs_realloc = false;
-    size_t new_max_tasks = g_storage->max_tasks;
-    size_t new_max_bytes = g_storage->max_query_bytes;
+    bool need_realloc = false;
     
-    // Check if reallocation needed
-    if (needed_tasks > g_storage->max_tasks) {
-        new_max_tasks = needed_tasks * 2;
-        needs_realloc = true;
+    // Check if we need more task capacity
+    if (new_tasks > g_storage->max_tasks) {
+        g_storage->max_tasks = new_tasks * 2; // Allocate 2x for growth
+        need_realloc = true;
     }
     
-    if (needed_seq_bytes > g_storage->max_query_bytes) {
-        new_max_bytes = needed_seq_bytes * 2;
-        needs_realloc = true;
+    // Check if we need more sequence capacity
+    if (new_seq_bytes > g_storage->max_query_bytes || 
+        new_seq_bytes > g_storage->max_target_bytes) {
+        g_storage->max_query_bytes = new_seq_bytes * 2;
+        g_storage->max_target_bytes = new_seq_bytes * 2;
+        need_realloc = true;
     }
     
-    if (!needs_realloc) return 0;
+    if (!need_realloc) return 0;
     
-    // Reallocate sequences
-    if (new_max_bytes > g_storage->max_query_bytes) {
-        cudaFree(g_storage->d_unpacked_query);
-        cudaFree(g_storage->d_unpacked_target);
-        cudaFree(g_storage->d_packed_query);
-        cudaFree(g_storage->d_packed_target);
-        
-        cudaMalloc(&g_storage->d_unpacked_query, new_max_bytes);
-        cudaMalloc(&g_storage->d_unpacked_target, new_max_bytes);
-        cudaMalloc(&g_storage->d_packed_query, (new_max_bytes / 8) * sizeof(uint32_t));
-        cudaMalloc(&g_storage->d_packed_target, (new_max_bytes / 8) * sizeof(uint32_t));
-        
-        g_storage->max_query_bytes = new_max_bytes;
-        g_storage->max_target_bytes = new_max_bytes;
-    }
+    // Recalculate backtracking sizes
+    size_t max_antidiag = 2 * g_storage->max_query_len;
+    size_t max_n_col = (g_storage->band_width < 0) ? 
+                       g_storage->max_query_len : (g_storage->band_width + 1);
+    g_storage->max_backtrack_size = max_antidiag * max_n_col;
+    g_storage->max_cigar_len = 2 * g_storage->max_query_len;
     
-    // Reallocate task-related arrays
-    if (new_max_tasks > g_storage->max_tasks) {
-        cudaFree(g_storage->d_query_offsets);
-        cudaFree(g_storage->d_target_offsets);
-        cudaFree(g_storage->d_query_lens);
-        cudaFree(g_storage->d_target_lens);
-        cudaFree(g_storage->d_task_to_align_id);
-        
-        cudaMalloc(&g_storage->d_query_offsets, new_max_tasks * sizeof(uint32_t));
-        cudaMalloc(&g_storage->d_target_offsets, new_max_tasks * sizeof(uint32_t));
-        cudaMalloc(&g_storage->d_query_lens, new_max_tasks * sizeof(uint32_t));
-        cudaMalloc(&g_storage->d_target_lens, new_max_tasks * sizeof(uint32_t));
-        cudaMalloc(&g_storage->d_task_to_align_id, new_max_tasks * sizeof(int32_t));
-        
-        // Reallocate host arrays
-        free(g_storage->h_task_to_align_id);
-        free(g_storage->host_res->aln_score);
-        free(g_storage->host_res->query_batch_end);
-        free(g_storage->host_res->target_batch_end);
-        free(g_storage->h_sort_buffer);
-        
-        g_storage->h_task_to_align_id = (int32_t*)calloc(new_max_tasks, sizeof(int32_t));
-        g_storage->host_res->aln_score = (int32_t*)calloc(new_max_tasks, sizeof(int32_t));
-        g_storage->host_res->query_batch_end = (int32_t*)calloc(new_max_tasks, sizeof(int32_t));
-        g_storage->host_res->target_batch_end = (int32_t*)calloc(new_max_tasks, sizeof(int32_t));
-        g_storage->h_sort_buffer = (short2*)calloc(new_max_tasks, sizeof(short2));
-        
-        // Reallocate device results
-        cudaFree(g_storage->device_res_ptrs->aln_score);
-        cudaFree(g_storage->device_res_ptrs->query_batch_end);
-        cudaFree(g_storage->device_res_ptrs->target_batch_end);
-        
-        int32_t *d_scores, *d_query_ends, *d_target_ends;
-        cudaMalloc(&d_scores, new_max_tasks * sizeof(int32_t));
-        cudaMalloc(&d_query_ends, new_max_tasks * sizeof(int32_t));
-        cudaMalloc(&d_target_ends, new_max_tasks * sizeof(int32_t));
-        
-        g_storage->device_res_ptrs->aln_score = d_scores;
-        g_storage->device_res_ptrs->query_batch_end = d_query_ends;
-        g_storage->device_res_ptrs->target_batch_end = d_target_ends;
-        
-        cudaMemcpy(g_storage->device_res, g_storage->device_res_ptrs, 
-                   sizeof(gasal_res_t), cudaMemcpyHostToDevice);
-        
-        g_storage->max_tasks = new_max_tasks;
-    }
+    // Reallocate sequence buffers
+    cudaFree(g_storage->d_unpacked_query);
+    cudaFree(g_storage->d_unpacked_target);
+    cudaFree(g_storage->d_packed_query);
+    cudaFree(g_storage->d_packed_target);
+    
+    cudaMalloc(&g_storage->d_unpacked_query, g_storage->max_query_bytes);
+    cudaMalloc(&g_storage->d_unpacked_target, g_storage->max_target_bytes);
+    cudaMalloc(&g_storage->d_packed_query, (g_storage->max_query_bytes / 8) * sizeof(uint32_t));
+    cudaMalloc(&g_storage->d_packed_target, (g_storage->max_target_bytes / 8) * sizeof(uint32_t));
+    
+    // Reallocate metadata arrays
+    cudaFree(g_storage->d_query_offsets);
+    cudaFree(g_storage->d_target_offsets);
+    cudaFree(g_storage->d_query_lens);
+    cudaFree(g_storage->d_target_lens);
+    
+    cudaMalloc(&g_storage->d_query_offsets, g_storage->max_tasks * sizeof(uint32_t));
+    cudaMalloc(&g_storage->d_target_offsets, g_storage->max_tasks * sizeof(uint32_t));
+    cudaMalloc(&g_storage->d_query_lens, g_storage->max_tasks * sizeof(uint32_t));
+    cudaMalloc(&g_storage->d_target_lens, g_storage->max_tasks * sizeof(uint32_t));
+    
+    // Reallocate backtracking buffers
+    cudaFree(g_storage->d_backtrack_p);
+    cudaFree(g_storage->d_backtrack_off);
+    cudaFree(g_storage->d_backtrack_n_col);
+    cudaFree(g_storage->d_cigar_buffer);
+    cudaFree(g_storage->d_cigar_lengths);
+    
+    cudaMalloc(&g_storage->d_backtrack_p, 
+               g_storage->max_tasks * g_storage->max_backtrack_size);
+    cudaMalloc(&g_storage->d_backtrack_off, 
+               g_storage->max_tasks * max_antidiag * sizeof(int));
+    cudaMalloc(&g_storage->d_backtrack_n_col, 
+               g_storage->max_tasks * sizeof(int));
+    cudaMalloc(&g_storage->d_cigar_buffer, 
+               g_storage->max_tasks * g_storage->max_cigar_len * sizeof(uint32_t));
+    cudaMalloc(&g_storage->d_cigar_lengths, 
+               g_storage->max_tasks * sizeof(int));
+    
+    // Reallocate host CIGAR buffers
+    free(g_storage->h_cigar_buffer);
+    free(g_storage->h_cigar_lengths);
+    g_storage->h_cigar_buffer = (uint32_t*)calloc(
+        g_storage->max_tasks * g_storage->max_cigar_len, sizeof(uint32_t));
+    g_storage->h_cigar_lengths = (int*)calloc(g_storage->max_tasks, sizeof(int));
+    
+    // Reallocate other task-dependent buffers
+    cudaFree(g_storage->d_task_to_align_id);
+    free(g_storage->h_task_to_align_id);
+    free(g_storage->h_sort_buffer);
+    
+    cudaMalloc(&g_storage->d_task_to_align_id, g_storage->max_tasks * sizeof(int32_t));
+    g_storage->h_task_to_align_id = (int32_t*)calloc(g_storage->max_tasks, sizeof(int32_t));
+    g_storage->h_sort_buffer = (short2*)calloc(g_storage->max_tasks, sizeof(short2));
+    
+    // Reallocate result arrays
+    free(g_storage->host_res->aln_score);
+    free(g_storage->host_res->query_batch_end);
+    free(g_storage->host_res->target_batch_end);
+    
+    g_storage->host_res->aln_score = (int32_t*)calloc(g_storage->max_tasks, sizeof(int32_t));
+    g_storage->host_res->query_batch_end = (int32_t*)calloc(g_storage->max_tasks, sizeof(int32_t));
+    g_storage->host_res->target_batch_end = (int32_t*)calloc(g_storage->max_tasks, sizeof(int32_t));
+    
+    cudaFree(g_storage->device_res_ptrs->aln_score);
+    cudaFree(g_storage->device_res_ptrs->query_batch_end);
+    cudaFree(g_storage->device_res_ptrs->target_batch_end);
+    
+    cudaMalloc(&g_storage->device_res_ptrs->aln_score, g_storage->max_tasks * sizeof(int32_t));
+    cudaMalloc(&g_storage->device_res_ptrs->query_batch_end, g_storage->max_tasks * sizeof(int32_t));
+    cudaMalloc(&g_storage->device_res_ptrs->target_batch_end, g_storage->max_tasks * sizeof(int32_t));
+    
+    cudaMemcpy(g_storage->device_res, g_storage->device_res_ptrs, 
+               sizeof(gasal_res_t), cudaMemcpyHostToDevice);
     
     return 0;
 }
 
-extern "C" void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks, 
+extern "C" void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks, 
                             uint8_t *seq_buffer, uint32_t *cigar_buffer);
-void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks, 
+void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks, 
                             uint8_t *seq_buffer, uint32_t *cigar_buffer) {
     if (n_tasks <= 0) return;
     
@@ -302,7 +367,7 @@ void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks,
             h_unpacked_target[h_target_offsets[i] + j] = 0x0F;
         }
     }
-    
+
     // Copy to GPU
     cudaMemcpyAsync(g_storage->d_unpacked_query, h_unpacked_query, 
                     total_query_bytes, cudaMemcpyHostToDevice, g_storage->stream);
@@ -316,7 +381,7 @@ void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks,
                     n_tasks * sizeof(uint32_t), cudaMemcpyHostToDevice, g_storage->stream);
     cudaMemcpyAsync(g_storage->d_target_lens, h_target_lens, 
                     n_tasks * sizeof(uint32_t), cudaMemcpyHostToDevice, g_storage->stream);
-    
+
     // Launch packing kernel
     int query_tasks_per_thread = (int)ceil((double)total_query_bytes / 
                                           (8 * g_storage->kernel_threads * g_storage->kernel_blocks));
@@ -369,7 +434,13 @@ void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks,
                        ((32 * (8 * (g_storage->slice_width + 1))) + 28) * sizeof(int32_t);
     cudaFuncSetAttribute(agatha_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);
     
-    agatha_kernel<<<g_storage->kernel_blocks, g_storage->kernel_threads, 
+    int8_t h_scoring_matrix[25];
+    ksw_gen_simple_mat(5, h_scoring_matrix, opt->a, opt->b, opt->sc_ambi);
+    cudaMemcpyAsync(g_storage->mat, h_scoring_matrix, 25 * sizeof(int8_t),
+                    cudaMemcpyHostToDevice, g_storage->stream);
+
+    // ===== KSW Alignment Kernel (Phase 1: Compute scores and save backtrack) =====
+    ksw_global_cuda_kernel<<<g_storage->kernel_blocks, g_storage->kernel_threads, 
                     shared_mem, g_storage->stream>>>(
         g_storage->d_packed_query,
         g_storage->d_packed_target,
@@ -378,13 +449,48 @@ void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks,
         g_storage->d_query_offsets,
         g_storage->d_target_offsets,
         g_storage->device_res,
-        NULL, // device_res_second not used
-        g_storage->d_packed_tb_matrices,
+        g_storage->mat, 
+        g_storage->d_backtrack_p,
+        g_storage->d_backtrack_off,
+        g_storage->d_backtrack_n_col,
+        g_storage->max_backtrack_size,
         n_tasks,
-        g_storage->max_query_len,
-        g_storage->d_global_buffer
+        5,  // m = alphabet size(ACGTN)
+        g_config.gap_open, 
+        g_config.gap_extend,
+        g_storage->band_width
     );
-    
+
+    // ===== KSW Backtracking Kernel (Phase 2: Generate CIGAR) =====
+    //FIXME: skip backtrack for now
+    if (!cigar_buffer) {
+        ksw_backtrack_kernel<<<g_storage->kernel_blocks, g_storage->kernel_threads,
+                        shared_mem, g_storage->stream>>>(
+            g_storage->d_backtrack_p,
+            g_storage->d_backtrack_off,
+            g_storage->d_backtrack_n_col,
+            g_storage->d_query_lens,
+            g_storage->d_target_lens,
+            g_storage->device_res,
+            g_storage->d_cigar_buffer,
+            g_storage->d_cigar_lengths,
+            g_storage->max_cigar_len,
+            g_storage->max_backtrack_size,
+            n_tasks,
+            g_config.gap_open
+        );
+        
+        // Copy CIGAR results back to host
+        cudaMemcpyAsync(g_storage->h_cigar_buffer,
+                        g_storage->d_cigar_buffer,
+                        n_tasks * g_storage->max_cigar_len * sizeof(uint32_t),
+                        cudaMemcpyDeviceToHost, g_storage->stream);
+        cudaMemcpyAsync(g_storage->h_cigar_lengths,
+                        g_storage->d_cigar_lengths,
+                        n_tasks * sizeof(int),
+                        cudaMemcpyDeviceToHost, g_storage->stream);
+    }
+
     // Copy results back
     cudaMemcpyAsync(g_storage->host_res->aln_score, 
                     g_storage->device_res_ptrs->aln_score,
@@ -410,25 +516,34 @@ void gpu_align_batch_execute(gpu_align_task_t *tasks, int n_tasks,
         tasks[i].max_q = g_storage->host_res->query_batch_end[align_id];
         tasks[i].max_t = g_storage->host_res->target_batch_end[align_id];
         
-        // Generate basic CIGAR if buffer provided
-        if (cigar_buffer && tasks[i].cigar_offset < tasks[i].max_cigar) {
-            // For now, generate simple match CIGAR
-            // TODO: Implement proper CIGAR generation or traceback
-            int match_len = (tasks[i].max_q < tasks[i].max_t) ? 
-                           tasks[i].max_q : tasks[i].max_t;
-            if (match_len > 0) {
-                cigar_buffer[tasks[i].cigar_offset] = (match_len << 4) | 0; // M operation
-                tasks[i].n_cigar = 1;
-            } else {
-                tasks[i].n_cigar = 0;
+        // Copy CIGAR to output buffer
+        if (cigar_buffer) {
+            int n_cigar = g_storage->h_cigar_lengths[align_id];
+            tasks[i].n_cigar = n_cigar;
+            
+            // Copy CIGAR operations
+            if (n_cigar > 0 && tasks[i].cigar_offset + n_cigar <= tasks[i].max_cigar) {
+                memcpy(cigar_buffer + tasks[i].cigar_offset,
+                       g_storage->h_cigar_buffer + align_id * g_storage->max_cigar_len,
+                       n_cigar * sizeof(uint32_t));
             }
+        } else {
+            tasks[i].n_cigar = 0;
         }
         
         // Set completion flags
         tasks[i].reach_end = (tasks[i].max_q == tasks[i].qlen) && 
                             (tasks[i].max_t == tasks[i].tlen);
-        tasks[i].zdropped = 0; // AGATHA doesn't provide zdrop info directly
+        tasks[i].zdropped = 0;
     }
+    
+    // Cleanup host buffers
+    free(h_unpacked_query);
+    free(h_unpacked_target);
+    free(h_query_offsets);
+    free(h_target_offsets);
+    free(h_query_lens);
+    free(h_target_lens);
 }
 
 void gpu_align_cleanup() {

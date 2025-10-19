@@ -39,6 +39,18 @@ typedef struct {
     gasal_res_t *device_res_ptrs;  // Host-side copy of device pointers
     gasal_res_t *host_res;         // Host-side results
     
+    // === KSW Backtracking Arrays ===
+    uint8_t *d_backtrack_p;        // Backtrack matrix buffer (per task)
+    int *d_backtrack_off;          // Offset array buffer (per task)
+    int *d_backtrack_n_col;        // Number of columns for each task
+    uint32_t *d_cigar_buffer;      // CIGAR operations buffer
+    int *d_cigar_lengths;          // Length of CIGAR for each task
+    uint32_t *h_cigar_buffer;      // Host CIGAR buffer
+    int *h_cigar_lengths;          // Host CIGAR lengths
+    size_t max_backtrack_size;     // Max backtrack matrix size per task
+    size_t max_cigar_len;          // Max CIGAR length per task
+    int8_t* mat;
+
     // === AGATHA Specific ===
     short2 *d_global_buffer;        // AGATHA kernel working buffer
     short2 *h_sort_buffer;         // Host buffer for sorting

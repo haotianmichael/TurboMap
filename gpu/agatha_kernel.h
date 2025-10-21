@@ -1,7 +1,6 @@
 #ifndef __AGATHA_KERNEL__
 #define __AGATHA_KERNEL__
 
-
 // This old core provides the same result as the currently LOCAL core, but lacks some optimization. Left for historical / comparative purposes.
 // Deprecated code from GASAL2 (left as reference)
 #define CORE_LOCAL_DEPRECATED_COMPUTE() \
@@ -584,8 +583,7 @@ __global__ void ksw_backtrack_kernel(
     cigar_offsets[task_id] = n_cigar;
 }
 
-
-__global__ void ksw_global_cuda_kernel(
+__global__ void ksw_semi_global_cuda_kernel(
     uint32_t *packed_query_batch,
     uint32_t *packed_ref_batch,
     uint32_t *query_batch_lens,
@@ -594,196 +592,366 @@ __global__ void ksw_global_cuda_kernel(
     uint32_t *target_batch_offsets,
     gasal_res_t *device_res,
     int8_t *device_mat,
-    uint8_t *backtrack_p,        // Pre-allocated backtrack matrix buffer
-    int *backtrack_off,          // Pre-allocated offset buffer
-    int *backtrack_n_col,        // Store n_col for each task
-    int max_backtrack_size,      // Max size for backtrack matrix per task
+    uint8_t *backtrack_p,
+    int *backtrack_off,
+    int *backtrack_off_end,
+    int *backtrack_n_col,
+    int max_backtrack_size,
+    ksw_extz_t *ez_array,
+    void *d_temp_buffer,       
+    size_t temp_per_task,        
     int n_tasks,
     int8_t m,
-    int8_t gapo,
-    int8_t gape,
-    int w  // band width, <0 to disable
+    int32_t zdrop,
+    int end_bonus,
+    int flag
 )
 {
+    int8_t q = _cudaGapO;
+    int8_t e = _cudaGapExtend;
+    int8_t q2 = _cudaGapOL;
+    int8_t e2 = _cudaGapExtendL;
+    int32_t w = _cudaBandWidth;
+
     const int warp_size = 32;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int warp_id = tid / warp_size;
     const int lane_id = tid % warp_size;
     
     if (warp_id >= n_tasks) return;
-    
-    // Get sequence info for this task
+    if (lane_id != 0) return;
+
     int task_id = warp_id;
     int qlen = query_batch_lens[task_id];
     int tlen = target_batch_lens[task_id];
+    ksw_extz_t* ez = &ez_array[task_id];
+
+    // Handle empty sequences
+    if (qlen <= 0 || tlen <= 0) {
+        ez->max = -0x40000000;
+        ez->max_q = ez->max_t = -1;
+        ez->score = 0;
+        ez->zdropped = 0;
+        device_res->aln_score[task_id] = 0;
+        device_res->query_batch_end[task_id] = -1;
+        device_res->target_batch_end[task_id] = -1;
+        return;
+    }
+
     int packed_query_offset = query_batch_offsets[task_id] >> 3;
     int packed_target_offset = target_batch_offsets[task_id] >> 3;
-    
-    // Gap penalties
-    int qe = gapo + gape;
-    int qe2 = qe + qe;
-    
-    // Band width
-    int bandwidth = (w < 0) ? max(qlen, tlen) : w;
-    int n_col = min(bandwidth + 1, tlen);
-    
-    // Allocate arrays in global memory (simplified version)
-    // In production, use shared memory or pre-allocated buffers
-    int8_t *u = NULL;  // H[i,j] - H[i-1,j]
-    int8_t *v = NULL;  // H[i,j] - H[i,j-1]
-    int8_t *x = NULL;  // E[i+1,j] - H[i,j]
-    int8_t *y = NULL;  // F[i,j+1] - H[i,j]
-    int8_t *s = NULL;  // match/mismatch scores
-    
-    // Backtrack arrays stored in global memory
-    uint8_t *p = backtrack_p + (size_t)task_id * max_backtrack_size;
-    int *off = backtrack_off + (size_t)task_id * (qlen + tlen);
-    
-    // Only lane 0 allocates (in real implementation, pre-allocate or use shared mem)
-    if (lane_id == 0) {
-        u = (int8_t*)malloc((tlen + 1) * sizeof(int8_t));
-        v = (int8_t*)malloc((tlen + 1) * sizeof(int8_t));
-        x = (int8_t*)malloc((tlen + 1) * sizeof(int8_t));
-        y = (int8_t*)malloc((tlen + 1) * sizeof(int8_t));
-        s = (int8_t*)malloc(tlen * sizeof(int8_t));
-        
-        // Initialize arrays
-        for (int i = 0; i <= tlen; i++) {
-            u[i] = v[i] = x[i] = y[i] = 0;
-        }
+
+    // Gap penalties swap
+    if(q2 + e2 < q + e) {
+        int8_t tmp = q; q = q2; q2 = tmp;
+        tmp = e; e = e2; e2 = tmp;
     }
+    int qe = q + e;
+    int qe2 = q2 + e2;
+
+    // Band width
+    int wl = (w < 0) ? max(qlen, tlen) : w;
+    int wr = (w < 0) ? max(qlen, tlen) : w;
+
+    // Long gap threshold
+    int long_thres = (e != e2) ? (q2 - q) / (e - e2) - 1 : 0;
+    if(q2 + e2 + long_thres * e2 > q + e + long_thres * e) {
+        ++long_thres;
+    }
+    int32_t long_diff = long_thres * (e - e2) - (q2 - q) - e2;
+
+    // === 从预分配缓冲区分配内存 ===
+    char *task_buf = (char*)d_temp_buffer + task_id * temp_per_task;
     
-    __syncwarp();
+    // 布局: H | u,v,x,y,x2,y2,s | qr,target
+    size_t offset = 0;
     
-    if (lane_id != 0 || u == NULL) return;  // Only lane 0 computes
+    // H array (int32_t)
+    int32_t *H = (int32_t*)(task_buf + offset);
+    offset += tlen * sizeof(int32_t);
     
-    // Unpack query to reverse query array
-    uint8_t *qr = (uint8_t*)malloc(qlen * sizeof(uint8_t));
+    // u,v,x,y,x2,y2,s (int8_t, each tlen+1 except s=tlen)
+    int8_t *u = (int8_t*)(task_buf + offset);
+    offset += (tlen + 1) * sizeof(int8_t);
+    int8_t *v = (int8_t*)(task_buf + offset);
+    offset += (tlen + 1) * sizeof(int8_t);
+    int8_t *x = (int8_t*)(task_buf + offset);
+    offset += (tlen + 1) * sizeof(int8_t);
+    int8_t *y = (int8_t*)(task_buf + offset);
+    offset += (tlen + 1) * sizeof(int8_t);
+    int8_t *x2 = (int8_t*)(task_buf + offset);
+    offset += (tlen + 1) * sizeof(int8_t);
+    int8_t *y2 = (int8_t*)(task_buf + offset);
+    offset += (tlen + 1) * sizeof(int8_t);
+    int8_t *s = (int8_t*)(task_buf + offset);
+    offset += tlen * sizeof(int8_t);
+    
+    // qr, target (uint8_t)
+    uint8_t *qr = (uint8_t*)(task_buf + offset);
+    offset += qlen * sizeof(uint8_t);
+    uint8_t *target = (uint8_t*)(task_buf + offset);
+
+    // Initialize H to KSW_NEG_INF
+    for (int i = 0; i < tlen; ++i) {
+        H[i] = -0x40000000;
+    }
+
+    // Initialize u,v,x,y,x2,y2
+    for (int i = 0; i <= tlen; i++) {
+        u[i] = -q - e;
+        v[i] = -q - e;
+        x[i] = -q - e;
+        y[i] = -q - e;
+        x2[i] = -q2 - e2;
+        y2[i] = -q2 - e2;
+    }
+
+    // Unpack query (reverse)
     for (int i = 0; i < qlen; i++) {
         int packed_idx = i / 8;
         int bit_offset = (7 - (i % 8)) * 4;
         uint32_t packed_val = packed_query_batch[packed_query_offset + packed_idx];
         qr[qlen - 1 - i] = (packed_val >> bit_offset) & 0xF;
     }
-    
-    // Unpack target sequence
-    uint8_t *target = (uint8_t*)malloc(tlen * sizeof(uint8_t));
+
+    // Unpack target
     for (int i = 0; i < tlen; i++) {
         int packed_idx = i / 8;
         int bit_offset = (7 - (i % 8)) * 4;
         uint32_t packed_val = packed_ref_batch[packed_target_offset + packed_idx];
         target[i] = (packed_val >> bit_offset) & 0xF;
     }
-    
+
+    // Initialize ez
+    ez->max = -0x40000000;
+    ez->mqe = -0x40000000;
+    ez->mte = -0x40000000;
+    ez->max_q = ez->max_t = -1;
+    ez->mqe_t = ez->mte_q = -1;
+    ez->score = -0x40000000;
+    ez->reach_end = 0;
+    ez->zdropped = 0;
+
     int last_H0_t = 0;
     int H0 = 0;
-    
-    // Main KSW loop: iterate over anti-diagonals (r = i + j)
+    int last_st = -1, last_en = -1;
+    int n_col = min(qlen, tlen);
+    n_col = min(wl + 1, n_col);
+    int with_cigar = !(flag & 0x01);
+    int approx_max = !!(flag & 0x02);
+
+    // Backtrack buffers
+    uint8_t *p = backtrack_p + (size_t)task_id * max_backtrack_size;
+    int *off = backtrack_off + (size_t)task_id * (qlen + tlen);
+    int *off_end = backtrack_off_end + (size_t)task_id * (qlen + tlen);
+
+    // Main KSW loop
     for (int r = 0; r < qlen + tlen - 1; r++) {
         int st = 0, en = tlen - 1;
-        
+        int st0, en0;
+
         // Determine band boundaries
         if (st < r - qlen + 1) st = r - qlen + 1;
         if (en > r) en = r;
-        if (st < (r - bandwidth + 1) >> 1) st = (r - bandwidth + 1) >> 1;
-        if (en > (r + bandwidth) >> 1) en = (r + bandwidth) >> 1;
+        if (st < (r - wr + 1) >> 1) st = (r - wr + 1) >> 1;
+        if (en > (r + wl) >> 1) en = (r + wl) >> 1;
         
+        if (st > en) {
+            ez->zdropped = 1;
+            break;
+        }
+
+        // Clip to valid range
+        st0 = (st < 0) ? 0 : st;
+        en0 = (en >= tlen) ? tlen - 1 : en;
+        if (st0 > en0) {
+            ez->zdropped = 1;
+            break;
+        }
+
         // Initialize boundary conditions
-        int8_t x1, v1;
-        if (st != 0) {
-            if (r > st + st + bandwidth - 1) {
-                x1 = 0; v1 = 0;
-            } else {
-                x1 = s[st - 1];
+        int8_t x1, v1, x21;
+        if (st > 0) {
+            if(st - 1 >= last_st && st - 1 <= last_en) {
+                x1 = x[st - 1];
+                x21 = x2[st - 1];
                 v1 = v[st - 1];
+            } else {
+                x1 = -q - e;
+                x21 = -q2 - e2;
+                v1 = -q - e;
             }
         } else {
-            x1 = 0;
-            v1 = r ? gapo : 0;
-        }
-        
-        if (en != r) {
-            if (r < en + en - bandwidth - 1) {
-                y[en] = 0;
-                u[en] = 0;
+            x1 = -q - e;
+            x21 = -q2 - e2;
+            if(r == 0) {
+                v1 = -q - e;
+            } else if(r < long_thres) {
+                v1 = -e;
+            } else if(r == long_thres) {
+                v1 = (int8_t)long_diff;
+            } else {
+                v1 = -e2;
             }
-        } else {
-            y[r] = 0;
-            u[r] = r ? gapo : 0;
         }
         
-        // Compute match/mismatch scores for this anti-diagonal
-        for (int t = st; t <= en; t++) {
-            int qi = t + qlen - 1 - r;
+        if (en >= r) {
+            y[r] = -q - e;
+            y2[r] = -q2 - e2;
+            if(r == 0) {
+                u[r] = -q - e;
+            } else if(r < long_thres) {
+                u[r] = -e;	
+            } else if(r == long_thres) {
+                u[r] = (int8_t)long_diff;
+            } else {
+                u[r] = -e2;
+            }
+        }
+        
+        // Compute scores
+        for (int t = st0; t <= en0; t++) {
+            int qi = r - t;
             if (qi >= 0 && qi < qlen && t < tlen) {
                 s[t] = device_mat[target[t] * m + qr[qi]];
             }
         }
+
+        if(with_cigar) {
+            off[r] = st;
+            off_end[r] = en;
+        }
         
-        // Store offset for backtracking
-        off[r] = st;
-        uint8_t *pr = p + (size_t)r * n_col;
+        uint8_t *pr = p + (size_t)r * n_col - st0;
         
-        // KSW differential recurrence along the anti-diagonal
-        for (int t = st; t <= en; t++) {
-            uint8_t d;
-            int8_t u1;
-            
-            // z = max(s[t] + 2qe, x1 + v1, y[t] + u[t])
-            int8_t z = s[t] + qe2;
+        // DP recurrence
+        for (int t = st0; t <= en0; t++) {
+            int8_t z = s[t];
             int8_t a = x1 + v1;
             int8_t b = y[t] + u[t];
-            
-            // Track which achieves max
-            d = (a > z) ? 1 : 0;
-            z = (a > z) ? a : z;
-            d = (b > z) ? 2 : d;
-            z = (b > z) ? b : z;
-            
-            // Update differences
-            u1 = u[t];
+            int8_t a2 = x21 + v1;
+            int8_t b2 = y2[t] + u[t];
+
+            uint8_t d = 0;
+            int8_t u1 = u[t];
             u[t] = z - v1;
             v1 = v[t];
             v[t] = z - u1;
             
-            z -= gapo;
-            a -= z;
-            b -= z;
+            if (a > z) { z = a; d = 1; }
+            if (b > z) { z = b; d = 2; }
+            if (a2 > z) { z = a2; d = 3; }
+            if (b2 > z) { z = b2; d = 4; }
+
+            int8_t sc_mch = device_mat[0];
+            if (z > sc_mch) z = sc_mch;
+
+            int tmp = z - q;
+            a -= tmp; b -= tmp;
+            tmp = z - q2;
+            a2 -= tmp; b2 -= tmp;
             
             x1 = x[t];
-            d |= (a > 0) ? 0x08 : 0;
-            x[t] = (a > 0) ? a : 0;
-            d |= (b > 0) ? 0x10 : 0;
-            y[t] = (b > 0) ? b : 0;
+            if (a > 0) { x[t] = a - qe; d |= 0x08; } else { x[t] = -qe; }
+            if (b > 0) { y[t] = b - qe; d |= 0x10; } else { y[t] = -qe; }
+            if (a2 > 0) { x2[t] = a2 - qe2; d |= 0x20; } else { x2[t] = -qe2; }
+            if (b2 > 0) { y2[t] = b2 - qe2; d |= 0x40; } else { y2[t] = -qe2; }
             
-            // Store backtrack info
-            pr[t - st] = d;
+            if(with_cigar) {
+                pr[t - st0] = d;
+            }
         }
         
-        // Update H0 (score at [0,0] -> [qlen-1, tlen-1])
-        if (r > 0) {
-            if (last_H0_t >= st && last_H0_t <= en) {
-                H0 += v[last_H0_t] - qe;
+        if(!approx_max) {
+            int32_t max_H, max_t;
+            if (r == 0) {
+                H[0] = (int32_t)v[0];
+                max_H = H[0];
+                max_t = 0;
             } else {
-                ++last_H0_t;
-                H0 += u[last_H0_t] - qe;
+                for (int t = st0; t < en0; ++t) {
+                    H[t] += (int32_t)v[t];
+                }
+                if (en0 == 0) {
+                    H[en0] = (int32_t)v[en0];
+                } else if (en0 - 1 >= st0) {
+                    H[en0] = H[en0 - 1] + (int32_t)u[en0];
+                } else {
+                    H[en0] = (int32_t)v[en0];
+                }
+
+                max_H = H[st0];
+                max_t = st0;
+                for (int t = st0 + 1; t <= en0; ++t) {
+                    if (H[t] > max_H) {
+                        max_H = H[t];
+                        max_t = t;
+                    }
+                }
+            }
+
+            int j = max_t;
+            int i = r - j;
+            if (max_H > ez->max) {
+                ez->max = max_H;
+                ez->max_t = j;
+                ez->max_q = i;
+            } else if (j >= ez->max_t && i >= ez->max_q) {
+                int tl = j - ez->max_t;
+                int ql = i - ez->max_q;
+                int l = (tl > ql) ? (tl - ql) : (ql - tl);
+                if (zdrop >= 0 && ez->max - max_H > zdrop + l * e2) {
+                    ez->zdropped = 1;
+                    break;
+                }
+            }
+
+            if (en0 == tlen - 1 && H[en0] > ez->mte) {
+                ez->mte = H[en0];
+                ez->mte_q = r - en0;
+            }
+            if (r - st0 == qlen - 1 && H[st0] > ez->mqe) {
+                ez->mqe = H[st0];
+                ez->mqe_t = st0;
+            }
+            if (r == qlen + tlen - 2 && en0 == tlen - 1) {
+                ez->score = H[tlen - 1];
             }
         } else {
-            H0 = v[0] - qe - qe;
-            last_H0_t = 0;
+            // Approximate branch (kept minimal)
+            if (r > 0) {
+                if (last_H0_t >= st0 && last_H0_t <= en0 && 
+                    last_H0_t + 1 >= st0 && last_H0_t + 1 <= en0) {
+                    int32_t d0 = v[last_H0_t];
+                    int32_t d1 = u[last_H0_t + 1];
+                    if (d0 > d1) H0 += d0;
+                    else { H0 += d1; ++last_H0_t; }
+                } else if (last_H0_t >= st0 && last_H0_t <= en0) {
+                    H0 += v[last_H0_t];
+                } else {
+                    ++last_H0_t;
+                    H0 += u[last_H0_t];
+                }
+            } else {
+                H0 = v[0];
+                last_H0_t = 0;
+            }
+            if (r == qlen + tlen - 2 && en0 == tlen - 1) {
+                ez->score = H0;
+            }
         }
+        last_st = st;
+        last_en = en;
     }
-    
-    // Store results and backtrack info
-    device_res->aln_score[task_id] = H0;
-    device_res->query_batch_end[task_id] = qlen - 1;
-    device_res->target_batch_end[task_id] = tlen - 1;
-    backtrack_n_col[task_id] = n_col;
-    
-    // Cleanup temporary arrays only (p and off are in pre-allocated global memory)
-    free(u); free(v); free(x); free(y); free(s);
-    free(qr); free(target);
-}
 
+    // Store results
+    device_res->aln_score[task_id] = ez->score;
+    device_res->query_batch_end[task_id] = ez->reach_end ? qlen - 1 : ez->max_q;
+    device_res->target_batch_end[task_id] = ez->reach_end ? tlen - 1 : ez->max_t;
+
+    if (with_cigar) {
+        backtrack_n_col[task_id] = n_col;
+    }
+}
 
 #endif

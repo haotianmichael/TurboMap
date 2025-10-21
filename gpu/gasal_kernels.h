@@ -26,11 +26,13 @@ struct SameType<T, T>
 #define SAMETYPE(a, b) (SameType<a,b>::result)
 
 
-__constant__ int32_t _cudaGapO; /*gap open penalty*/
+__constant__ int8_t _cudaGapO; /*gap open penalty*/
 __constant__ int32_t _cudaGapOE; /*sum of gap open and extension penalties*/
-__constant__ int32_t _cudaGapExtend; /*sum of gap extend*/
-__constant__ int32_t _cudaMatchScore; /*score for a match*/
-__constant__ int32_t _cudaMismatchScore; /*penalty for a mismatch*/
+__constant__ int8_t _cudaGapOL;
+__constant__ int8_t _cudaGapExtendL;
+__constant__ int8_t _cudaGapExtend; /*sum of gap extend*/
+__constant__ int8_t _cudaMatchScore; /*score for a match*/
+__constant__ int8_t _cudaMismatchScore; /*penalty for a mismatch*/
 __constant__ int32_t _cudaSliceWidth; /*(AGAThA) slice width*/
 __constant__ int32_t _cudaZThreshold; /*(AGAThA) zdrop threshold*/
 __constant__ int32_t _cudaBandWidth; /*(AGAThA) band width*/

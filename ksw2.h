@@ -27,7 +27,7 @@
 extern "C" {
 #endif
 
-typedef struct {
+/*typedef struct {
 	uint32_t max:31, zdropped:1;
 	int max_q, max_t;      // max extension coordinate
 	int mqe, mqe_t;        // max score when reaching the end of query
@@ -36,8 +36,18 @@ typedef struct {
 	int m_cigar, n_cigar;
 	int reach_end;
 	uint32_t *cigar;
+} ksw_extz_t;*/
+typedef struct {
+    int32_t max;
+    uint32_t zdropped:1;
+    int32_t max_q, max_t;
+    int32_t mqe, mqe_t;
+    int32_t mte, mte_q;
+    int32_t score;
+    int32_t m_cigar, n_cigar;
+    int32_t reach_end;
+    uint32_t *cigar;
 } ksw_extz_t;
-
 /**
  * NW-like extension
  *

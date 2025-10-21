@@ -18,10 +18,12 @@ static align_config_t g_config = {
     .slice_width = 3,
     .z_threshold = 400,
     .band_width = 751,
-    .match_score = 1,
+    .match_score = 2,
     .mismatch_score = 4,
-    .gap_open = 6,
-    .gap_extend = 2
+    .gap_open = 4,
+    .gap_extend = 2,
+    .gap_open_long = 24,
+    .gap_extend_long = 1
 };
 
 gpu_align_storage_t *g_storage = NULL;
@@ -45,12 +47,14 @@ static void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc
 void gasal_copy_subst_scores(gasal_subst_scores *subst){
 
 	cudaError_t err;
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapO, &(subst->gap_open), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapExtend, &(subst->gap_extend), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
+	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapO, &(subst->gap_open), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapExtend, &(subst->gap_extend), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapOL, &(subst->gap_open_long), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapExtendL, &(subst->gap_extend_long), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
 	int32_t gapoe = (subst->gap_open + subst->gap_extend);
 	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapOE, &(gapoe), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaMatchScore, &(subst->match), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaMismatchScore, &(subst->mismatch), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
+	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaMatchScore, &(subst->match), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaMismatchScore, &(subst->mismatch), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
 	// For AGAThA
 	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaSliceWidth, &(subst->slice_width), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
 	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaZThreshold, &(subst->z_threshold), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
@@ -67,30 +71,28 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     // Set configuration
     g_storage->kernel_blocks = g_config.blocks;
     g_storage->kernel_threads = g_config.threads;
-    g_storage->slice_width = g_config.slice_width;
-    g_storage->z_threshold = g_config.z_threshold;
-    g_storage->band_width = g_config.band_width;
-    
-    // Set initial capacities
     g_storage->max_tasks = initial_tasks;
     g_storage->max_query_bytes = initial_seq_bytes;
     g_storage->max_target_bytes = initial_seq_bytes;
-    g_storage->max_query_len = 100000; // Default max query length
+    g_storage->max_query_len = 100000; 
 
-    // Calculate backtracking buffer sizes
-    // Backtrack matrix: for each task, (qlen + tlen) * n_col
-    // Worst case: n_col = bandwidth + 1, max_len = max_query_len
-    // Conservative estimate: 2 * max_query_len * (bandwidth + 1)
-
-    size_t max_antidiag = 2 * g_storage->max_query_len;
-    size_t max_n_col = (g_storage->band_width < 0) ? 
-                       g_storage->max_query_len : (g_storage->band_width + 1);
-    g_storage->max_backtrack_size = 1; //FIXME: max_antidiag * max_n_col;
-    g_storage->max_cigar_len = 1; //FIXME: 2 * g_storage->max_query_len; // Worst case: all indels
+    // Copy substitution scores to device constants
+    gasal_subst_scores subst;
+    subst.match = g_config.match_score;
+    subst.mismatch = g_config.mismatch_score;
+    subst.gap_open = g_config.gap_open;
+    subst.gap_extend = g_config.gap_extend;
+    subst.gap_open_long = g_config.gap_open_long;
+    subst.gap_extend_long = g_config.gap_extend_long;
+    subst.slice_width = g_config.slice_width;
+    subst.z_threshold = g_config.z_threshold;
+    subst.band_width = g_config.band_width;
+    gasal_copy_subst_scores(&subst);
 
     // Create CUDA stream
     cudaStreamCreate(&g_storage->stream);
-    
+    cudaMalloc(&g_storage->mat, 25 * sizeof(int8_t));
+
     // Allocate device memory for sequences
     cudaMalloc(&g_storage->d_unpacked_query, g_storage->max_query_bytes);
     cudaMalloc(&g_storage->d_unpacked_target, g_storage->max_target_bytes);
@@ -103,22 +105,50 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     cudaMalloc(&g_storage->d_query_lens, g_storage->max_tasks * sizeof(uint32_t));
     cudaMalloc(&g_storage->d_target_lens, g_storage->max_tasks * sizeof(uint32_t));
 
-    // Allocate KSW backtracking buffers FIXME: g_storage->max_tasks
-    cudaMalloc(&g_storage->d_backtrack_p, 
-               1 * g_storage->max_backtrack_size);
-    cudaMalloc(&g_storage->d_backtrack_off, 
-               1 * max_antidiag * sizeof(int));
-    cudaMalloc(&g_storage->d_backtrack_n_col, 
-               1 * sizeof(int));
-    cudaMalloc(&g_storage->d_cigar_buffer, 
-               1 * g_storage->max_cigar_len * sizeof(uint32_t));
-    cudaMalloc(&g_storage->d_cigar_lengths, 
-               1 * sizeof(int));
-    cudaMalloc(&g_storage->mat, 25 * sizeof(int8_t));
+
+     // Allocate AGATHA global buffer
+    size_t global_buffer_size = g_storage->kernel_blocks * (g_storage->kernel_threads / 8) * 
+                                g_storage->max_query_len * 4;
+    cudaMalloc(&g_storage->d_global_buffer, global_buffer_size * sizeof(short2));
     
+    // Allocate host sorting buffer
+    g_storage->h_sort_buffer = (short2*)calloc(g_storage->max_tasks, sizeof(short2));
+
+    size_t max_len = g_storage->max_query_len;
+    size_t H_size = max_len * sizeof(int32_t);
+    size_t u8_arrays_size = (max_len + 1) * 7 * sizeof(int8_t); // u,v,x,y,x2,y2,s
+    size_t seq_size = max_len * 2 * sizeof(uint8_t);           // qr, target
+    size_t raw_size = H_size + u8_arrays_size + seq_size;
+    g_storage->ksw_temp_per_task = (raw_size + 7) & ~7ULL;  // 8-byte alignment
+    cudaError_t err = cudaMalloc(&g_storage->d_ksw_temp_buffer, 
+                             244 * g_storage->ksw_temp_per_task);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] Failed to allocate d_ksw_temp_buffer: %s (requested %.2f GB)\n",
+                cudaGetErrorString(err),
+                (g_storage->max_tasks * (double)g_storage->ksw_temp_per_task) / (1024*1024*1024));
+        return -1;
+    }
+    
+    // ==============================Result and Backtrack==============================
+    // Calculate backtracking buffer sizes
+    // Backtrack matrix: for each task, (qlen + tlen) * n_col
+    // Worst case: n_col = bandwidth + 1, max_len = max_query_len
+    // Conservative estimate: 2 * max_query_len * (bandwidth + 1)
+    size_t max_antidiag = 2 * g_storage->max_query_len;
+    size_t max_n_col = (g_config.band_width < 0) ? 
+                       g_storage->max_query_len : (g_config.band_width + 1);
+    g_storage->max_backtrack_size = 1; //FIXME: max_antidiag * max_n_col;
+    g_storage->max_cigar_len = 1; //FIXME: 2 * g_storage->max_query_len; // Worst case: all indels
+
+    // Allocate KSW backtracking buffers FIXME: g_storage->max_tasks
+    cudaMalloc(&g_storage->d_backtrack_p, 1 * g_storage->max_backtrack_size);
+    cudaMalloc(&g_storage->d_backtrack_off, 1 * max_antidiag * sizeof(int));
+    cudaMalloc(&g_storage->d_backtrack_off_end, 1 * max_antidiag * sizeof(int));
+    cudaMalloc(&g_storage->d_backtrack_n_col, 1 * sizeof(int));
+    cudaMalloc(&g_storage->d_cigar_buffer, 1 * g_storage->max_cigar_len * sizeof(uint32_t));
+    cudaMalloc(&g_storage->d_cigar_lengths, 1 * sizeof(int));
     // Allocate host CIGAR buffers  FIXME: g_storage->max_tasks
-    g_storage->h_cigar_buffer = (uint32_t*)calloc(
-        1 * g_storage->max_cigar_len, sizeof(uint32_t));
+    g_storage->h_cigar_buffer = (uint32_t*)calloc(1 * g_storage->max_cigar_len, sizeof(uint32_t));
     g_storage->h_cigar_lengths = (int*)calloc(1 , sizeof(int));
 
     // Allocate task mapping
@@ -134,6 +164,7 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     // Allocate device result structure
     cudaMalloc(&g_storage->device_res, sizeof(gasal_res_t));
     g_storage->device_res_ptrs = (gasal_res_t*)calloc(1, sizeof(gasal_res_t));
+    cudaMalloc(&g_storage->d_ez_array, sizeof(ksw_extz_t) * g_storage->max_tasks);
     
     // Allocate device result arrays
     int32_t *d_scores, *d_query_ends, *d_target_ends;
@@ -149,25 +180,6 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     // Copy device pointers to device struct
     cudaMemcpy(g_storage->device_res, g_storage->device_res_ptrs, 
                sizeof(gasal_res_t), cudaMemcpyHostToDevice);
-    
-    // Allocate AGATHA global buffer
-    size_t global_buffer_size = g_storage->kernel_blocks * (g_storage->kernel_threads / 8) * 
-                                g_storage->max_query_len * 4;
-    cudaMalloc(&g_storage->d_global_buffer, global_buffer_size * sizeof(short2));
-    
-    // Allocate host sorting buffer
-    g_storage->h_sort_buffer = (short2*)calloc(g_storage->max_tasks, sizeof(short2));
-    
-    // Copy substitution scores to device constants
-    gasal_subst_scores subst;
-    subst.match = g_config.match_score;
-    subst.mismatch = g_config.mismatch_score;
-    subst.gap_open = g_config.gap_open;
-    subst.gap_extend = g_config.gap_extend;
-    subst.slice_width = g_config.slice_width;
-    subst.z_threshold = g_config.z_threshold;
-    subst.band_width = g_config.band_width;
-    gasal_copy_subst_scores(&subst);
     
     g_initialized = true;
     return 0;
@@ -196,8 +208,8 @@ static int realloc_gpu_storage(size_t new_tasks, size_t new_seq_bytes) {
     
     // Recalculate backtracking sizes
     size_t max_antidiag = 2 * g_storage->max_query_len;
-    size_t max_n_col = (g_storage->band_width < 0) ? 
-                       g_storage->max_query_len : (g_storage->band_width + 1);
+    size_t max_n_col = (g_config.band_width < 0) ? 
+                       g_storage->max_query_len : (g_config.band_width + 1);
     g_storage->max_backtrack_size = max_antidiag * max_n_col;
     g_storage->max_cigar_len = 2 * g_storage->max_query_len;
     
@@ -293,7 +305,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             return;
         }
     }
-    
+    n_tasks = 240;  
     // Calculate memory requirements
     size_t total_query_bytes = 0, total_target_bytes = 0;
     uint32_t max_query_len = 0;
@@ -431,16 +443,17 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     
     // Configure and launch AGATHA kernel
     size_t shared_mem = (g_storage->kernel_threads / 32) * 
-                       ((32 * (8 * (g_storage->slice_width + 1))) + 28) * sizeof(int32_t);
+                       ((32 * (8 * (g_config.slice_width + 1))) + 28) * sizeof(int32_t);
     cudaFuncSetAttribute(agatha_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);
     
     int8_t h_scoring_matrix[25];
     ksw_gen_simple_mat(5, h_scoring_matrix, opt->a, opt->b, opt->sc_ambi);
     cudaMemcpyAsync(g_storage->mat, h_scoring_matrix, 25 * sizeof(int8_t),
                     cudaMemcpyHostToDevice, g_storage->stream);
+    int32_t extra_flag = 0;
 
     // ===== KSW Alignment Kernel (Phase 1: Compute scores and save backtrack) =====
-    ksw_global_cuda_kernel<<<g_storage->kernel_blocks, g_storage->kernel_threads, 
+    ksw_semi_global_cuda_kernel<<<g_storage->kernel_blocks, g_storage->kernel_threads, 
                     shared_mem, g_storage->stream>>>(
         g_storage->d_packed_query,
         g_storage->d_packed_target,
@@ -452,13 +465,17 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         g_storage->mat, 
         g_storage->d_backtrack_p,
         g_storage->d_backtrack_off,
+        g_storage->d_backtrack_off_end,
         g_storage->d_backtrack_n_col,
         g_storage->max_backtrack_size,
+        g_storage->d_ez_array,
+        g_storage->d_ksw_temp_buffer,
+        g_storage->ksw_temp_per_task,
         n_tasks,
         5,  // m = alphabet size(ACGTN)
-        g_config.gap_open, 
-        g_config.gap_extend,
-        g_storage->band_width
+        opt->zdrop,
+        opt->end_bonus,
+        extra_flag | KSW_EZ_EXTZ_ONLY | KSW_EZ_RIGHT | KSW_EZ_REV_CIGAR
     );
 
     // ===== KSW Backtracking Kernel (Phase 2: Generate CIGAR) =====
@@ -517,7 +534,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         tasks[i].max_t = g_storage->host_res->target_batch_end[align_id];
         
         // Copy CIGAR to output buffer
-        if (cigar_buffer) {
+        if (!cigar_buffer) {
             int n_cigar = g_storage->h_cigar_lengths[align_id];
             tasks[i].n_cigar = n_cigar;
             

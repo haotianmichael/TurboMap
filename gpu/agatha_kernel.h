@@ -1,6 +1,6 @@
 #ifndef __AGATHA_KERNEL__
 #define __AGATHA_KERNEL__
-
+#include <stdio.h>
 // This old core provides the same result as the currently LOCAL core, but lacks some optimization. Left for historical / comparative purposes.
 // Deprecated code from GASAL2 (left as reference)
 #define CORE_LOCAL_DEPRECATED_COMPUTE() \
@@ -462,20 +462,6 @@ __global__ void agatha_sort(uint32_t *packed_query_batch, uint32_t *packed_ref_b
 #define KSW_CIGAR_DEL    2
 #define KSW_NEG_INF     -0x40000000
 
-// Backtrack states encoding (same as KSW scalar)
-// bit 0-2: state type (0=H, 1=E, 2=F)
-// bit 3: E continuation
-// bit 4: F continuation
-
-// Backtrack buffer structure
-typedef struct {
-    uint8_t *p;      // Backtrack matrix
-    int *off;        // Offset array for each anti-diagonal
-    int n_col;       // Number of columns in backtrack matrix
-    int qlen;        // Query length
-    int tlen;        // Target length
-} ksw_backtrack_buf_t;
-
 /**
  * Separate backtracking kernel - runs after alignment kernel
  * Each thread/warp processes one task's backtracking
@@ -626,9 +612,8 @@ __global__ void ksw_semi_global_cuda_kernel(
     int tlen = target_batch_lens[task_id];
     ksw_extz_t* ez = &ez_array[task_id];
 
-    // Handle empty sequences
     if (qlen <= 0 || tlen <= 0) {
-        ez->max = -0x40000000;
+        ez->max = KSW_NEG_INF;
         ez->max_q = ez->max_t = -1;
         ez->score = 0;
         ez->zdropped = 0;
@@ -638,10 +623,16 @@ __global__ void ksw_semi_global_cuda_kernel(
         return;
     }
 
+    ez->max_q = ez->max_t = ez->mqe_t = ez->mte_q = -1;
+    ez->max = 0;
+    ez->score = ez->mqe = ez->mte = KSW_NEG_INF;
+    ez->n_cigar = 0;
+    ez->zdropped = 0;
+    ez->reach_end = 0;
+
     int packed_query_offset = query_batch_offsets[task_id] >> 3;
     int packed_target_offset = target_batch_offsets[task_id] >> 3;
 
-    // Gap penalties swap
     if(q2 + e2 < q + e) {
         int8_t tmp = q; q = q2; q2 = tmp;
         tmp = e; e = e2; e2 = tmp;
@@ -649,28 +640,21 @@ __global__ void ksw_semi_global_cuda_kernel(
     int qe = q + e;
     int qe2 = q2 + e2;
 
-    // Band width
     int wl = (w < 0) ? max(qlen, tlen) : w;
     int wr = (w < 0) ? max(qlen, tlen) : w;
 
-    // Long gap threshold
     int long_thres = (e != e2) ? (q2 - q) / (e - e2) - 1 : 0;
     if(q2 + e2 + long_thres * e2 > q + e + long_thres * e) {
         ++long_thres;
     }
     int32_t long_diff = long_thres * (e - e2) - (q2 - q) - e2;
 
-    // === 从预分配缓冲区分配内存 ===
     char *task_buf = (char*)d_temp_buffer + task_id * temp_per_task;
     
-    // 布局: H | u,v,x,y,x2,y2,s | qr,target
     size_t offset = 0;
-    
-    // H array (int32_t)
     int32_t *H = (int32_t*)(task_buf + offset);
     offset += tlen * sizeof(int32_t);
     
-    // u,v,x,y,x2,y2,s (int8_t, each tlen+1 except s=tlen)
     int8_t *u = (int8_t*)(task_buf + offset);
     offset += (tlen + 1) * sizeof(int8_t);
     int8_t *v = (int8_t*)(task_buf + offset);
@@ -686,17 +670,14 @@ __global__ void ksw_semi_global_cuda_kernel(
     int8_t *s = (int8_t*)(task_buf + offset);
     offset += tlen * sizeof(int8_t);
     
-    // qr, target (uint8_t)
     uint8_t *qr = (uint8_t*)(task_buf + offset);
     offset += qlen * sizeof(uint8_t);
     uint8_t *target = (uint8_t*)(task_buf + offset);
 
-    // Initialize H to KSW_NEG_INF
     for (int i = 0; i < tlen; ++i) {
-        H[i] = -0x40000000;
+        H[i] = KSW_NEG_INF;
     }
 
-    // Initialize u,v,x,y,x2,y2
     for (int i = 0; i <= tlen; i++) {
         u[i] = -q - e;
         v[i] = -q - e;
@@ -706,7 +687,6 @@ __global__ void ksw_semi_global_cuda_kernel(
         y2[i] = -q2 - e2;
     }
 
-    // Unpack query (reverse)
     for (int i = 0; i < qlen; i++) {
         int packed_idx = i / 8;
         int bit_offset = (7 - (i % 8)) * 4;
@@ -714,7 +694,6 @@ __global__ void ksw_semi_global_cuda_kernel(
         qr[qlen - 1 - i] = (packed_val >> bit_offset) & 0xF;
     }
 
-    // Unpack target
     for (int i = 0; i < tlen; i++) {
         int packed_idx = i / 8;
         int bit_offset = (7 - (i % 8)) * 4;
@@ -722,35 +701,22 @@ __global__ void ksw_semi_global_cuda_kernel(
         target[i] = (packed_val >> bit_offset) & 0xF;
     }
 
-    // Initialize ez
-    ez->max = -0x40000000;
-    ez->mqe = -0x40000000;
-    ez->mte = -0x40000000;
-    ez->max_q = ez->max_t = -1;
-    ez->mqe_t = ez->mte_q = -1;
-    ez->score = -0x40000000;
-    ez->reach_end = 0;
-    ez->zdropped = 0;
-
     int last_H0_t = 0;
-    int H0 = 0;
+    int32_t H0 = 0;
     int last_st = -1, last_en = -1;
     int n_col = min(qlen, tlen);
     n_col = min(wl + 1, n_col);
     int with_cigar = !(flag & 0x01);
     int approx_max = !!(flag & 0x02);
 
-    // Backtrack buffers
     uint8_t *p = backtrack_p + (size_t)task_id * max_backtrack_size;
     int *off = backtrack_off + (size_t)task_id * (qlen + tlen);
     int *off_end = backtrack_off_end + (size_t)task_id * (qlen + tlen);
 
-    // Main KSW loop
     for (int r = 0; r < qlen + tlen - 1; r++) {
         int st = 0, en = tlen - 1;
         int st0, en0;
 
-        // Determine band boundaries
         if (st < r - qlen + 1) st = r - qlen + 1;
         if (en > r) en = r;
         if (st < (r - wr + 1) >> 1) st = (r - wr + 1) >> 1;
@@ -761,15 +727,9 @@ __global__ void ksw_semi_global_cuda_kernel(
             break;
         }
 
-        // Clip to valid range
-        st0 = (st < 0) ? 0 : st;
-        en0 = (en >= tlen) ? tlen - 1 : en;
-        if (st0 > en0) {
-            ez->zdropped = 1;
-            break;
-        }
+        st0 = st;
+        en0 = en;
 
-        // Initialize boundary conditions
         int8_t x1, v1, x21;
         if (st > 0) {
             if(st - 1 >= last_st && st - 1 <= last_en) {
@@ -795,7 +755,7 @@ __global__ void ksw_semi_global_cuda_kernel(
             }
         }
         
-        if (en >= r) {
+        if (en >= r && r < tlen) {
             y[r] = -q - e;
             y2[r] = -q2 - e2;
             if(r == 0) {
@@ -809,11 +769,18 @@ __global__ void ksw_semi_global_cuda_kernel(
             }
         }
         
-        // Compute scores
         for (int t = st0; t <= en0; t++) {
-            int qi = r - t;
-            if (qi >= 0 && qi < qlen && t < tlen) {
-                s[t] = device_mat[target[t] * m + qr[qi]];
+            int qi = qlen - 1 - r + t;
+            if (qi >= 0 && qi < qlen && t >= 0 && t < tlen) {
+                uint8_t tbase = target[t];
+                uint8_t qbase = qr[qi];
+                if (tbase < m && qbase < m) {
+                    s[t] = device_mat[tbase * m + qbase];
+                } else {
+                    s[t] = 0;
+                }
+            } else {
+                s[t] = 0;
             }
         }
 
@@ -822,22 +789,27 @@ __global__ void ksw_semi_global_cuda_kernel(
             off_end[r] = en;
         }
         
-        uint8_t *pr = p + (size_t)r * n_col - st0;
+        uint8_t *pr = with_cigar ? (p + (size_t)r * n_col - st0) : NULL;
         
-        // DP recurrence
+      // DP recurrence
         for (int t = st0; t <= en0; t++) {
             int8_t z = s[t];
+            
+            // 计算a, b, a2, b2
             int8_t a = x1 + v1;
             int8_t b = y[t] + u[t];
             int8_t a2 = x21 + v1;
             int8_t b2 = y2[t] + u[t];
 
             uint8_t d = 0;
-            int8_t u1 = u[t];
-            u[t] = z - v1;
-            v1 = v[t];
-            v[t] = z - u1;
             
+            // 保存旧值
+            int8_t ut = u[t];
+            int8_t vt = v[t];
+            int8_t xt = x[t];
+            int8_t x2t = x2[t];
+            
+            // **修复:先找最大的z**
             if (a > z) { z = a; d = 1; }
             if (b > z) { z = b; d = 2; }
             if (a2 > z) { z = a2; d = 3; }
@@ -845,48 +817,93 @@ __global__ void ksw_semi_global_cuda_kernel(
 
             int8_t sc_mch = device_mat[0];
             if (z > sc_mch) z = sc_mch;
+            
+            // **修复:找到最大z后再更新u和v**
+            u[t] = z - v1;
+            v[t] = z - ut;
 
+            // 更新a, b, a2, b2
             int tmp = z - q;
-            a -= tmp; b -= tmp;
+            a -= tmp; 
+            b -= tmp;
             tmp = z - q2;
-            a2 -= tmp; b2 -= tmp;
+            a2 -= tmp; 
+            b2 -= tmp;
             
-            x1 = x[t];
-            if (a > 0) { x[t] = a - qe; d |= 0x08; } else { x[t] = -qe; }
-            if (b > 0) { y[t] = b - qe; d |= 0x10; } else { y[t] = -qe; }
-            if (a2 > 0) { x2[t] = a2 - qe2; d |= 0x20; } else { x2[t] = -qe2; }
-            if (b2 > 0) { y2[t] = b2 - qe2; d |= 0x40; } else { y2[t] = -qe2; }
-            
-            if(with_cigar) {
-                pr[t - st0] = d;
+            // 更新x, y, x2, y2
+            if (a > 0) { 
+                x[t] = a - qe; 
+                d |= 0x08; 
+            } else { 
+                x[t] = -qe; 
             }
+            
+            if (b > 0) { 
+                y[t] = b - qe; 
+                d |= 0x10; 
+            } else { 
+                y[t] = -qe; 
+            }
+            
+            if (a2 > 0) { 
+                x2[t] = a2 - qe2; 
+                d |= 0x20; 
+            } else { 
+                x2[t] = -qe2; 
+            }
+            
+            if (b2 > 0) { 
+                y2[t] = b2 - qe2; 
+                d |= 0x40; 
+            } else { 
+                y2[t] = -qe2; 
+            }
+            
+            if(with_cigar && pr != NULL) {
+                pr[t] = d;
+            }
+            
+            // 为下一次迭代准备变量
+            v1 = vt;
+            x1 = xt;
+            x21 = x2t;
         }
-        
         if(!approx_max) {
             int32_t max_H, max_t;
+            
             if (r == 0) {
-                H[0] = (int32_t)v[0];
+                H[0] = (int32_t)v[0] - qe;
                 max_H = H[0];
                 max_t = 0;
             } else {
+                // **关键修复：在更新前保存需要的旧值**
+                int32_t H_en0_old = H[en0];           // 保存H[en0]本身的旧值（用于垂直转移）
+                int32_t H_en0_minus1_old = (en0 > 0) ? H[en0 - 1] : 0;  // 保存H[en0-1]的旧值（用于水平转移）
+                
+                // 更新H[st0] ~ H[en0-1]（这会修改H[en0-1]）
+                max_H = KSW_NEG_INF;
+                max_t = st0;
                 for (int t = st0; t < en0; ++t) {
                     H[t] += (int32_t)v[t];
-                }
-                if (en0 == 0) {
-                    H[en0] = (int32_t)v[en0];
-                } else if (en0 - 1 >= st0) {
-                    H[en0] = H[en0 - 1] + (int32_t)u[en0];
-                } else {
-                    H[en0] = (int32_t)v[en0];
-                }
-
-                max_H = H[st0];
-                max_t = st0;
-                for (int t = st0 + 1; t <= en0; ++t) {
                     if (H[t] > max_H) {
                         max_H = H[t];
                         max_t = t;
                     }
+                }
+                
+                // **关键修复：H[en0]需要考虑两种转移路径，取最大值**
+                int32_t from_vertical = H_en0_old + (int32_t)v[en0];      // 从上一轮的H[en0]
+                int32_t from_horizontal = H_en0_minus1_old + (int32_t)u[en0];  // 从上一轮的H[en0-1]
+                
+                if (en0 > 0) {
+                    H[en0] = (from_vertical > from_horizontal) ? from_vertical : from_horizontal;
+                } else {
+                    H[en0] = from_vertical;
+                }
+                
+                if (H[en0] > max_H) {
+                    max_H = H[en0];
+                    max_t = en0;
                 }
             }
 
@@ -896,7 +913,9 @@ __global__ void ksw_semi_global_cuda_kernel(
                 ez->max = max_H;
                 ez->max_t = j;
                 ez->max_q = i;
-            } else if (j >= ez->max_t && i >= ez->max_q) {
+            }
+            
+            if (j >= ez->max_t && i >= ez->max_q) {
                 int tl = j - ez->max_t;
                 int ql = i - ez->max_q;
                 int l = (tl > ql) ? (tl - ql) : (ql - tl);
@@ -910,22 +929,26 @@ __global__ void ksw_semi_global_cuda_kernel(
                 ez->mte = H[en0];
                 ez->mte_q = r - en0;
             }
-            if (r - st0 == qlen - 1 && H[st0] > ez->mqe) {
+            if (r - st0 == qlen - 1 && st0 >= 0 && st0 < tlen && H[st0] > ez->mqe) {
                 ez->mqe = H[st0];
                 ez->mqe_t = st0;
             }
+            
             if (r == qlen + tlen - 2 && en0 == tlen - 1) {
                 ez->score = H[tlen - 1];
             }
         } else {
-            // Approximate branch (kept minimal)
             if (r > 0) {
                 if (last_H0_t >= st0 && last_H0_t <= en0 && 
                     last_H0_t + 1 >= st0 && last_H0_t + 1 <= en0) {
                     int32_t d0 = v[last_H0_t];
                     int32_t d1 = u[last_H0_t + 1];
-                    if (d0 > d1) H0 += d0;
-                    else { H0 += d1; ++last_H0_t; }
+                    if (d0 > d1) {
+                        H0 += d0;
+                    } else {
+                        H0 += d1;
+                        ++last_H0_t;
+                    }
                 } else if (last_H0_t >= st0 && last_H0_t <= en0) {
                     H0 += v[last_H0_t];
                 } else {
@@ -933,18 +956,18 @@ __global__ void ksw_semi_global_cuda_kernel(
                     H0 += u[last_H0_t];
                 }
             } else {
-                H0 = v[0];
+                H0 = v[0] - qe;
                 last_H0_t = 0;
             }
+            
             if (r == qlen + tlen - 2 && en0 == tlen - 1) {
                 ez->score = H0;
             }
         }
+        
         last_st = st;
         last_en = en;
     }
-
-    // Store results
     device_res->aln_score[task_id] = ez->score;
     device_res->query_batch_end[task_id] = ez->reach_end ? qlen - 1 : ez->max_q;
     device_res->target_batch_end[task_id] = ez->reach_end ? tlen - 1 : ez->max_t;

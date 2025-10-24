@@ -121,7 +121,7 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     size_t raw_size = H_size + u8_arrays_size + seq_size;
     g_storage->ksw_temp_per_task = (raw_size + 7) & ~7ULL;  // 8-byte alignment
     cudaError_t err = cudaMalloc(&g_storage->d_ksw_temp_buffer, 
-                             244 * g_storage->ksw_temp_per_task);
+                             225 * g_storage->ksw_temp_per_task);
     if (err != cudaSuccess) {
         fprintf(stderr, "[ERROR] Failed to allocate d_ksw_temp_buffer: %s (requested %.2f GB)\n",
                 cudaGetErrorString(err),
@@ -129,27 +129,71 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
         return -1;
     }
     
-    // ==============================Result and Backtrack==============================
-    // Calculate backtracking buffer sizes
-    // Backtrack matrix: for each task, (qlen + tlen) * n_col
-    // Worst case: n_col = bandwidth + 1, max_len = max_query_len
-    // Conservative estimate: 2 * max_query_len * (bandwidth + 1)
-    size_t max_antidiag = 2 * g_storage->max_query_len;
-    size_t max_n_col = (g_config.band_width < 0) ? 
-                       g_storage->max_query_len : (g_config.band_width + 1);
-    g_storage->max_backtrack_size = 1; //FIXME: max_antidiag * max_n_col;
-    g_storage->max_cigar_len = 1; //FIXME: 2 * g_storage->max_query_len; // Worst case: all indels
-
-    // Allocate KSW backtracking buffers FIXME: g_storage->max_tasks
-    cudaMalloc(&g_storage->d_backtrack_p, 1 * g_storage->max_backtrack_size);
-    cudaMalloc(&g_storage->d_backtrack_off, 1 * max_antidiag * sizeof(int));
-    cudaMalloc(&g_storage->d_backtrack_off_end, 1 * max_antidiag * sizeof(int));
-    cudaMalloc(&g_storage->d_backtrack_n_col, 1 * sizeof(int));
-    cudaMalloc(&g_storage->d_cigar_buffer, 1 * g_storage->max_cigar_len * sizeof(uint32_t));
-    cudaMalloc(&g_storage->d_cigar_lengths, 1 * sizeof(int));
-    // Allocate host CIGAR buffers  FIXME: g_storage->max_tasks
-    g_storage->h_cigar_buffer = (uint32_t*)calloc(1 * g_storage->max_cigar_len, sizeof(uint32_t));
-    g_storage->h_cigar_lengths = (int*)calloc(1 , sizeof(int));
+    // ==================== Backtrack Buffers ====================
+    // Purpose: Store information for CIGAR generation (alignment path reconstruction)
+    // 
+    // For each alignment with qlen and tlen:
+    // - Total antidiagonals: qlen + tlen - 1
+    // - Cells per antidiagonal: n_col = min(bandwidth+1, min(qlen, tlen))
+    //
+    // backtrack_p[]: Direction bits for each DP cell
+    //   - Size per task: (qlen + tlen - 1) × n_col bytes
+    //   - Each byte stores 4 bits for direction (which cell we came from)
+    //                     + 4 bits for state flags
+    //
+    // backtrack_off[], backtrack_off_end[]: Valid range for each antidiagonal
+    //   - Size per task: (qlen + tlen - 1) × 2 integers
+    //   - Tells us which cells in each antidiagonal are within the band
+    //
+    // backtrack_n_col[]: The n_col value for each task
+    //   - Size per task: 1 integer
+    
+    // Calculate sizes
+    size_t max_antidiag = 2 * g_storage->max_query_len - 1;  // Worst case: qlen = tlen = max_query_len
+    
+    // n_col = min(bandwidth+1, min(qlen, tlen))
+    size_t max_n_col;
+    if (g_config.band_width < 0) {
+        // No banding, worst case n_col = max_query_len
+        max_n_col = g_storage->max_query_len;
+    } else {
+        // With banding, n_col limited by bandwidth
+        max_n_col = g_config.band_width + 1;
+    }
+    
+    // Per-task backtrack sizes
+    g_storage->max_backtrack_size = max_antidiag * max_n_col;  // bytes per task
+    g_storage->max_cigar_len = 2 * g_storage->max_query_len;   // uint32_t per task (worst case: all indels)
+    
+    // Memory estimate for full allocation
+    size_t backtrack_mem_per_task = g_storage->max_backtrack_size +              // backtrack_p
+                                     max_antidiag * 2 * sizeof(int) +            // off + off_end
+                                     sizeof(int) +                               // n_col
+                                     g_storage->max_cigar_len * sizeof(uint32_t); // cigar
+    
+    double total_backtrack_gb = (224 * backtrack_mem_per_task) / (1024.0 * 1024.0 * 1024.0);
+    
+    fprintf(stderr, "[INFO] Backtrack memory estimate: %.2f GB for %zu tasks\n", 
+            total_backtrack_gb, 224);
+        
+    //FIXME: only for testing
+    size_t alloc_tasks = 20; 
+    
+    // Allocate KSW backtracking buffers
+    cudaMalloc(&g_storage->d_backtrack_p, alloc_tasks * g_storage->max_backtrack_size);
+    cudaMalloc(&g_storage->d_backtrack_off, alloc_tasks * max_antidiag * sizeof(int));
+    cudaMalloc(&g_storage->d_backtrack_off_end, alloc_tasks * max_antidiag * sizeof(int));
+    cudaMalloc(&g_storage->d_backtrack_n_col, alloc_tasks * sizeof(int));
+    cudaMalloc(&g_storage->d_cigar_buffer, alloc_tasks * g_storage->max_cigar_len * sizeof(uint32_t));
+    cudaMalloc(&g_storage->d_cigar_lengths, alloc_tasks * sizeof(int));
+    
+    // Allocate host CIGAR buffers
+    g_storage->h_cigar_buffer = (uint32_t*)calloc(alloc_tasks * g_storage->max_cigar_len, sizeof(uint32_t));
+    g_storage->h_cigar_lengths = (int*)calloc(alloc_tasks, sizeof(int));
+    
+    fprintf(stderr, "[INFO] Allocated backtrack buffers for %zu tasks (%.2f MB total)\n",
+            alloc_tasks, 
+            (alloc_tasks * backtrack_mem_per_task) / (1024.0 * 1024.0));
 
     // Allocate task mapping
     cudaMalloc(&g_storage->d_task_to_align_id, g_storage->max_tasks * sizeof(int32_t));
@@ -164,7 +208,7 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     // Allocate device result structure
     cudaMalloc(&g_storage->device_res, sizeof(gasal_res_t));
     g_storage->device_res_ptrs = (gasal_res_t*)calloc(1, sizeof(gasal_res_t));
-    cudaMalloc(&g_storage->d_ez_array, sizeof(ksw_extz_t) * g_storage->max_tasks);
+    cudaMalloc(&g_storage->d_ez_array, sizeof(ksw_extz_t) * 224);  // FIXED: use concurrent tasks
     
     // Allocate device result arrays
     int32_t *d_scores, *d_query_ends, *d_target_ends;
@@ -182,6 +226,15 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
                sizeof(gasal_res_t), cudaMemcpyHostToDevice);
     
     g_initialized = true;
+    
+    // Print summary
+    fprintf(stderr, "\n========== GPU Storage Initialized ==========\n");
+    fprintf(stderr, "Max tasks: %zu (concurrent: %zu)\n", g_storage->max_tasks, 224);
+    fprintf(stderr, "Max sequence length: %zu\n", g_storage->max_query_len);
+    fprintf(stderr, "Max backtrack size per task: %zu bytes\n", g_storage->max_backtrack_size);
+    fprintf(stderr, "Bandwidth: %d\n", g_config.band_width);
+    fprintf(stderr, "============================================\n\n");
+    
     return 0;
 }
 
@@ -305,7 +358,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             return;
         }
     }
-    n_tasks = 240;  
+    n_tasks = 20;  
     // Calculate memory requirements
     size_t total_query_bytes = 0, total_target_bytes = 0;
     uint32_t max_query_len = 0;
@@ -475,7 +528,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         5,  // m = alphabet size(ACGTN)
         opt->zdrop,
         opt->end_bonus,
-        extra_flag | KSW_EZ_EXTZ_ONLY | KSW_EZ_RIGHT | KSW_EZ_REV_CIGAR
+        extra_flag
     );
 
     // ===== KSW Backtracking Kernel (Phase 2: Generate CIGAR) =====

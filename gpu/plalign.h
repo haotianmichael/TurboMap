@@ -37,6 +37,7 @@ typedef struct {
     uint32_t *d_target_offsets;
     uint32_t *d_query_lens;
     uint32_t *d_target_lens;
+    int32_t *d_flag;
 
     // === CUDA Resources ===
     cudaStream_t stream;

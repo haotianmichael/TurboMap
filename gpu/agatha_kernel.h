@@ -1,6 +1,5 @@
 #ifndef __AGATHA_KERNEL__
 #define __AGATHA_KERNEL__
-#include <stdio.h>
 // This old core provides the same result as the currently LOCAL core, but lacks some optimization. Left for historical / comparative purposes.
 // Deprecated code from GASAL2 (left as reference)
 #define CORE_LOCAL_DEPRECATED_COMPUTE() \
@@ -456,117 +455,210 @@ __global__ void agatha_sort(uint32_t *packed_query_batch, uint32_t *packed_ref_b
 
 }
 
+
+#define KSW_EZ_SCORE_ONLY  0x01 // don't record alignment path/cigar
+#define KSW_EZ_RIGHT       0x02 // right-align gaps
+#define KSW_EZ_GENERIC_SC  0x04 // without this flag: match/mismatch only; last symbol is a wildcard
+#define KSW_EZ_APPROX_MAX  0x08 // approximate max; this is faster with sse
+#define KSW_EZ_APPROX_DROP 0x10 // approximate Z-drop; faster with sse
+#define KSW_EZ_EXTZ_ONLY   0x40 // only perform extension
+#define KSW_EZ_REV_CIGAR   0x80 // reverse CIGAR in the output
+#define KSW_EZ_SPLICE_FOR  0x100
+#define KSW_EZ_SPLICE_REV  0x200
+#define KSW_EZ_SPLICE_FLANK 0x400
+
 // CIGAR operations
 #define KSW_CIGAR_MATCH  0
 #define KSW_CIGAR_INS    1
 #define KSW_CIGAR_DEL    2
 #define KSW_NEG_INF     -0x40000000
 
-/**
- * Separate backtracking kernel - runs after alignment kernel
- * Each thread/warp processes one task's backtracking
- */
+
+// ========== CIGAR操作辅助函数 ==========
+__device__ static inline uint32_t* ksw_push_cigar_device(
+    int *n_cigar, 
+    int max_cigar_len,
+    uint32_t *cigar, 
+    uint32_t op, 
+    int len)
+{
+    // 如果CIGAR为空或者操作类型不同，添加新元素
+    if (*n_cigar == 0 || op != (cigar[(*n_cigar) - 1] & 0xf)) {
+        if (*n_cigar < max_cigar_len) {
+            cigar[(*n_cigar)++] = (len << 4) | op;
+        }
+    } else {
+        // 相同操作类型，累加长度
+        cigar[(*n_cigar) - 1] += len << 4;
+    }
+    return cigar;
+}
+
+// ========== CUDA回溯Kernel ==========
 __global__ void ksw_backtrack_kernel(
-    uint8_t *backtrack_p,
-    int *backtrack_off,
-    int *backtrack_n_col,
-    uint32_t *query_batch_lens,
-    uint32_t *target_batch_lens,
-    gasal_res_t *device_res,
-    uint32_t *cigar_buffer,      // Pre-allocated CIGAR buffer
-    int *cigar_offsets,          // Offset for each task's CIGAR
-    int max_cigar_len,           // Max CIGAR length per task
-    int max_backtrack_size,
-    int n_tasks,
-    int8_t gapo
+    uint8_t *backtrack_p,           // 回溯方向数组
+    int *backtrack_off,             // 每个反对角线的起始位置
+    int *backtrack_n_col,           // 每个task的n_col值
+    uint32_t *query_batch_lens,     // query长度数组
+    uint32_t *target_batch_lens,    // target长度数组
+    gasal_res_t *device_res,        // 对齐结果（包含终点坐标）
+    uint32_t *cigar_buffer,         // CIGAR输出缓冲区
+    int *cigar_lengths,             // CIGAR长度输出
+    int max_cigar_len,              // 每个task的最大CIGAR长度
+    int max_backtrack_size,         // 每个task的回溯缓冲区大小
+    int32_t *d_flag,                // 标志位
+    int n_tasks                    // 任务数量
 )
 {
+    const int warp_size = 32;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int warp_id = tid / warp_size;
+    const int lane_id = tid % warp_size;
     
-    if (tid >= n_tasks) return;
+    // 每个warp处理一个task，只使用lane 0
+    if (warp_id >= n_tasks) return;
+    if (lane_id != 0) return;
+
+    int task_id = warp_id;
     
-    int task_id = tid;
+    // ========== 获取任务信息 ==========
     int qlen = query_batch_lens[task_id];
     int tlen = target_batch_lens[task_id];
     int n_col = backtrack_n_col[task_id];
+    int flag = d_flag[task_id];
     
-    // Get backtrack arrays for this task
+    // 获取回溯起点（对齐终点）
+    int j0 = device_res->query_batch_end[task_id];      // query终点
+    int i0 = device_res->target_batch_end[task_id];     // target终点
+    
+    // 检查有效性
+    if (i0 < 0 || j0 < 0 || qlen <= 0 || tlen <= 0) {
+        cigar_lengths[task_id] = 0;
+        return;
+    }
+    
+    // ========== 获取缓冲区指针 ==========
     uint8_t *p = backtrack_p + (size_t)task_id * max_backtrack_size;
     int *off = backtrack_off + (size_t)task_id * (qlen + tlen);
-    
-    // Get CIGAR buffer for this task
     uint32_t *cigar = cigar_buffer + (size_t)task_id * max_cigar_len;
+    
+    // ========== 回溯参数 ==========
+    int is_rot = 1;                                     // 使用反对角线遍历
+    int is_rev = !!(flag & KSW_EZ_REV_CIGAR);                        // 是否反转CIGAR（默认反转）
+    int min_intron_len = 0;                             // 不处理splicing
+    
+    // ========== 回溯主循环 ==========
     int n_cigar = 0;
+    int i = i0, j = j0;     // 当前位置（query坐标，target坐标）
+    int state = 0;          // 当前状态：0=H, 1=E, 2=F, 3=long E, 4=long F
+    int r;                  // 反对角线编号
+    uint8_t tmp;
     
-    // Backtracking
-    int i = tlen - 1, j = qlen - 1;
-    int state = 0;
-    
+    // 从终点回溯到起点
     while (i >= 0 && j >= 0) {
-        int r = i + j;
         int force_state = -1;
         
-        if (i < off[r]) force_state = 2;
-        uint8_t tmp = (force_state < 0) ? p[(size_t)r * n_col + i - off[r]] : 0;
+        // ========== 读取方向信息 ==========
+        // is_rot=1: 使用反对角线坐标系
+        r = i + j;  // 反对角线编号
         
-        if (state == 0) state = tmp & 7;
-        else if (!(tmp >> (state + 2) & 1)) state = 0;
-        if (state == 0) state = tmp & 7;
-        if (force_state >= 0) state = force_state;
+        // 检查是否在band范围内
+        if (i < off[r]) {
+            force_state = 2;  // 强制为F状态（水平移动）
+        }
         
-        // Determine CIGAR operation
-        uint32_t op;
-        if (state == 0) {
-            op = KSW_CIGAR_MATCH;
-            --i; --j;
-        } else if (state == 1) {
-            op = KSW_CIGAR_DEL;
-            --i;
+        // 读取回溯方向
+        if (force_state < 0) {
+            // 计算在回溯数组中的位置
+            size_t p_idx = (size_t)r * n_col + i - off[r];
+            tmp = p[p_idx];
         } else {
-            op = KSW_CIGAR_INS;
+            tmp = 0;
+        }
+        
+        // ========== 状态转换 ==========
+        if (state == 0) {
+            // H状态：查找哪个状态产生了最大值
+            state = tmp & 7;  // 低3位：0=H, 1=E, 2=F, 3=long E, 4=long F
+        } else {
+            // 其他状态：检查是否继续当前状态
+            // 如果对应的continuation bit为1，保持当前状态；否则回到H
+            if (!(tmp >> (state + 2) & 1)) {
+                state = 0;
+            }
+        }
+        
+        // 如果回到H状态，重新查找最优前驱
+        if (state == 0) {
+            state = tmp & 7;
+        }
+        
+        // 强制状态优先
+        if (force_state >= 0) {
+            state = force_state;
+        }
+        
+        // ========== 根据状态生成CIGAR并移动坐标 ==========
+        if (state == 0) {
+            // H状态：匹配/错配（对角线移动）
+            ksw_push_cigar_device(&n_cigar, max_cigar_len, cigar, 
+                                  KSW_CIGAR_MATCH, 1);
+            --i;
+            --j;
+        } 
+        else if (state == 1 || (state == 3 && min_intron_len <= 0)) {
+            // E状态：deletion（垂直移动，query消耗）
+            ksw_push_cigar_device(&n_cigar, max_cigar_len, cigar, 
+                                  KSW_CIGAR_DEL, 1);
+            --i;
+        } 
+        else if (state == 3 && min_intron_len > 0) {
+            // 长deletion（splicing，N操作）
+            ksw_push_cigar_device(&n_cigar, max_cigar_len, cigar, 
+                                  KSW_CIGAR_N_SKIP, 1);
+            --i;
+        } 
+        else {
+            // F状态：insertion（水平移动，target消耗）
+            ksw_push_cigar_device(&n_cigar, max_cigar_len, cigar, 
+                                  KSW_CIGAR_INS, 1);
             --j;
         }
         
-        // Extend or add new CIGAR op
-        if (n_cigar == 0 || op != (cigar[n_cigar - 1] & 0xf)) {
-            if (n_cigar < max_cigar_len) {
-                cigar[n_cigar++] = (1 << 4) | op;
-            }
-        } else {
-            cigar[n_cigar - 1] += (1 << 4);
+        // 防止无限循环
+        if (n_cigar >= max_cigar_len - 2) {
+            break;
         }
     }
     
-    // Handle remaining insertions/deletions
+    // ========== 处理剩余的query部分 ==========
     if (i >= 0) {
-        if (n_cigar == 0 || KSW_CIGAR_DEL != (cigar[n_cigar - 1] & 0xf)) {
-            if (n_cigar < max_cigar_len) {
-                cigar[n_cigar++] = ((i + 1) << 4) | KSW_CIGAR_DEL;
-            }
-        } else {
-            cigar[n_cigar - 1] += ((i + 1) << 4);
-        }
+        // query还有剩余：添加deletion
+        int op = (min_intron_len > 0 && i >= min_intron_len) ? 
+                 KSW_CIGAR_N_SKIP : KSW_CIGAR_DEL;
+        ksw_push_cigar_device(&n_cigar, max_cigar_len, cigar, op, i + 1);
     }
     
+    // ========== 处理剩余的target部分 ==========
     if (j >= 0) {
-        if (n_cigar == 0 || KSW_CIGAR_INS != (cigar[n_cigar - 1] & 0xf)) {
-            if (n_cigar < max_cigar_len) {
-                cigar[n_cigar++] = ((j + 1) << 4) | KSW_CIGAR_INS;
-            }
-        } else {
-            cigar[n_cigar - 1] += ((j + 1) << 4);
+        // target还有剩余：添加insertion
+        ksw_push_cigar_device(&n_cigar, max_cigar_len, cigar, 
+                              KSW_CIGAR_INS, j + 1);
+    }
+    
+    // ========== 反转CIGAR（如果需要）==========
+    // 回溯是从终点到起点，所以CIGAR是反向的
+    // 通常需要反转使其从起点到终点
+    if (!is_rev) {
+        for (int k = 0; k < n_cigar / 2; ++k) {
+            uint32_t temp = cigar[k];
+            cigar[k] = cigar[n_cigar - 1 - k];
+            cigar[n_cigar - 1 - k] = temp;
         }
     }
     
-    // Reverse CIGAR (computed backwards)
-    for (int k = 0; k < n_cigar / 2; k++) {
-        uint32_t tmp = cigar[k];
-        cigar[k] = cigar[n_cigar - 1 - k];
-        cigar[n_cigar - 1 - k] = tmp;
-    }
-    
-    // Store CIGAR info
-    cigar_offsets[task_id] = n_cigar;
+    // ========== 输出CIGAR长度 ==========
+    cigar_lengths[task_id] = n_cigar;
 }
 
 __global__ void ksw_semi_global_cuda_kernel(
@@ -585,33 +677,39 @@ __global__ void ksw_semi_global_cuda_kernel(
     int max_backtrack_size,
     ksw_extz_t *ez_array,
     void *d_temp_buffer,       
+    int *d_flag,
     size_t temp_per_task,        
     int n_tasks,
     int8_t m,
     int32_t zdrop,
-    int end_bonus,
-    int flag
+    int end_bonus
 )
 {
-    int8_t q = _cudaGapO;
-    int8_t e = _cudaGapExtend;
-    int8_t q2 = _cudaGapOL;
-    int8_t e2 = _cudaGapExtendL;
-    int32_t w = _cudaBandWidth;
+    // ========== Gap penalty parameters ==========
+    int8_t q = _cudaGapO;           // 短gap开放罚分
+    int8_t e = _cudaGapExtend;      // 短gap延伸罚分
+    int8_t q2 = _cudaGapOL;         // 长gap开放罚分
+    int8_t e2 = _cudaGapExtendL;    // 长gap延伸罚分
+    int32_t w = _cudaBandWidth;     // 带宽限制
 
+    // ========== Thread configuration ==========
     const int warp_size = 32;
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int warp_id = tid / warp_size;
     const int lane_id = tid % warp_size;
     
+    // 每个warp处理一个task，只使用lane 0
     if (warp_id >= n_tasks) return;
     if (lane_id != 0) return;
 
+    // ========== Task initialization ==========
     int task_id = warp_id;
     int qlen = query_batch_lens[task_id];
     int tlen = target_batch_lens[task_id];
     ksw_extz_t* ez = &ez_array[task_id];
+    int flag = d_flag[task_id];
 
+    // 空序列检查
     if (qlen <= 0 || tlen <= 0) {
         ez->max = KSW_NEG_INF;
         ez->max_q = ez->max_t = -1;
@@ -623,6 +721,7 @@ __global__ void ksw_semi_global_cuda_kernel(
         return;
     }
 
+    // 初始化ez结构体
     ez->max_q = ez->max_t = ez->mqe_t = ez->mte_q = -1;
     ez->max = 0;
     ez->score = ez->mqe = ez->mte = KSW_NEG_INF;
@@ -633,51 +732,72 @@ __global__ void ksw_semi_global_cuda_kernel(
     int packed_query_offset = query_batch_offsets[task_id] >> 3;
     int packed_target_offset = target_batch_offsets[task_id] >> 3;
 
+    // ========== Gap penalty normalization ==========
+    // 确保q+e不大于q2+e2（短gap罚分不大于长gap罚分）
     if(q2 + e2 < q + e) {
         int8_t tmp = q; q = q2; q2 = tmp;
         tmp = e; e = e2; e2 = tmp;
     }
-    int qe = q + e;
-    int qe2 = q2 + e2;
+    int qe = q + e;      // 短gap总罚分
+    int qe2 = q2 + e2;   // 长gap总罚分
 
-    int wl = (w < 0) ? max(qlen, tlen) : w;
-    int wr = (w < 0) ? max(qlen, tlen) : w;
+    // ========== Band width setup ==========
+    int wl = (w < 0) ? max(qlen, tlen) : w;  // 左带宽
+    int wr = (w < 0) ? max(qlen, tlen) : w;  // 右带宽
 
+    // ========== Long gap threshold ==========
+    // long_thres: 从短gap切换到长gap的阈值位置
+    // 当gap长度超过long_thres时，使用长gap罚分更优
     int long_thres = (e != e2) ? (q2 - q) / (e - e2) - 1 : 0;
     if(q2 + e2 + long_thres * e2 > q + e + long_thres * e) {
         ++long_thres;
     }
+    // long_diff: 在阈值位置的罚分差异
     int32_t long_diff = long_thres * (e - e2) - (q2 - q) - e2;
 
+    // ========== Allocate task-local buffers ==========
     char *task_buf = (char*)d_temp_buffer + task_id * temp_per_task;
     
     size_t offset = 0;
+    // H[t]: 到位置t的累积得分
     int32_t *H = (int32_t*)(task_buf + offset);
     offset += tlen * sizeof(int32_t);
     
+    // u[t], v[t]: 短gap状态（u垂直，v水平）
     int8_t *u = (int8_t*)(task_buf + offset);
     offset += (tlen + 1) * sizeof(int8_t);
     int8_t *v = (int8_t*)(task_buf + offset);
     offset += (tlen + 1) * sizeof(int8_t);
+    
+    // x[t], y[t]: 短gap扩展状态
     int8_t *x = (int8_t*)(task_buf + offset);
     offset += (tlen + 1) * sizeof(int8_t);
     int8_t *y = (int8_t*)(task_buf + offset);
     offset += (tlen + 1) * sizeof(int8_t);
+    
+    // x2[t], y2[t]: 长gap扩展状态
     int8_t *x2 = (int8_t*)(task_buf + offset);
     offset += (tlen + 1) * sizeof(int8_t);
     int8_t *y2 = (int8_t*)(task_buf + offset);
     offset += (tlen + 1) * sizeof(int8_t);
+    
+    // s[t]: 当前对角线的匹配/错配得分
     int8_t *s = (int8_t*)(task_buf + offset);
     offset += tlen * sizeof(int8_t);
     
+    // qr[]: 反转的query序列
     uint8_t *qr = (uint8_t*)(task_buf + offset);
     offset += qlen * sizeof(uint8_t);
+    // target[]: target序列
     uint8_t *target = (uint8_t*)(task_buf + offset);
 
+    // ========== Initialize DP arrays ==========
+    // H数组初始化为负无穷
     for (int i = 0; i < tlen; ++i) {
         H[i] = KSW_NEG_INF;
     }
 
+    // 初始化gap状态数组
     for (int i = 0; i <= tlen; i++) {
         u[i] = -q - e;
         v[i] = -q - e;
@@ -687,6 +807,8 @@ __global__ void ksw_semi_global_cuda_kernel(
         y2[i] = -q2 - e2;
     }
 
+    // ========== Unpack sequences ==========
+    // 解包query序列（4-bit packed）并反转
     for (int i = 0; i < qlen; i++) {
         int packed_idx = i / 8;
         int bit_offset = (7 - (i % 8)) * 4;
@@ -694,6 +816,7 @@ __global__ void ksw_semi_global_cuda_kernel(
         qr[qlen - 1 - i] = (packed_val >> bit_offset) & 0xF;
     }
 
+    // 解包target序列
     for (int i = 0; i < tlen; i++) {
         int packed_idx = i / 8;
         int bit_offset = (7 - (i % 8)) * 4;
@@ -701,22 +824,31 @@ __global__ void ksw_semi_global_cuda_kernel(
         target[i] = (packed_val >> bit_offset) & 0xF;
     }
 
+    // ========== DP configuration ==========
     int last_H0_t = 0;
     int32_t H0 = 0;
     int last_st = -1, last_en = -1;
-    int n_col = min(qlen, tlen);
-    n_col = min(wl + 1, n_col);
-    int with_cigar = !(flag & 0x01);
-    int approx_max = !!(flag & 0x02);
+    int n_col = (qlen < tlen) ? qlen : tlen;
+    n_col = (n_col < w + 1) ? n_col : (w + 1);
+    
+    // 根据flag设置计算模式
+    int with_cigar = !(flag & KSW_EZ_SCORE_ONLY);      // 是否需要回溯信息
+    int approx_max = !!(flag & KSW_EZ_APPROX_MAX);     // 是否使用近似最大值
+    int right_align = !!(flag & KSW_EZ_RIGHT);    // gap右对齐 vs 左对齐
 
     uint8_t *p = backtrack_p + (size_t)task_id * max_backtrack_size;
     int *off = backtrack_off + (size_t)task_id * (qlen + tlen);
     int *off_end = backtrack_off_end + (size_t)task_id * (qlen + tlen);
 
-    for (int r = 0; r < qlen + tlen - 1; r++) {
-        int st = 0, en = tlen - 1;
+    // ========== Main DP loop (anti-diagonal traversal) ==========
+    // r是反对角线编号: r=0时(q=qlen-1,t=0), r=qlen+tlen-2时(q=0,t=tlen-1)
+    int r = 0;
+    for (r = 0; r < qlen + tlen - 1; r++) {
+        int st = 0, en = tlen - 1;  // 当前反对角线的起止位置
         int st0, en0;
 
+        // ========== Calculate band boundaries ==========
+        // 根据反对角线编号和带宽限制计算有效范围
         if (st < r - qlen + 1) st = r - qlen + 1;
         if (en > r) en = r;
         if (st < (r - wr + 1) >> 1) st = (r - wr + 1) >> 1;
@@ -730,8 +862,10 @@ __global__ void ksw_semi_global_cuda_kernel(
         st0 = st;
         en0 = en;
 
+        // ========== Initialize boundary conditions ==========
         int8_t x1, v1, x21;
         if (st > 0) {
+            // 从上一轮获取边界值
             if(st - 1 >= last_st && st - 1 <= last_en) {
                 x1 = x[st - 1];
                 x21 = x2[st - 1];
@@ -744,6 +878,7 @@ __global__ void ksw_semi_global_cuda_kernel(
         } else {
             x1 = -q - e;
             x21 = -q2 - e2;
+            // 根据位置设置v1（处理长gap阈值）
             if(r == 0) {
                 v1 = -q - e;
             } else if(r < long_thres) {
@@ -755,6 +890,7 @@ __global__ void ksw_semi_global_cuda_kernel(
             }
         }
         
+        // 设置对角线末端的边界条件
         if (en >= r && r < tlen) {
             y[r] = -q - e;
             y2[r] = -q2 - e2;
@@ -769,8 +905,9 @@ __global__ void ksw_semi_global_cuda_kernel(
             }
         }
         
+        // ========== Compute match/mismatch scores ==========
         for (int t = st0; t <= en0; t++) {
-            int qi = qlen - 1 - r + t;
+            int qi = qlen - 1 - r + t;  // query索引
             if (qi >= 0 && qi < qlen && t >= 0 && t < tlen) {
                 uint8_t tbase = target[t];
                 uint8_t qbase = qr[qi];
@@ -784,91 +921,226 @@ __global__ void ksw_semi_global_cuda_kernel(
             }
         }
 
+        // 记录回溯范围
         if(with_cigar) {
             off[r] = st;
             off_end[r] = en;
         }
         
-        uint8_t *pr = with_cigar ? (p + (size_t)r * n_col - st0) : NULL;
+        uint8_t *pr = with_cigar ? (p + (size_t)r * n_col) : NULL;
         
-      // DP recurrence
-        for (int t = st0; t <= en0; t++) {
-            int8_t z = s[t];
-            
-            // 计算a, b, a2, b2
-            int8_t a = x1 + v1;
-            int8_t b = y[t] + u[t];
-            int8_t a2 = x21 + v1;
-            int8_t b2 = y2[t] + u[t];
+        // ========== DP recurrence (three modes) ==========
+        
+        if (!with_cigar) {
+            // ==================== Mode 1: Score only ====================
+            // 只计算得分，不记录回溯信息（最快）
+            for (int t = st0; t <= en0; t++) {
+                int8_t z = s[t];
+                
+                // 计算四个可能的前驱得分
+                int8_t a = x1 + v1;      // 从左上方来（匹配/错配）
+                int8_t b = y[t] + u[t];  // 从上方来（垂直gap）
+                int8_t a2 = x21 + v1;    // 从左上方来（长gap）
+                int8_t b2 = y2[t] + u[t];// 从上方来（长gap）
 
-            uint8_t d = 0;
-            
-            // 保存旧值
-            int8_t ut = u[t];
-            int8_t vt = v[t];
-            int8_t xt = x[t];
-            int8_t x2t = x2[t];
-            
-            // **修复:先找最大的z**
-            if (a > z) { z = a; d = 1; }
-            if (b > z) { z = b; d = 2; }
-            if (a2 > z) { z = a2; d = 3; }
-            if (b2 > z) { z = b2; d = 4; }
+                // 保存旧值（用于下次迭代）
+                int8_t ut = u[t];
+                int8_t vt = v[t];
+                int8_t xt = x[t];
+                int8_t x2t = x2[t];
+                
+                // 找最大得分
+                if (a > z) z = a;
+                if (b > z) z = b;
+                if (a2 > z) z = a2;
+                if (b2 > z) z = b2;
 
-            int8_t sc_mch = device_mat[0];
-            if (z > sc_mch) z = sc_mch;
-            
-            // **修复:找到最大z后再更新u和v**
-            u[t] = z - v1;
-            v[t] = z - ut;
+                // 限制最大得分
+                int8_t sc_mch = device_mat[0];
+                if (z > sc_mch) z = sc_mch;
+                
+                // 更新u和v（使用最终的z）
+                u[t] = z - v1;
+                v[t] = z - ut;
 
-            // 更新a, b, a2, b2
-            int tmp = z - q;
-            a -= tmp; 
-            b -= tmp;
-            tmp = z - q2;
-            a2 -= tmp; 
-            b2 -= tmp;
-            
-            // 更新x, y, x2, y2
-            if (a > 0) { 
-                x[t] = a - qe; 
-                d |= 0x08; 
-            } else { 
-                x[t] = -qe; 
+                // 更新gap扩展状态
+                int tmp = z - q;
+                a -= tmp; 
+                b -= tmp;
+                tmp = z - q2;
+                a2 -= tmp; 
+                b2 -= tmp;
+                
+                // 更新x, y, x2, y2
+                x[t] = (a > 0) ? (a - qe) : (-qe);
+                y[t] = (b > 0) ? (b - qe) : (-qe);
+                x2[t] = (a2 > 0) ? (a2 - qe2) : (-qe2);
+                y2[t] = (b2 > 0) ? (b2 - qe2) : (-qe2);
+                
+                // 为下一次迭代准备
+                v1 = vt;
+                x1 = xt;
+                x21 = x2t;
             }
             
-            if (b > 0) { 
-                y[t] = b - qe; 
-                d |= 0x10; 
-            } else { 
-                y[t] = -qe; 
+        } else if (!right_align) {
+            // ==================== Mode 2: Gap left-alignment ====================
+            // 当多个前驱得分相同时，优先选择左边的（先遇到的）
+            // 使用严格大于(>)来更新方向
+            for (int t = st0; t <= en0; t++) {
+                int8_t z = s[t];
+                
+                int8_t a = x1 + v1;
+                int8_t b = y[t] + u[t];
+                int8_t a2 = x21 + v1;
+                int8_t b2 = y2[t] + u[t];
+
+                uint8_t d = 0;  // 方向标记：0=s, 1=a, 2=b, 3=a2, 4=b2
+                
+                int8_t ut = u[t];
+                int8_t vt = v[t];
+                int8_t xt = x[t];
+                int8_t x2t = x2[t];
+                
+                // Left-alignment: 只有严格大于时才更新方向和得分
+                if (a > z) { z = a; d = 1; }
+                if (b > z) { z = b; d = 2; }
+                if (a2 > z) { z = a2; d = 3; }
+                if (b2 > z) { z = b2; d = 4; }
+
+                int8_t sc_mch = device_mat[0];
+                if (z > sc_mch) z = sc_mch;
+                
+                u[t] = z - v1;
+                v[t] = z - ut;
+
+                int tmp = z - q;
+                a -= tmp; 
+                b -= tmp;
+                tmp = z - q2;
+                a2 -= tmp; 
+                b2 -= tmp;
+                
+                // 更新gap扩展状态，并记录扩展方向
+                if (a > 0) { 
+                    x[t] = a - qe; 
+                    d |= 0x08;  // 第3位：x可扩展
+                } else { 
+                    x[t] = -qe; 
+                }
+                
+                if (b > 0) { 
+                    y[t] = b - qe; 
+                    d |= 0x10;  // 第4位：y可扩展
+                } else { 
+                    y[t] = -qe; 
+                }
+                
+                if (a2 > 0) { 
+                    x2[t] = a2 - qe2; 
+                    d |= 0x20;  // 第5位：x2可扩展
+                } else { 
+                    x2[t] = -qe2; 
+                }
+                
+                if (b2 > 0) { 
+                    y2[t] = b2 - qe2; 
+                    d |= 0x40;  // 第6位：y2可扩展
+                } else { 
+                    y2[t] = -qe2; 
+                }
+                
+                // 保存回溯方向
+                if(pr != NULL) {
+                    pr[t - st] = d;
+                }
+                
+                v1 = vt;
+                x1 = xt;
+                x21 = x2t;
             }
             
-            if (a2 > 0) { 
-                x2[t] = a2 - qe2; 
-                d |= 0x20; 
-            } else { 
-                x2[t] = -qe2; 
+        } else {
+            // ==================== Mode 3: Gap right-alignment ====================
+            // 当多个前驱得分相同时，优先选择右边的（后遇到的）
+            // 使用大于等于(>=)来更新方向，即"不严格小于"
+            for (int t = st0; t <= en0; t++) {
+                int8_t z = s[t];
+                
+                int8_t a = x1 + v1;
+                int8_t b = y[t] + u[t];
+                int8_t a2 = x21 + v1;
+                int8_t b2 = y2[t] + u[t];
+
+                uint8_t d = 0;
+                
+                int8_t ut = u[t];
+                int8_t vt = v[t];
+                int8_t xt = x[t];
+                int8_t x2t = x2[t];
+                
+                // Right-alignment: z不大于新值时，更新方向和得分
+                // 相当于：如果a>=z，则选择a
+                if (!(z > a)) { z = a; d = 1; }
+                if (!(z > b)) { z = b; d = 2; }
+                if (!(z > a2)) { z = a2; d = 3; }
+                if (!(z > b2)) { z = b2; d = 4; }
+
+                int8_t sc_mch = device_mat[0];
+                if (z > sc_mch) z = sc_mch;
+                
+                u[t] = z - v1;
+                v[t] = z - ut;
+
+                int tmp = z - q;
+                a -= tmp; 
+                b -= tmp;
+                tmp = z - q2;
+                a2 -= tmp; 
+                b2 -= tmp;
+                
+                // Right-alignment的gap扩展判断也要调整
+                if (!(0 > a)) {  // a >= 0
+                    x[t] = a - qe; 
+                    d |= 0x08;
+                } else { 
+                    x[t] = -qe; 
+                }
+                
+                if (!(0 > b)) {  // b >= 0
+                    y[t] = b - qe; 
+                    d |= 0x10;
+                } else { 
+                    y[t] = -qe; 
+                }
+                
+                if (!(0 > a2)) {  // a2 >= 0
+                    x2[t] = a2 - qe2; 
+                    d |= 0x20;
+                } else { 
+                    x2[t] = -qe2; 
+                }
+                
+                if (!(0 > b2)) {  // b2 >= 0
+                    y2[t] = b2 - qe2; 
+                    d |= 0x40;
+                } else { 
+                    y2[t] = -qe2; 
+                }
+                
+                if(pr != NULL) {
+                    pr[t - st] = d;
+                }
+                
+                v1 = vt;
+                x1 = xt;
+                x21 = x2t;
             }
-            
-            if (b2 > 0) { 
-                y2[t] = b2 - qe2; 
-                d |= 0x40; 
-            } else { 
-                y2[t] = -qe2; 
-            }
-            
-            if(with_cigar && pr != NULL) {
-                pr[t] = d;
-            }
-            
-            // 为下一次迭代准备变量
-            v1 = vt;
-            x1 = xt;
-            x21 = x2t;
         }
+        
+        // ========== Track maximum score and update H array ==========
         if(!approx_max) {
+            // 精确跟踪最大值（需要维护完整的H数组）
             int32_t max_H, max_t;
             
             if (r == 0) {
@@ -876,13 +1148,14 @@ __global__ void ksw_semi_global_cuda_kernel(
                 max_H = H[0];
                 max_t = 0;
             } else {
-                // **关键修复：在更新前保存需要的旧值**
-                int32_t H_en0_old = H[en0];           // 保存H[en0]本身的旧值（用于垂直转移）
-                int32_t H_en0_minus1_old = (en0 > 0) ? H[en0 - 1] : 0;  // 保存H[en0-1]的旧值（用于水平转移）
+                // 更新H数组：H[r][t] = H[r-1][t-1] + v[r][t] 或 H[r-1][t] + u[r][t]
+                // 先保存H[en0-1]用于更新H[en0]
+                int32_t H_en0_old = en0 > 0 ? H[en0 - 1] : H[en0];
                 
-                // 更新H[st0] ~ H[en0-1]（这会修改H[en0-1]）
                 max_H = KSW_NEG_INF;
                 max_t = st0;
+                
+                // 更新H[st0] ~ H[en0-1]（水平方向传递）
                 for (int t = st0; t < en0; ++t) {
                     H[t] += (int32_t)v[t];
                     if (H[t] > max_H) {
@@ -891,14 +1164,11 @@ __global__ void ksw_semi_global_cuda_kernel(
                     }
                 }
                 
-                // **关键修复：H[en0]需要考虑两种转移路径，取最大值**
-                int32_t from_vertical = H_en0_old + (int32_t)v[en0];      // 从上一轮的H[en0]
-                int32_t from_horizontal = H_en0_minus1_old + (int32_t)u[en0];  // 从上一轮的H[en0-1]
-                
+                // 更新H[en0]（垂直方向传递）
                 if (en0 > 0) {
-                    H[en0] = (from_vertical > from_horizontal) ? from_vertical : from_horizontal;
+                    H[en0] = H_en0_old + (int32_t)u[en0];
                 } else {
-                    H[en0] = from_vertical;
+                    H[en0] += (int32_t)v[en0];
                 }
                 
                 if (H[en0] > max_H) {
@@ -907,6 +1177,7 @@ __global__ void ksw_semi_global_cuda_kernel(
                 }
             }
 
+            // 更新全局最大值
             int j = max_t;
             int i = r - j;
             if (max_H > ez->max) {
@@ -915,6 +1186,8 @@ __global__ void ksw_semi_global_cuda_kernel(
                 ez->max_q = i;
             }
             
+            // ========== Z-drop check ==========
+            // 如果得分下降超过zdrop阈值，提前终止
             if (j >= ez->max_t && i >= ez->max_q) {
                 int tl = j - ez->max_t;
                 int ql = i - ez->max_q;
@@ -925,6 +1198,7 @@ __global__ void ksw_semi_global_cuda_kernel(
                 }
             }
 
+            // 记录query末端和target末端的最佳得分
             if (en0 == tlen - 1 && H[en0] > ez->mte) {
                 ez->mte = H[en0];
                 ez->mte_q = r - en0;
@@ -934,11 +1208,14 @@ __global__ void ksw_semi_global_cuda_kernel(
                 ez->mqe_t = st0;
             }
             
+            // 记录最终得分
             if (r == qlen + tlen - 2 && en0 == tlen - 1) {
                 ez->score = H[tlen - 1];
             }
         } else {
+            // 近似最大值（只跟踪H0，不维护完整H数组）
             if (r > 0) {
+                // 根据上一轮的H0位置更新
                 if (last_H0_t >= st0 && last_H0_t <= en0 && 
                     last_H0_t + 1 >= st0 && last_H0_t + 1 <= en0) {
                     int32_t d0 = v[last_H0_t];
@@ -968,6 +1245,8 @@ __global__ void ksw_semi_global_cuda_kernel(
         last_st = st;
         last_en = en;
     }
+    
+    // ========== Write results ==========
     device_res->aln_score[task_id] = ez->score;
     device_res->query_batch_end[task_id] = ez->reach_end ? qlen - 1 : ez->max_q;
     device_res->target_batch_end[task_id] = ez->reach_end ? tlen - 1 : ez->max_t;

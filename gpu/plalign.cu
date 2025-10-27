@@ -104,6 +104,7 @@ static int init_gpu_storage(size_t initial_tasks, size_t initial_seq_bytes) {
     cudaMalloc(&g_storage->d_target_offsets, g_storage->max_tasks * sizeof(uint32_t));
     cudaMalloc(&g_storage->d_query_lens, g_storage->max_tasks * sizeof(uint32_t));
     cudaMalloc(&g_storage->d_target_lens, g_storage->max_tasks * sizeof(uint32_t));
+    cudaMalloc(&g_storage->d_flag, g_storage->max_tasks * sizeof(int32_t));
 
 
      // Allocate AGATHA global buffer
@@ -368,6 +369,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     uint32_t *h_target_offsets = (uint32_t*)calloc(n_tasks, sizeof(uint32_t));
     uint32_t *h_query_lens = (uint32_t*)calloc(n_tasks, sizeof(uint32_t));
     uint32_t *h_target_lens = (uint32_t*)calloc(n_tasks, sizeof(uint32_t));
+    int32_t *h_flag = (int32_t*)calloc(n_tasks, sizeof(int32_t));
     
     // Calculate offsets and prepare sequences
     for (int i = 0; i < n_tasks; i++) {
@@ -379,6 +381,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         h_target_offsets[i] = total_target_bytes;
         h_query_lens[i] = tasks[i].qlen;
         h_target_lens[i] = tasks[i].tlen;
+        h_flag[i] = tasks[i].flag;
         
         total_query_bytes += qlen_aligned;
         total_target_bytes += tlen_aligned;
@@ -414,7 +417,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         return;
     }
     
-     
+    const uint8_t N_BASE = 4; 
     for (int i = 0; i < n_tasks; i++) {
         // Copy sequences
         memcpy(h_unpacked_query + h_query_offsets[i], 
@@ -426,10 +429,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         size_t qlen_aligned = ((tasks[i].qlen + 7) / 8) * 8;
         size_t tlen_aligned = ((tasks[i].tlen + 7) / 8) * 8;
         for (int j = tasks[i].qlen; j < qlen_aligned; j++) {
-            h_unpacked_query[h_query_offsets[i] + j] = 0x0F;
+            h_unpacked_query[h_query_offsets[i] + j] = N_BASE;
         }
         for (int j = tasks[i].tlen; j < tlen_aligned; j++) {
-            h_unpacked_target[h_target_offsets[i] + j] = 0x0F;
+            h_unpacked_target[h_target_offsets[i] + j] = N_BASE;
         }
     }
 
@@ -446,6 +449,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     n_tasks * sizeof(uint32_t), cudaMemcpyHostToDevice, g_storage->stream);
     cudaMemcpyAsync(g_storage->d_target_lens, h_target_lens, 
                     n_tasks * sizeof(uint32_t), cudaMemcpyHostToDevice, g_storage->stream);
+    cudaMemcpyAsync(g_storage->d_flag, h_flag, 
+                    n_tasks * sizeof(int32_t), cudaMemcpyHostToDevice, g_storage->stream);
+    
 
     // Launch packing kernel
     int query_tasks_per_thread = (int)ceil((double)total_query_bytes / 
@@ -523,17 +529,17 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         g_storage->max_backtrack_size,
         g_storage->d_ez_array,
         g_storage->d_ksw_temp_buffer,
+        g_storage->d_flag,
         g_storage->ksw_temp_per_task,
         n_tasks,
         5,  // m = alphabet size(ACGTN)
         opt->zdrop,
-        opt->end_bonus,
-        extra_flag
+        opt->end_bonus
     );
 
     // ===== KSW Backtracking Kernel (Phase 2: Generate CIGAR) =====
     //FIXME: skip backtrack for now
-    if (!cigar_buffer) {
+    if (cigar_buffer) {
         ksw_backtrack_kernel<<<g_storage->kernel_blocks, g_storage->kernel_threads,
                         shared_mem, g_storage->stream>>>(
             g_storage->d_backtrack_p,
@@ -546,10 +552,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             g_storage->d_cigar_lengths,
             g_storage->max_cigar_len,
             g_storage->max_backtrack_size,
-            n_tasks,
-            g_config.gap_open
+            g_storage->d_flag,
+            n_tasks
         );
-        
+
         // Copy CIGAR results back to host
         cudaMemcpyAsync(g_storage->h_cigar_buffer,
                         g_storage->d_cigar_buffer,
@@ -587,7 +593,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         tasks[i].max_t = g_storage->host_res->target_batch_end[align_id];
         
         // Copy CIGAR to output buffer
-        if (!cigar_buffer) {
+        if (cigar_buffer) {
             int n_cigar = g_storage->h_cigar_lengths[align_id];
             tasks[i].n_cigar = n_cigar;
             

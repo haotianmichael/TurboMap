@@ -154,7 +154,7 @@ typedef struct {
     read_align_ctx_t *read_ctxs; // context for each read
     
     // Memory pool
-    void *km;              // memory pool for this batch
+    //void *km;              // memory pool for this batch
 } gpu_align_batch_t;
 
 

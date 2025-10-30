@@ -1118,7 +1118,7 @@ static void mm_align_pair_batched(gpu_align_batch_t *gpu_batch,
                       task_type, task_sub_idx);
 }
 
-void mm_align1_batched(gpu_align_batch_t *gpu_batch,
+void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                              const mm_mapopt_t *opt, const mm_idx_t *mi, 
                              int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
                              int n_a, mm128_t *a, int read_idx, int reg_idx)
@@ -1130,7 +1130,6 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch,
     int32_t rs, re, qs, qe;
     int32_t rs1, qs1, re1, qe1;
     int8_t mat[25];
-    void *km = gpu_batch->km;
 
     if (is_sr) assert(!(mi->flag & MM_I_HPC));
 

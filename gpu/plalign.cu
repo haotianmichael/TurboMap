@@ -538,7 +538,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     );
 
     // ===== KSW Backtracking Kernel (Phase 2: Generate CIGAR) =====
-    //FIXME: skip backtrack for now
     if (cigar_buffer) {
         ksw_backtrack_kernel<<<g_storage->kernel_blocks, g_storage->kernel_threads,
                         shared_mem, g_storage->stream>>>(

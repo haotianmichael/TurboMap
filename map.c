@@ -1204,7 +1204,7 @@ int mm_split_merge(int n_segs, const char **fn, const mm_mapopt_t *opt, int n_sp
 
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks, 
                                    uint8_t *seq_buffer, uint32_t *cigar_buffer);
-extern void mm_align1_batched(gpu_align_batch_t *gpu_batch,
+extern void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                              const mm_mapopt_t *opt, const mm_idx_t *mi, 
                              int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
                              int n_a, mm128_t *a, int read_idx, int reg_idx);
@@ -1230,7 +1230,10 @@ static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
     
     gpu_batch->n_reads = n_reads;
     gpu_batch->read_ctxs = (read_align_ctx_t*)kcalloc(km, n_reads, sizeof(read_align_ctx_t));
-    gpu_batch->km = km;
+
+	gpu_batch->n_tasks = 0;
+    gpu_batch->seq_buffer_used = 0;
+    gpu_batch->cigar_buffer_used = 0;
     
     return gpu_batch;
 }
@@ -1273,7 +1276,7 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
 }
 
 static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                                chain_read_t *read_, mm_tbuf_t *b, void *km, gpu_align_batch_t *gpu_batch, int read_idx) 
+                                chain_read_t *read_, void *km, gpu_align_batch_t *gpu_batch, int read_idx) 
 {
     int n_segs = read_->n_seg;
     const int *qlens = read_->qlens;
@@ -1293,8 +1296,6 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
     int is_sr = !!(opt->flag & MM_F_SR);
     uint32_t hash;
     mm_reg1_t *regs0;
-    double *timers = b->timers;
-    double t1 = realtime();
 
     hash  = qname && !(opt->flag & MM_F_NO_HASH_NAME)? __ac_X31_hash_string(qname) : 0;
     hash ^= __ac_Wang_hash(qlen_sum) + __ac_Wang_hash(opt->seed);
@@ -1353,7 +1354,7 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
         
         // This replaces the mm_align1 call with task collection
 		assert(!((opt->flag&MM_F_SPLICE) && (opt->flag&MM_F_SPLICE_FOR) && (opt->flag&MM_F_SPLICE_REV)));
-        mm_align1_batched(gpu_batch, opt, mi, qlens[0], qseq0, &regs0[i], &r2, n_a, a, read_idx, i);
+        mm_align1_batched(gpu_batch, km, opt, mi, qlens[0], qseq0, &regs0[i], &r2, n_a, a, read_idx, i);
         
         // FIXME: Handle r2.cnt > 0 case after GPU processing
         // if (r2.cnt > 0) regs0 = mm_insert_reg(&r2, i, &skele_n_regs, regs0);
@@ -1370,13 +1371,18 @@ static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 	const int *qlens = read_->qlens;
 	mm128_t *a = read_->a;
 	uint64_t *u = read_->u;
-	uint64_t *mini_pos = &read_->mini_pos;
+	uint64_t *mini_pos = read_->mini_pos;
 	int rep_len = read_->rep_len;
 	int is_sr = !!(opt->flag & MM_F_SR);
 	read_align_ctx_t *ctx = &gpu_batch->read_ctxs[read_idx];
 	int *n_regs_after_align = &ctx->n_regs;
 	mm_reg1_t *regs_after_align = ctx->regs0;
-	if(0 == *n_regs_after_align) return;
+	if(0 == *n_regs_after_align) {
+		kfree(km, a);
+		kfree(km, u);
+		kfree(km, mini_pos);
+		return;
+	}
 
 	mm_filter_regs(opt, qlens[0], n_regs_after_align, regs_after_align);
 	if (!(opt->flag&MM_F_SR) && !opt->split_prefix && qlens[0] >= opt->rank_min_len) {
@@ -1395,10 +1401,15 @@ static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 	 *END: put part of mm_align_skeletion here for simplicity.
 	 * **************************************/
 	regs_after_align = (mm_reg1_t*)realloc(regs_after_align, sizeof(*regs_after_align) * *n_regs_after_align);
+	ctx->regs0 = regs_after_align;
 	mm_set_mapq(km, *n_regs_after_align, regs_after_align, opt->min_chain_score, opt->a, rep_len, is_sr);
 	kfree(km, a);
 	kfree(km, u);
-	kfree(km, *mini_pos);
+	kfree(km, mini_pos);
+
+	read_->a = NULL;
+	read_->u = NULL;
+	read_->mini_pos = NULL;
 }
 
 static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s) 
@@ -1408,7 +1419,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     // Process each read and collect alignment tasks
     for (int iread = 0; iread < batch->count; iread++) {
         pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread], 
-                            	b, batch->km, gpu_batch, iread);
+                            	batch->km, gpu_batch, iread);
     }
     
     // Submit all tasks to GPU and process results
@@ -1468,7 +1479,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
 	// Final cleanup for each read
     for (int iread = 0; iread < batch->count; iread++) {
         read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
-        kfree(batch->km, ctx->qseq0[0]);
+    	kfree(batch->km, ctx->qseq0[0]);
     }
     kfree(batch->km, gpu_batch->tasks);
     kfree(batch->km, gpu_batch->seq_buffer);

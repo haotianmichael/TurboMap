@@ -7,7 +7,7 @@
 #include "ksw2.h"
 #include "gpu/plutils.h"
 
-static void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi)
+void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi)
 {
 	int i, j;
 	a = a < 0? -a : a;
@@ -238,7 +238,7 @@ static void mm_update_cigar_eqx(mm_reg1_t *r, const uint8_t *qseq, const uint8_t
 	r->p = p;
 }
 
-static void mm_update_extra(mm_reg1_t *r, const uint8_t *qseq, const uint8_t *tseq, const int8_t *mat, int8_t q, int8_t e, int is_eqx, int log_gap)
+void mm_update_extra(mm_reg1_t *r, const uint8_t *qseq, const uint8_t *tseq, const int8_t *mat, int8_t q, int8_t e, int is_eqx, int log_gap)
 {
 	uint32_t k, l;
 	int32_t qshift, tshift, toff = 0, qoff = 0;
@@ -1031,7 +1031,7 @@ static int gpu_batch_add_task(gpu_align_batch_t *gpu_batch,
                              const int8_t *mat, int32_t w, int32_t end_bonus, 
                              int32_t zdrop, int32_t flag,
                              int32_t read_idx, int32_t reg_idx, 
-                             int32_t task_type, int32_t task_sub_idx)
+                             int32_t task_type, int32_t task_sub_idx, task_ctx_t task_ctx)
 {
     if (gpu_batch->n_tasks >= gpu_batch->max_tasks) {
         fprintf(stderr, "[ERROR] GPU batch task overflow\n");
@@ -1094,7 +1094,17 @@ static int gpu_batch_add_task(gpu_align_batch_t *gpu_batch,
     task->n_cigar = 0;
     task->zdropped = 0;
     task->reach_end = 0;
-    
+
+	task->task_ctx.ref_qs = task_ctx.ref_qs;
+	task->task_ctx.ref_qe = task_ctx.ref_qe;
+	task->task_ctx.ref_rs = task_ctx.ref_rs;
+	task->task_ctx.ref_re = task_ctx.ref_re;
+
+	task->task_ctx.qs0 = task_ctx.qs0; task->task_ctx.qe0 = task_ctx.qe0;
+	task->task_ctx.rs0 = task_ctx.rs0; task->task_ctx.re0 = task_ctx.re0;
+	task->task_ctx.rev= task_ctx.rev;
+	task->task_ctx.rid = task_ctx.rid;
+
     gpu_batch->n_tasks++;
     return 0;
 }
@@ -1106,7 +1116,7 @@ static void mm_align_pair_batched(gpu_align_batch_t *gpu_batch,
                                  const uint8_t *junc, const int8_t *mat, 
                                  int w, int end_bonus, int zdrop, int flag,
                                  int32_t read_idx, int32_t reg_idx, 
-                                 int32_t task_type, int32_t task_sub_idx)
+                                 int32_t task_type, int32_t task_sub_idx, task_ctx_t task_ctx)
 {
     // For very large alignments, skip GPU (fallback handled later)
     if (opt->max_sw_mat > 0 && (int64_t)tlen * qlen > opt->max_sw_mat) {
@@ -1115,7 +1125,7 @@ static void mm_align_pair_batched(gpu_align_batch_t *gpu_batch,
     
     gpu_batch_add_task(gpu_batch, qseq, qlen, tseq, tlen, junc, mat, 
                       w, end_bonus, zdrop, flag, read_idx, reg_idx, 
-                      task_type, task_sub_idx);
+                      task_type, task_sub_idx, task_ctx);
 }
 
 void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
@@ -1248,8 +1258,15 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     junc = (uint8_t*)kmalloc(km, re0 - rs0);
 
     rs1 = rs, qs1 = qs;
-
-    // Left extension
+	task_ctx_t task_ctx;
+    task_ctx.qs0 = qs0;
+	task_ctx.qe0 = qe0;
+	task_ctx.rs0 = rs0;
+	task_ctx.re0 = re0;
+	task_ctx.rid = rid;
+	task_ctx.rev = rev;
+ 
+	// Left extension
     if (qs > 0 && rs > 0) {
         if (opt->flag & MM_F_QSTRAND) {
             qseq = &qseq0[0][qs0];
@@ -1262,11 +1279,15 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         mm_seq_rev(qs - qs0, qseq);
         mm_seq_rev(rs - rs0, tseq);
         mm_seq_rev(rs - rs0, junc);
-        
-        mm_align_pair_batched(gpu_batch, opt, qs - qs0, qseq, rs - rs0, tseq, junc, mat,
+
+	    task_ctx.ref_qs = qs;
+	    task_ctx.ref_qe = qs;
+	    task_ctx.ref_rs = rs;
+	    task_ctx.ref_re = rs;
+	    mm_align_pair_batched(gpu_batch, opt, qs - qs0, qseq, rs - rs0, tseq, junc, mat,
                              bw, opt->end_bonus, r->split_inv? opt->zdrop_inv : opt->zdrop,
                              extra_flag|KSW_EZ_EXTZ_ONLY|KSW_EZ_RIGHT|KSW_EZ_REV_CIGAR,
-                             read_idx, reg_idx, GPU_TASK_LEFT_EXT, 0);
+                             read_idx, reg_idx, GPU_TASK_LEFT_EXT, 0, task_ctx);
         
         mm_seq_rev(qs - qs0, qseq);
     }
@@ -1309,9 +1330,14 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                 mm_append_cigar(r, 1, &cigar_op);
                 if (r->p) r->p->dp_score += score;
             } else {
+
+	            task_ctx.ref_qs = qs;
+	            task_ctx.ref_qe = qe;
+	            task_ctx.ref_rs = rs;
+	            task_ctx.ref_re = re;
                 mm_align_pair_batched(gpu_batch, opt, qe - qs, qseq, re - rs, tseq, junc, mat,
                                      bw1, -1, opt->zdrop, extra_flag|KSW_EZ_APPROX_MAX,
-                                     read_idx, reg_idx, GPU_TASK_GAP_FILL, i);
+                                     read_idx, reg_idx, GPU_TASK_GAP_FILL, i, task_ctx);
             }
             rs = re, qs = qe;
         }
@@ -1328,9 +1354,13 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         }
         mm_idx_bed_junc(mi, rid, re, re0, junc);
         
+	    task_ctx.ref_qs = qe;
+	    task_ctx.ref_qe = qe0;
+	    task_ctx.ref_rs = re;
+	    task_ctx.ref_re = re0;
         mm_align_pair_batched(gpu_batch, opt, qe0 - qe, qseq, re0 - re, tseq, junc, mat,
                              bw, opt->end_bonus, opt->zdrop, extra_flag|KSW_EZ_EXTZ_ONLY,
-                             read_idx, reg_idx, GPU_TASK_RIGHT_EXT, 0);
+                             read_idx, reg_idx, GPU_TASK_RIGHT_EXT, 0, task_ctx);
     }
 
     kfree(km, tseq);

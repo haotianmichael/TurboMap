@@ -1209,6 +1209,8 @@ extern void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                              int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
                              int n_a, mm128_t *a, int read_idx, int reg_idx);
 extern void mm_append_cigar(mm_reg1_t *r, uint32_t n_cigar, uint32_t *cigar);
+extern void mm_update_extra(mm_reg1_t *r, const uint8_t *qseq, const uint8_t *tseq, const int8_t *mat, int8_t q, int8_t e, int is_eqx, int log_gap);
+extern void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi);
 
 static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
 {
@@ -1238,32 +1240,199 @@ static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
     return gpu_batch;
 }
 
-static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch)
+// sorting by read_idx、reg_idx、task_type、task_sub_idx
+static int task_compare(const void *a, const void *b) {
+    const gpu_align_task_t *ta = (const gpu_align_task_t*)a;
+    const gpu_align_task_t *tb = (const gpu_align_task_t*)b;
+    
+    if (ta->read_idx != tb->read_idx) 
+        return ta->read_idx - tb->read_idx;
+    if (ta->reg_idx != tb->reg_idx) 
+        return ta->reg_idx - tb->reg_idx;
+    if (ta->task_type != tb->task_type) 
+        return ta->task_type - tb->task_type;
+    return ta->task_sub_idx - tb->task_sub_idx;
+}
+
+static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch, 
+                                       const mm_mapopt_t *opt, 
+                                       const mm_idx_t *mi, void *km)
 {
+    if (gpu_batch->n_tasks == 0) return;
+   
+    qsort(gpu_batch->tasks, gpu_batch->n_tasks, 
+          sizeof(gpu_align_task_t), task_compare);
+    
+    int current_read = -1, current_reg = -1;
+    read_align_ctx_t *ctx = NULL;
+    mm_reg1_t *r = NULL;
+    int32_t rs1 = 0, qs1 = 0, re1 = 0, qe1 = 0;
+    int qlen = 0;
+    int dropped = 0;
+    int8_t mat[25];
+    
+    ksw_gen_simple_mat(5, mat, opt->a, opt->b, opt->sc_ambi);
+    
     for (int i = 0; i < gpu_batch->n_tasks; i++) {
         gpu_align_task_t *task = &gpu_batch->tasks[i];
-        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[task->read_idx];
-        mm_reg1_t *r = &ctx->regs0[task->reg_idx];
+
+		if(task->n_cigar == 0 || task->max_q < 0 || task->max_t < 0) {
+			continue;
+		}
         
+        // 切换到新region
+        if (task->read_idx != current_read || task->reg_idx != current_reg) {
+            current_read = task->read_idx;
+            current_reg = task->reg_idx;
+            ctx = &gpu_batch->read_ctxs[current_read];
+            r = &ctx->regs0[current_reg];
+            
+            // 获取query长度
+            for (int k = 0; k < ctx->n_a; k++) {
+                if ((int32_t)(ctx->a[k].y >> 32 & 0xff) > 0) {
+                    qlen = (int32_t)ctx->a[k].y + (int32_t)(ctx->a[k].y >> 32 & 0xff);
+                    break;
+                }
+            }
+            if (qlen == 0 && ctx->qseq0[0] && ctx->qseq0[1]) {
+                qlen = ctx->qseq0[1] - ctx->qseq0[0];
+            }
+            
+            dropped = 0;
+            
+            // 初始化边界（将在任务处理中累积更新）
+            rs1 = r->rs;
+            qs1 = r->qs;
+            re1 = r->rs;
+            qe1 = r->qs;
+            
+            // 确保r->p已分配
+            if (!r->p) {
+                uint32_t capacity = sizeof(mm_extra_t)/4 + 100;
+                kroundup32(capacity);
+                r->p = (mm_extra_t*)calloc(capacity, 4);
+                r->p->capacity = capacity;
+            }
+        }
+        
+        if (dropped) continue;
+        
+        // 处理CIGAR（左扩展需要反向）
         if (task->n_cigar > 0) {
             uint32_t *cigar = gpu_batch->cigar_buffer + task->cigar_offset;
-            mm_append_cigar(r, task->n_cigar, cigar);
-            if (r->p) r->p->dp_score += task->score;
+            
+            if (task->task_type == GPU_TASK_LEFT_EXT) {
+                // 左扩展的CIGAR需要反向
+                uint32_t *rev_cigar = (uint32_t*)kmalloc(km, task->n_cigar * sizeof(uint32_t));
+                for (int k = 0; k < task->n_cigar; k++) {
+                    rev_cigar[k] = cigar[task->n_cigar - 1 - k];
+                }
+                mm_append_cigar(r, task->n_cigar, rev_cigar);
+                kfree(km, rev_cigar);
+            } else {
+                mm_append_cigar(r, task->n_cigar, cigar);
+            }
         }
         
-        // Handle Z-drop and other special cases
-        if (task->zdropped && task->task_type == GPU_TASK_GAP_FILL) {
-            // TODO: Handle region splitting - complex logic would go here
-            // For now, just mark as zdropped
+        // 累积score
+        if (r->p && task->score > 0) {
+            r->p->dp_score += task->score;
         }
         
-        // Update region boundaries based on task results
-        // This requires mapping the GPU results back to the original mm_align1 logic
-        // The exact implementation would depend on your specific GPU kernel output format
+        // 根据任务类型更新边界（使用参考坐标转换）
+        switch (task->task_type) {
+            case GPU_TASK_LEFT_EXT:
+                // 左扩展：向前（向起点方向）扩展
+                if (task->reach_end) {
+                    // 扩展到了对齐区域的起点
+                    rs1 = task->task_ctx.rs0;
+                    qs1 = task->task_ctx.qs0;
+                } else {
+                    // 部分扩展：ref_rs/qs是扩展的起点，max_t/q是扩展长度
+                    rs1 = task->task_ctx.ref_rs - (task->max_t + 1);
+                    qs1 = task->task_ctx.ref_qs - (task->max_q + 1);
+                }
+                // 左扩展不改变终点
+                break;
+                
+            case GPU_TASK_GAP_FILL:
+                // Gap填充
+                if (task->zdropped) {
+                    // Z-drop截断
+                    re1 = task->task_ctx.ref_rs + (task->max_t + 1);
+                    qe1 = task->task_ctx.ref_qs + (task->max_q + 1);
+                    dropped = 1;
+                    // TODO: 需要调用mm_split_reg处理剩余的anchors
+                } else {
+                    // 正常填充：更新终点到gap的终点
+                    re1 = task->task_ctx.ref_re;
+                    qe1 = task->task_ctx.ref_qe;
+                }
+                break;
+                
+            case GPU_TASK_RIGHT_EXT:
+                // 右扩展：向后（向终点方向）扩展
+                if (task->reach_end) {
+                    // 扩展到了对齐区域的终点
+                    re1 = task->task_ctx.re0;
+                    qe1 = task->task_ctx.qe0;
+                } else {
+                    // 部分扩展：ref_re/qe是扩展的起点，max_t/q是扩展长度
+                    re1 = task->task_ctx.ref_re + (task->max_t + 1);
+                    qe1 = task->task_ctx.ref_qe + (task->max_q + 1);
+                }
+                // 右扩展不改变起点
+                break;
+        }
+        
+        // 检查是否是当前region的最后一个任务
+        int is_last_task = (i == gpu_batch->n_tasks - 1) ||
+                          (gpu_batch->tasks[i+1].read_idx != current_read) ||
+                          (gpu_batch->tasks[i+1].reg_idx != current_reg);
+        
+        if (is_last_task) {
+
+            // 设置最终边界
+            r->rs = rs1;
+            r->re = re1;
+            
+            // 处理query坐标（考虑反向互补）
+            int rev = task->task_ctx.rev;
+            if (!rev || (opt->flag & MM_F_QSTRAND)) {
+                r->qs = qs1;
+                r->qe = qe1;
+            } else {
+                r->qs = qlen - qe1;
+                r->qe = qlen - qs1;
+            }
+            
+            // 调用mm_update_extra更新统计信息
+            if (r->p && r->p->n_cigar > 0) {
+                uint8_t *qseq;
+				if(!rev || (opt->flag & MM_F_QSTRAND)) {
+					qseq = ctx->qseq0[0] + qs1;
+				}else {
+					qseq = ctx->qseq0[1] + (qlen - qe1);
+				}
+                uint8_t *tseq = (uint8_t*)kmalloc(km, re1 - rs1);
+                mm_idx_getseq(mi, task->task_ctx.rid, rs1, re1, tseq);
+                
+                mm_update_extra(r, qseq, tseq, mat, opt->q, opt->e, 
+                               opt->flag & MM_F_EQX, !(opt->flag & MM_F_SR));
+                
+                // 处理trans_strand（splicing）
+                if (rev && r->p->trans_strand) {
+                    r->p->trans_strand ^= 3;
+                }
+                
+                kfree(km, tseq);
+            }
+        }
     }
 }
 
-static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch_t *gpu_batch)
+
+static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch_t *gpu_batch, const mm_idx_t *mi, void *km)
 {
     if (gpu_batch->n_tasks == 0) return;
     
@@ -1272,7 +1441,7 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
                            gpu_batch->seq_buffer, gpu_batch->cigar_buffer);
     
     // Process results back to mm_reg1_t structures
-    gpu_batch_process_results(gpu_batch);
+    gpu_batch_process_results(gpu_batch, opt, mi, km);
 }
 
 static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
@@ -1423,7 +1592,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     }
     
     // Submit all tasks to GPU and process results
-    gpu_batch_submit_and_process(s->p->opt, gpu_batch);
+    gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km);
     
   
 	for (int iread = 0; iread < batch->count; iread++) {

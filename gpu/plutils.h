@@ -86,6 +86,17 @@ typedef struct seg_t {
 
 /* Align Options */
 // Single GPU alignment task within a batch
+typedef struct{
+
+    int32_t ref_qs, ref_qe;
+    int32_t ref_rs, ref_re;
+
+    int32_t qs0, qe0;
+    int32_t rs0, re0;
+    int32_t rev;
+    int32_t rid;
+}task_ctx_t;
+
 typedef struct {
     // Input sequences (offsets into batch buffers)
     size_t qseq_offset;     // query sequence offset in batch buffer
@@ -118,6 +129,8 @@ typedef struct {
     int32_t max_cigar;      // max CIGAR capacity
     uint8_t zdropped;       // whether zdropped
     uint8_t reach_end;      // whether reached end
+
+    task_ctx_t task_ctx;    // coor
 } gpu_align_task_t;
 
 // Per-read alignment context
@@ -153,8 +166,6 @@ typedef struct {
     int32_t n_reads;        // number of reads being processed
     read_align_ctx_t *read_ctxs; // context for each read
     
-    // Memory pool
-    //void *km;              // memory pool for this batch
 } gpu_align_batch_t;
 
 

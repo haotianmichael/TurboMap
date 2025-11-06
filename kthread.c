@@ -100,7 +100,7 @@ void kt_for_async(int n_threads, void (*producer_func)(void*,long,int), void *pr
             t.w[i].t = &t, t.w[i].i = i;
         
         // Start consumer thread first
-        //pthread_create(&consumer_tid, 0, (void *(*)(void *))consumer_func, consumer_data);
+        pthread_create(&consumer_tid, 0, (void *(*)(void *))consumer_func, consumer_data);
         
         // Start producer threads
         for (i = 0; i < n_threads; ++i) 

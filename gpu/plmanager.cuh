@@ -53,15 +53,40 @@ void push_seeded_read(seeded_queue_t *q, chain_read_t *read) {
         pthread_cond_wait(&q->not_full, &q->mutex);
     }
     
-    // Copy read to queue
-    q->reads[q->tail] = *read;
+    // Deep copy read to queue - 使用malloc分配独立内存
+    chain_read_t *queue_read = &q->reads[q->tail];
+    
+    // Copy basic fields
+    *queue_read = *read;
+    
+    // Deep copy qlens
+    if (read->n_seg > 0) {
+        queue_read->qlens = (int*)malloc(sizeof(int) * read->n_seg);
+        memcpy(queue_read->qlens, read->qlens, sizeof(int) * read->n_seg);
+        
+        queue_read->qseqs = (const char**)malloc(sizeof(const char*) * read->n_seg);
+        memcpy(queue_read->qseqs, read->qseqs, sizeof(const char*) * read->n_seg);
+    }
+    
+    // Deep copy mini_pos
+    if (read->n_mini_pos > 0) {
+        queue_read->mini_pos = (uint64_t*)malloc(read->n_mini_pos * sizeof(uint64_t));
+        memcpy(queue_read->mini_pos, read->mini_pos, read->n_mini_pos * sizeof(uint64_t));
+    }
+    
+    // Deep copy anchors array
+    if (read->n > 0) {
+        queue_read->a = (mm128_t*)malloc(read->n * sizeof(mm128_t));
+        memcpy(queue_read->a, read->a, read->n * sizeof(mm128_t));
+    }
+    
     q->tail = (q->tail + 1) % q->capacity;
     q->count++;
     
     // Signal that queue is not empty
     pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->mutex);
-}
+} 
 
 // Pop seeded read from global queue (blocking if empty, unless all workers finished)
 int pop_seeded_read(seeded_queue_t *q, chain_read_t *read) {
@@ -97,5 +122,24 @@ void mark_worker_finished(seeded_queue_t *q) {
     pthread_mutex_unlock(&q->mutex);
 }
 
+// Free the independently allocated memory for a queue read
+void free_queue_read(chain_read_t *read) {
+    if (read->qlens) {
+        free(read->qlens);
+        read->qlens = NULL;
+    }
+    if (read->qseqs) {
+        free(read->qseqs);
+        read->qseqs = NULL;
+    }
+    if (read->mini_pos) {
+        free(read->mini_pos);
+        read->mini_pos = NULL;
+    }
+    if (read->a) {
+        free(read->a);
+        read->a = NULL;
+    }
+} 
 
 #endif // __PL_MANAGER_CUH_

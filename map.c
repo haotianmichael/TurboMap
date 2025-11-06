@@ -1042,10 +1042,6 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		mm_consolidate_timers (s, p);
 		for (i = 0; i < p->n_threads; ++i) mm_tbuf_destroy(s->buf[i]);
 		free(s->buf);
-#if defined(__AMD_SPLIT_KERNELS__)
-		for (i = 0; i < p->n_threads; ++i) mm_trbuf_destroy(s->trbuf[i]);
-		free(s->trbuf);
-#endif
 
 		if ((p->opt->flag & MM_F_OUT_CS) && !(mm_dbg_flag & MM_DBG_NO_KALLOC)) km = km_init();
 		for (k = 0; k < s->n_frag; ++k) {
@@ -1270,15 +1266,16 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
     int qlen = 0;
     int dropped = 0;
     int8_t mat[25];
+    int initialized = 0;
     
     ksw_gen_simple_mat(5, mat, opt->a, opt->b, opt->sc_ambi);
     
     for (int i = 0; i < gpu_batch->n_tasks; i++) {
         gpu_align_task_t *task = &gpu_batch->tasks[i];
 
-		if(task->n_cigar == 0 || task->max_q < 0 || task->max_t < 0) {
-			continue;
-		}
+        if(task->n_cigar == 0 || task->max_q < 0 || task->max_t < 0) {
+            continue;
+        }
         
         // 切换到新region
         if (task->read_idx != current_read || task->reg_idx != current_reg) {
@@ -1288,23 +1285,16 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             r = &ctx->regs0[current_reg];
             
             // 获取query长度
+            qlen = 0;
             for (int k = 0; k < ctx->n_a; k++) {
                 if ((int32_t)(ctx->a[k].y >> 32 & 0xff) > 0) {
                     qlen = (int32_t)ctx->a[k].y + (int32_t)(ctx->a[k].y >> 32 & 0xff);
                     break;
                 }
             }
-            if (qlen == 0 && ctx->qseq0[0] && ctx->qseq0[1]) {
-                qlen = ctx->qseq0[1] - ctx->qseq0[0];
-            }
             
             dropped = 0;
-            
-            // 初始化边界（将在任务处理中累积更新）
-            rs1 = r->rs;
-            qs1 = r->qs;
-            re1 = r->rs;
-            qe1 = r->qs;
+            initialized = 0;
             
             // 确保r->p已分配
             if (!r->p) {
@@ -1312,10 +1302,36 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 kroundup32(capacity);
                 r->p = (mm_extra_t*)calloc(capacity, 4);
                 r->p->capacity = capacity;
+                r->p->n_cigar = 0;
             }
         }
         
         if (dropped) continue;
+        
+        // 第一次遇到这个region的任务，初始化边界
+        if (!initialized) {
+            // 从task_ctx获取seed的起点位置
+            if (task->task_type == GPU_TASK_LEFT_EXT) {
+                // 左扩展任务的ref_rs/ref_qs是seed的起点
+                rs1 = task->task_ctx.ref_rs;
+                qs1 = task->task_ctx.ref_qs;
+                re1 = rs1;
+                qe1 = qs1;
+            } else if (task->task_type == GPU_TASK_GAP_FILL && task->task_sub_idx == 1) {
+                // 第一个gap填充任务的ref_rs/ref_qs是seed的起点
+                rs1 = task->task_ctx.ref_rs;
+                qs1 = task->task_ctx.ref_qs;
+                re1 = rs1;
+                qe1 = qs1;
+            } else {
+                // 如果没有左扩展也没有gap填充，可能是只有右扩展
+                rs1 = task->task_ctx.ref_rs;
+                qs1 = task->task_ctx.ref_qs;
+                re1 = rs1;
+                qe1 = qs1;
+            }
+            initialized = 1;
+        }
         
         // 处理CIGAR（左扩展需要反向）
         if (task->n_cigar > 0) {
@@ -1339,24 +1355,24 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             r->p->dp_score += task->score;
         }
         
-        // 根据任务类型更新边界（使用参考坐标转换）
+        // 根据任务类型更新边界
         switch (task->task_type) {
             case GPU_TASK_LEFT_EXT:
-                // 左扩展：向前（向起点方向）扩展
+                // 左扩展：向前（向起点方向）扩展，更新rs1/qs1
                 if (task->reach_end) {
                     // 扩展到了对齐区域的起点
                     rs1 = task->task_ctx.rs0;
                     qs1 = task->task_ctx.qs0;
                 } else {
-                    // 部分扩展：ref_rs/qs是扩展的起点，max_t/q是扩展长度
+                    // 部分扩展
                     rs1 = task->task_ctx.ref_rs - (task->max_t + 1);
                     qs1 = task->task_ctx.ref_qs - (task->max_q + 1);
                 }
-                // 左扩展不改变终点
+                // re1/qe1保持为seed的起点位置（不变）
                 break;
                 
             case GPU_TASK_GAP_FILL:
-                // Gap填充
+                // Gap填充：更新re1/qe1到gap的终点
                 if (task->zdropped) {
                     // Z-drop截断
                     re1 = task->task_ctx.ref_rs + (task->max_t + 1);
@@ -1368,20 +1384,21 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                     re1 = task->task_ctx.ref_re;
                     qe1 = task->task_ctx.ref_qe;
                 }
+                // rs1/qs1保持不变（已经由左扩展或初始化确定）
                 break;
                 
             case GPU_TASK_RIGHT_EXT:
-                // 右扩展：向后（向终点方向）扩展
+                // 右扩展：向后（向终点方向）扩展，更新re1/qe1
                 if (task->reach_end) {
                     // 扩展到了对齐区域的终点
                     re1 = task->task_ctx.re0;
                     qe1 = task->task_ctx.qe0;
                 } else {
-                    // 部分扩展：ref_re/qe是扩展的起点，max_t/q是扩展长度
+                    // 部分扩展
                     re1 = task->task_ctx.ref_re + (task->max_t + 1);
                     qe1 = task->task_ctx.ref_qe + (task->max_q + 1);
                 }
-                // 右扩展不改变起点
+                // rs1/qs1保持不变
                 break;
         }
         
@@ -1390,8 +1407,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                           (gpu_batch->tasks[i+1].read_idx != current_read) ||
                           (gpu_batch->tasks[i+1].reg_idx != current_reg);
         
-        if (is_last_task) {
-
+        if (is_last_task && !dropped) {
             // 设置最终边界
             r->rs = rs1;
             r->re = re1;
@@ -1409,11 +1425,11 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             // 调用mm_update_extra更新统计信息
             if (r->p && r->p->n_cigar > 0) {
                 uint8_t *qseq;
-				if(!rev || (opt->flag & MM_F_QSTRAND)) {
-					qseq = ctx->qseq0[0] + qs1;
-				}else {
-					qseq = ctx->qseq0[1] + (qlen - qe1);
-				}
+                if(!rev || (opt->flag & MM_F_QSTRAND)) {
+                    qseq = ctx->qseq0[0] + qs1;
+                } else {
+                    qseq = ctx->qseq0[1] + (qlen - qe1);
+                }
                 uint8_t *tseq = (uint8_t*)kmalloc(km, re1 - rs1);
                 mm_idx_getseq(mi, task->task_ctx.rid, rs1, re1, tseq);
                 
@@ -1430,7 +1446,6 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
         }
     }
 }
-
 
 static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch_t *gpu_batch, const mm_idx_t *mi, void *km)
 {
@@ -1932,54 +1947,232 @@ static void worker_for(void *_data, long i_in, int tid) {
 }
 static void* gpu_batch_consumer(void *data) {
     step_t *s = (step_t*)data;
-    chain_read_t batch[10];
-    int batch_count = 0;
+    mm_tbuf_t *b = s->buf[0];
+    
+    mm_batch_trbuf_t acc_batch, launched_batch, pending_batch;
+    
+    acc_batch.km = km_init();
+    acc_batch.count = 0;
+    acc_batch.total_n = 0;
+    acc_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
+	memset(acc_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
+    acc_batch.batchid = 0;
+    
+    launched_batch.km = km_init();
+    launched_batch.count = 0;
+    launched_batch.total_n = 0;
+    launched_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
+	memset(launched_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
+    launched_batch.batchid = 2;
+    
+    pending_batch.km = km_init();
+    pending_batch.count = 0;
+    pending_batch.total_n = 0;
+    pending_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
+	memset(pending_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
+    pending_batch.batchid = 1;
+    
+    int is_full = 0;
+    int has_launched = 0;
+    int is_pending = 0;
+    int queue_finished = 0;
+    
     chain_read_t read;
     
-    while (pop_seeded_read(g_seeded_queue, &read)) {
-        batch[batch_count] = read;
+    // 主循环：累积reads
+    while (1) {
+        // Step 1: 从队列pop一个read（如果队列还没结束）
+        int got_read = 0;
+        if (!queue_finished) {
+            got_read = pop_seeded_read(g_seeded_queue, &read);
+            
+            if (got_read) {
+                // 深拷贝read到acc_batch（使用acc_batch的km）
+                chain_read_t *batch_read = &acc_batch.reads[acc_batch.count];
+                *batch_read = read;
+                
+                if (s->p->opt->flag & MM_F_INDEPEND_SEG) {
+                    batch_read->qlens = (int*)kmalloc(acc_batch.km, sizeof(int));
+                    batch_read->qseqs = (const char**)kmalloc(acc_batch.km, sizeof(const char*));
+                    batch_read->qlens[0] = read.qlens[0];
+                    batch_read->qseqs[0] = read.qseqs[0];
+                } else {
+                    batch_read->qlens = (int*)kmalloc(acc_batch.km, sizeof(int) * read.n_seg);
+                    batch_read->qseqs = (const char**)kmalloc(acc_batch.km, sizeof(const char*) * read.n_seg);
+                    memcpy(batch_read->qlens, read.qlens, sizeof(int) * read.n_seg);
+                    memcpy(batch_read->qseqs, read.qseqs, sizeof(const char*) * read.n_seg);
+                }
+                batch_read->mini_pos = (uint64_t*)kmalloc(acc_batch.km, read.n_mini_pos * sizeof(uint64_t));
+                batch_read->a = (mm128_t*)kmalloc(acc_batch.km, read.n * sizeof(mm128_t));
+                memcpy(batch_read->mini_pos, read.mini_pos, read.n_mini_pos * sizeof(uint64_t));
+                memcpy(batch_read->a, read.a, read.n * sizeof(mm128_t));
+                
+                acc_batch.count++;
+                acc_batch.total_n += read.n;
+                
+                // 释放队列中的独立内存
+                free_queue_read(&read);
+                
+                // 检查是否超过batch_max_anchors（复刻mm_trbuf_is_full的逻辑）
+                if (acc_batch.total_n >= s->batch_max_anchors) {
+                    is_full = 1;
+                    if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                        fprintf(stderr, "ACC_FULL: count=%d, total_n=%ld\n", 
+                                acc_batch.count, acc_batch.total_n);
+                    }
+                }
+            } else {
+                // 队列结束
+                queue_finished = 1;
+                is_full = 1; // 相当于i_in == -1，触发最后的处理
+                if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                    fprintf(stderr, "QUEUE_FINISHED: acc_count=%d\n", acc_batch.count);
+                }
+            }
+        }
         
-        // Check if batch is full or should be dispatched
-        if (batch_count >= 100) {
-            // Dispatch batch to GPU
-            if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
-                fprintf(stderr, "DISPATCH_BATCH\t%d_reads\tto_GPU\n", batch_count);
+        // Step 2: 处理batch（复刻old_worker_for的while循环逻辑）
+        while (is_full || (queue_finished && has_launched)) {
+            
+            if (is_full) {
+                // 提交acc_batch到GPU chain
+                if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                    fprintf(stderr, "LAUNCH_CHAIN: count=%d, total_n=%ld\n", 
+                            acc_batch.count, acc_batch.total_n);
+                }
+                
+                mm_batch_trbuf_t kernel_batch = acc_batch;
+                chain_stream_gpu(s->p->mi, s->p->opt, &kernel_batch.reads, 
+                                &kernel_batch.count, 0, launched_batch.km);
+                
+                // 检查返回值决定如何轮转
+                if (kernel_batch.reads) {
+                    // 返回了上一个launched batch（已完成）
+                    assert(has_launched);
+                    
+                    // CPU fallback for reads that didn't fit
+                    for (kernel_batch.count; kernel_batch.count<launched_batch.count; kernel_batch.count++) {
+                        fprintf(stderr, "[WARNING] Run CPU kernel for read %d\n", kernel_batch.count);
+                        mm_map_chain(s->p->mi, s->p->opt, &launched_batch.reads[kernel_batch.count], 
+                                    b, launched_batch.km);
+                    }
+                    assert(kernel_batch.count == launched_batch.count);
+                    
+                    // 三路轮转：launched→pending, acc→launched, pending→acc
+                    kernel_batch = launched_batch;
+                    launched_batch = acc_batch;
+                    acc_batch = pending_batch;
+                    pending_batch = kernel_batch;
+                    is_pending = 1;
+                } else {
+                    // 第一次调用，没有launched batch返回
+                    assert(!has_launched);
+                    
+                    // 两路轮转：acc→launched, pending→acc
+                    kernel_batch = launched_batch;
+                    launched_batch = acc_batch;
+                    acc_batch = pending_batch;
+                    pending_batch = kernel_batch;
+                    is_pending = 0;
+                }
+                
+                is_full = 0;
+                has_launched = 1;
+                
+            } else if (queue_finished && has_launched) {
+                // 清理最后的launched batch
+                if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                    fprintf(stderr, "FINISH_STREAM: launched_count=%d\n", launched_batch.count);
+                }
+                
+                mm_batch_trbuf_t kernel_batch;
+                finish_stream_gpu(s->p->mi, s->p->opt, &kernel_batch.reads, 
+                                 &kernel_batch.count, 0, launched_batch.km);
+                
+                // CPU fallback
+                for (kernel_batch.count; kernel_batch.count < launched_batch.count; kernel_batch.count++) {
+                    fprintf(stderr, "[WARNING] Run CPU kernel for read %d\n", kernel_batch.count);
+                    mm_map_chain(s->p->mi, s->p->opt, &launched_batch.reads[kernel_batch.count], 
+                                b, launched_batch.km);
+                }
+                assert(kernel_batch.count == launched_batch.count);
+                
+                // 三路轮转：launched→pending, acc→launched, pending→acc
+                kernel_batch = launched_batch;
+                is_full = 0;
+                is_pending = 1;
+                has_launched = 0;
+                launched_batch = acc_batch;
+                acc_batch = pending_batch;
+                pending_batch = kernel_batch;
             }
             
-            // TODO: Call your GPU chaining+alignment function here
-            // gpu_chain_align_batch(s->p->mi, s->p->opt, batch, batch_count);
-            
-            batch_count = 0;
+            // Step 3: 处理pending_batch（GPU Align）
+            if (is_pending) {
+                if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                    fprintf(stderr, "ALIGN_BATCH: count=%d\n", pending_batch.count);
+                }
+                
+                // Copy rep_len & frag_gap
+                for (int iread = 0; iread < pending_batch.count; iread++) {
+                    int i = pending_batch.reads[iread].seq.i;
+                    int j = pending_batch.reads[iread].seq.seg_id;
+                    int off = s->seg_off[i] + j;
+                    for (int k = 0; k < pending_batch.reads[iread].n_seg; k++) {
+                        s->rep_len[off + k] = pending_batch.reads[iread].rep_len;
+                        s->frag_gap[off + k] = pending_batch.reads[iread].frag_gap;
+                    }
+                }
+                
+                // GPU Align
+                prepare_align_batch_gpu(&pending_batch, b, s);
+                
+                // Reset pending batch
+                mm_trbuf_batch_reset(&pending_batch, s->batch_max_reads, s->p->opt);
+                is_pending = 0;
+                pending_batch.batchid = acc_batch.batchid + 1;
+            }
+        }
+        
+        // Step 4: 退出条件
+        if (queue_finished && !has_launched && !is_pending && acc_batch.count == 0) {
+            if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                fprintf(stderr, "CONSUMER_FINISHED\n");
+            }
+            break;
         }
     }
     
-    // Process remaining reads in partial batch
-    if (batch_count > 0) {
-        if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
-            fprintf(stderr, "DISPATCH_FINAL_BATCH\t%d_reads\tto_GPU\n", batch_count);
-        }
-        // TODO: Call your GPU chaining+alignment function here
-        // gpu_chain_align_batch(s->p->mi, s->p->opt, batch, batch_count);
-    }
-    
+    // Cleanup
+	mm_trbuf_batch_reset(&acc_batch, s->batch_max_reads, s->p->opt);
+	mm_trbuf_batch_reset(&launched_batch, s->batch_max_reads, s->p->opt);
+	mm_trbuf_batch_reset(&pending_batch, s->batch_max_reads, s->p->opt);
+
+	free(acc_batch.reads);
+	free(launched_batch.reads);
+	free(pending_batch.reads);
+
+	km_destroy(acc_batch.km);
+	km_destroy(launched_batch.km);
+	km_destroy(pending_batch.km);
+
     return NULL;
 }
-
 static void* kt_worker_manager(void *shared, void *in) {
 	pipeline_t *p = (pipeline_t*)shared;
 
 	step_t *s = (step_t *)in;
     
-    /* Initialize global seeded queue if not exists
+    // Initialize global seeded queue if not exists
     if (g_seeded_queue == NULL) {
-        int queue_capacity = p->opt->gpu_chain_max_reads; // allocate only one chunk
+        int queue_capacity = 11000;
         g_seeded_queue = init_seeded_queue(queue_capacity, p->n_threads);
-    }*/
+    }
     
     // Set batch parameters
     if (p->opt->flag & MM_F_GPU_CHAIN) {
-        s->batch_max_anchors = p->opt->gpu_chain_max_anchors;  // 2000000000
-        s->batch_max_reads = p->opt->gpu_chain_max_reads; // 2000000
+        s->batch_max_anchors = p->opt->gpu_chain_max_anchors;  // 200M
+        s->batch_max_reads = p->opt->gpu_chain_max_reads; // 200K
         s->gpu_min_n = p->opt->gpu_chain_min_n; // 512
     } else {
         s->batch_max_anchors = SIZE_MAX;
@@ -1987,18 +2180,17 @@ static void* kt_worker_manager(void *shared, void *in) {
     }
     
     //Reset finished workers counter
-    /*pthread_mutex_lock(&g_seeded_queue->mutex);
+    pthread_mutex_lock(&g_seeded_queue->mutex);
     g_seeded_queue->finished_workers = 0;
-    pthread_mutex_unlock(&g_seeded_queue->mutex);*/
+    pthread_mutex_unlock(&g_seeded_queue->mutex);
 	
-
-	for (int i = 0; i < p->n_threads; ++i)
-		s->trbuf[i] = mm_trbuf_init(s->batch_max_reads, p->opt);
+	for(int i = 0; i < p->n_threads; i ++) 
+		s->buf[i] = mm_tbuf_init();
 
 	if (p->n_parts > 0) merge_hits((step_t*)in);
-	else kt_for(p->n_threads, old_worker_for, in, s->n_frag);
-	/*else kt_for_async(p->n_threads, worker_for, in, s->n_frag, 
-                    gpu_batch_consumer, s);*/
+	else kt_for_async(p->n_threads, worker_for, in, s->n_frag, 
+                    gpu_batch_consumer, s);
+	//else kt_for(p->n_threads, old_worker_for, in, s->n_frag);
 
 	return in;
 }

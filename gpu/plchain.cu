@@ -17,7 +17,7 @@
 #include "planalyze.cuh"
 #include "debug.h"
 #endif // DEBUG_CHECK
-#define CUDA_DEVICE 0
+#define CUDA_DEVICE 3
 // utils functions
 struct
 {
@@ -432,16 +432,34 @@ void plchain_cal_score_async(chain_read_t **reads_, int *n_read_, Misc misc, str
     unsigned int num_long_seg;
     cudaMemcpy(&num_long_seg, stream_setup.streams[stream_id].dev_mem.d_long_seg_count, sizeof(unsigned int),
                 cudaMemcpyDeviceToHost);
+    fprintf(stderr, "[DEBUG] num_long_seg = %u\n", num_long_seg);
+
     seg_t* long_segs_og = (seg_t*)malloc(sizeof(seg_t) * num_long_seg);
     cudaMemcpy(long_segs_og, stream_setup.streams[stream_id].dev_mem.d_long_seg_og, sizeof(seg_t) * num_long_seg,
                 cudaMemcpyDeviceToHost);
-
+fprintf(stderr, "[DEBUG] First 5 long_segs:\n");
+for (int i = 0; i < (num_long_seg < 5 ? num_long_seg : 5); i++) {
+    fprintf(stderr, "  [%d] start=%u, end=%u, len=%u\n", 
+            i, long_segs_og[i].start_idx, long_segs_og[i].end_idx,
+            long_segs_og[i].end_idx - long_segs_og[i].start_idx);
+}
     // step7: sort long segs in descent order
     unsigned *map = new unsigned[num_long_seg];
     for (unsigned i = 0; i < num_long_seg; i++) {
         map[i] = i;
     }
+    fprintf(stderr, "[DEBUG] Before sort: map[0]=%u, map[1]=%u\n", map[0], map[1]);
+
     pairsort(long_segs_og, map, num_long_seg);
+    // ✓ 添加打印4：排序后map的值
+fprintf(stderr, "[DEBUG] After sort: map[0]=%u, map[1]=%u, num_long_seg=%u\n", 
+        map[0], map[1], num_long_seg);
+
+// ✓ 添加打印5：检查map[0]是否越界
+if (map[0] >= num_long_seg) {
+    fprintf(stderr, "[ERROR] map[0]=%u >= num_long_seg=%u, OVERFLOW!\n", 
+            map[0], num_long_seg);
+}
     #ifdef DEBUG_VERBOSE
     auto last_length = long_segs_og[map[0]].end_idx - long_segs_og[map[0]].start_idx;
     for (int i = 1; i < num_long_seg; i++){

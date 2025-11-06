@@ -1367,7 +1367,7 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     kfree(km, junc);
 
     // Set region boundaries (this will be updated after GPU processing)
-    r->rs = rs1, r->re = re1;
-    if (!rev || (opt->flag & MM_F_QSTRAND)) r->qs = qs1, r->qe = qe1;
-    else r->qs = qlen - qe1, r->qe = qlen - qs1;
+    //r->rs = rs1, r->re = re1;
+    //if (!rev || (opt->flag & MM_F_QSTRAND)) r->qs = qs1, r->qe = qe1;
+    //else r->qs = qlen - qe1, r->qe = qlen - qs1;
 }

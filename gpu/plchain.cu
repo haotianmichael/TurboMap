@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include "plbacktrack.cuh"
 #include <time.h>
 
 
@@ -17,7 +18,7 @@
 #include "planalyze.cuh"
 #include "debug.h"
 #endif // DEBUG_CHECK
-#define CUDA_DEVICE 3
+#define CUDA_DEVICE 0
 // utils functions
 struct
 {
@@ -107,6 +108,75 @@ void plchain_backtracking(hostMemPtr *host_mem, chain_read_t *reads, Misc misc, 
     uint16_t* p_hostmem = host_mem->p;
     int32_t* f = host_mem->f;
     for (int i = 0; i < n_read; i++) {
+        int64_t n = reads[i].n;
+        if (n == 0) continue;
+
+        // Allocate device memory for this read
+        int32_t *d_f = nullptr, *d_v = nullptr, *d_t = nullptr;
+        int64_t *d_p_rel = nullptr;
+        uint64_t *d_u = nullptr;
+        int32_t *d_n_u = nullptr, *d_n_v = nullptr;
+
+        cudaMalloc(&d_f, n * sizeof(int32_t));
+        cudaMalloc(&d_p_rel, n * sizeof(uint16_t));
+        cudaMalloc(&d_v, n * sizeof(int32_t));
+        cudaMalloc(&d_t, n * sizeof(int32_t));
+        cudaMalloc(&d_u, n * sizeof(uint64_t));
+        cudaMalloc(&d_n_u, sizeof(int32_t));
+        cudaMalloc(&d_n_v, sizeof(int32_t));
+
+        // Copy f and p to device
+        cudaMemcpy(d_f, f, n * sizeof(int32_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_p_rel, p_hostmem, n * sizeof(uint16_t), cudaMemcpyHostToDevice);
+
+        // Launch GPU backtracking kernel
+        plbacktrack_gpu_async(n, d_f, d_p_rel, d_v, d_t,
+                            misc.min_cnt, misc.min_score, max_drop,
+                            d_n_u, d_n_v, d_u, nullptr);
+
+        cudaDeviceSynchronize();
+
+        // Copy results back
+        int32_t n_u, n_v;
+        cudaMemcpy(&n_u, d_n_u, sizeof(int32_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&n_v, d_n_v, sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+        reads[i].n_u = n_u;
+
+        if (n_u == 0) {
+            kfree(km, reads[i].a);
+            reads[i].a = 0;
+            reads[i].u = 0;
+        } else {
+            // Allocate host memory and copy results
+            uint64_t *u;
+            int32_t *v;
+            KMALLOC(km, u, n_u);
+            KMALLOC(km, v, n_v);
+
+            cudaMemcpy(u, d_u, n_u * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+            cudaMemcpy(v, d_v, n_v * sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+            reads[i].u = u;
+
+            // Compact anchors
+            mm128_t* new_a = compact_a(km, n_u, u, n_v, v, reads[i].a);
+            reads[i].a = new_a;
+        }
+
+        // Free device memory
+        cudaFree(d_f);
+        cudaFree(d_p_rel);
+        cudaFree(d_v);
+        cudaFree(d_t);
+        cudaFree(d_u);
+        cudaFree(d_n_u);
+        cudaFree(d_n_v);
+
+        f += reads[i].n;
+        p_hostmem += reads[i].n;
+    }
+    /*for (int i = 0; i < n_read; i++) {
         int64_t* p;
         KMALLOC(km, p, reads[i].n);
         p_rel2idx(p_hostmem, p, reads[i].n);
@@ -119,7 +189,7 @@ void plchain_backtracking(hostMemPtr *host_mem, chain_read_t *reads, Misc misc, 
         debug_check_score(p, f, reads[i].p, reads[i].f, reads[i].n);
 #endif
 
-        /* Backtracking */
+        /* Backtracking 
         uint64_t* u;
         int32_t *v, *t;
         KMALLOC(km, v, reads[i].n);
@@ -146,7 +216,8 @@ void plchain_backtracking(hostMemPtr *host_mem, chain_read_t *reads, Misc misc, 
 
         f += reads[i].n;
         p_hostmem += reads[i].n;
-    }
+    }*/
+
 }
 
 

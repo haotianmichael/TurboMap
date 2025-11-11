@@ -9,7 +9,7 @@
 #include "plrange.cuh"
 #include "plscore.cuh"
 #include <time.h>
-#define CUDA_DEVICE 3
+#define CUDA_DEVICE 0
 void plmem_malloc_host_mem(hostMemPtr *host_mem, size_t anchor_per_batch,
                            int range_grid_size, size_t buffer_size_long) {
 #ifdef DEBUG_PRINT

@@ -116,10 +116,112 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_total_n_long, sizeof(size_t));
     cudaMalloc(&dev_mem->d_f_long, sizeof(int32_t) * dev_mem->buffer_size_long);
     cudaMalloc(&dev_mem->d_p_long, sizeof(uint16_t) * dev_mem->buffer_size_long); 
+
+    // ========== Backtrack Buffers ==========
+    // Use anchor_per_batch as max size for backtracking
+    dev_mem->max_backtrack_n = anchor_per_batch;
+    cudaMalloc(&dev_mem->d_bt_f, dev_mem->max_backtrack_n * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_bt_p_rel, dev_mem->max_backtrack_n * sizeof(uint16_t));
+    cudaMalloc(&dev_mem->d_bt_v, dev_mem->max_backtrack_n * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_bt_t, dev_mem->max_backtrack_n * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_bt_u, dev_mem->max_backtrack_n * sizeof(uint64_t));
+    cudaMalloc(&dev_mem->d_bt_n_u, sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_bt_n_v, sizeof(int32_t));
+#ifdef DEBUG_PRINT
+    fprintf(stderr, "[Info] Allocated backtrack buffers: max_n=%zu (%.2f MB)\n",
+            dev_mem->max_backtrack_n,
+            (dev_mem->max_backtrack_n * (sizeof(int32_t)*3 + sizeof(int64_t)*2 + sizeof(uint64_t)) + 2*sizeof(int32_t)) / (1024.0*1024.0));
+#endif
+
+    // ========== Alignment Buffers ==========
+    // Configuration for alignment
+    dev_mem->max_align_tasks = 20000;         // max tasks (can be configured)
+    dev_mem->max_align_seq_bytes = 100*1024*1024;  // 100MB for sequences
+    dev_mem->max_align_query_len = 100000;    // max query length
+
+    // Sequence data
+    cudaMalloc(&dev_mem->d_align_unpacked_query, dev_mem->max_align_seq_bytes);
+    cudaMalloc(&dev_mem->d_align_unpacked_target, dev_mem->max_align_seq_bytes);
+    cudaMalloc(&dev_mem->d_align_packed_query, (dev_mem->max_align_seq_bytes / 8) * sizeof(uint32_t));
+    cudaMalloc(&dev_mem->d_align_packed_target, (dev_mem->max_align_seq_bytes / 8) * sizeof(uint32_t));
+    cudaMalloc(&dev_mem->d_align_query_offsets, dev_mem->max_align_tasks * sizeof(uint32_t));
+    cudaMalloc(&dev_mem->d_align_target_offsets, dev_mem->max_align_tasks * sizeof(uint32_t));
+    cudaMalloc(&dev_mem->d_align_query_lens, dev_mem->max_align_tasks * sizeof(uint32_t));
+    cudaMalloc(&dev_mem->d_align_target_lens, dev_mem->max_align_tasks * sizeof(uint32_t));
+    cudaMalloc(&dev_mem->d_align_flag, dev_mem->max_align_tasks * sizeof(int32_t));
+
+    // AGATHA global buffer (28 blocks * 32 threads/warp * max_query_len * 4)
+    size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_query_len * 4;
+    cudaMalloc(&dev_mem->d_align_global_buffer, global_buffer_size * sizeof(short2));
+
+    // KSW temp buffer (225 concurrent tasks)
+    size_t max_len = dev_mem->max_align_query_len;
+    size_t H_size = max_len * sizeof(int32_t);
+    size_t u8_arrays_size = (max_len + 1) * 7 * sizeof(int8_t);
+    size_t seq_size = max_len * 2 * sizeof(uint8_t);
+    size_t raw_size = H_size + u8_arrays_size + seq_size;
+    dev_mem->align_ksw_temp_per_task = (raw_size + 7) & ~7ULL;
+    cudaMalloc(&dev_mem->d_align_ksw_temp_buffer, 225 * dev_mem->align_ksw_temp_per_task);
+
+    // Backtrack buffers (allocate for 20 tasks initially to save memory)
+    // ==================== Backtrack Buffers ====================
+    // Purpose: Store information for CIGAR generation (alignment path reconstruction)
+    // 
+    // For each alignment with qlen and tlen:
+    // - Total antidiagonals: qlen + tlen - 1
+    // - Cells per antidiagonal: n_col = min(bandwidth+1, min(qlen, tlen))
+    //
+    // backtrack_p[]: Direction bits for each DP cell
+    //   - Size per task: (qlen + tlen - 1) × n_col bytes
+    //   - Each byte stores 4 bits for direction (which cell we came from)
+    //                     + 4 bits for state flags
+    //
+    // backtrack_off[], backtrack_off_end[]: Valid range for each antidiagonal
+    //   - Size per task: (qlen + tlen - 1) × 2 integers
+    //   - Tells us which cells in each antidiagonal are within the band
+    //
+    // backtrack_n_col[]: The n_col value for each task
+    //   - Size per task: 1 integer
+    size_t alloc_tasks = 20;
+    size_t max_antidiag = 2 * dev_mem->max_align_query_len - 1;
+    size_t max_n_col = 751 + 1;  // bandwidth + 1
+    dev_mem->max_align_backtrack_size = max_antidiag * max_n_col;
+    dev_mem->max_align_cigar_len = 2 * dev_mem->max_align_query_len;
+
+    cudaMalloc(&dev_mem->d_align_backtrack_p, alloc_tasks * dev_mem->max_align_backtrack_size);
+    cudaMalloc(&dev_mem->d_align_backtrack_off, alloc_tasks * max_antidiag * sizeof(int));
+    cudaMalloc(&dev_mem->d_align_backtrack_off_end, alloc_tasks * max_antidiag * sizeof(int));
+    cudaMalloc(&dev_mem->d_align_backtrack_n_col, alloc_tasks * sizeof(int));
+    cudaMalloc(&dev_mem->d_align_cigar_buffer, alloc_tasks * dev_mem->max_align_cigar_len * sizeof(uint32_t));
+    cudaMalloc(&dev_mem->d_align_cigar_lengths, alloc_tasks * sizeof(int));
+
+    // Result structures
+    cudaMalloc(&dev_mem->d_align_device_res, sizeof(void*) * 6);  // gasal_res_t pointers
+    cudaMalloc(&dev_mem->d_align_ez_array, sizeof(void*) * 224);  // ksw_extz_t array (224 tasks)
+    cudaMalloc(&dev_mem->d_align_scores, dev_mem->max_align_tasks * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_align_query_ends, dev_mem->max_align_tasks * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_align_target_ends, dev_mem->max_align_tasks * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
+
+#ifdef DEBUG_PRINT
+    size_t align_mem = dev_mem->max_align_seq_bytes * 2 +  // unpacked
+                       (dev_mem->max_align_seq_bytes / 8) * 2 * sizeof(uint32_t) +  // packed
+                       dev_mem->max_align_tasks * sizeof(uint32_t) * 5 +  // metadata
+                       global_buffer_size * sizeof(short2) +
+                       225 * dev_mem->align_ksw_temp_per_task +
+                       alloc_tasks * (dev_mem->max_align_backtrack_size +
+                                     max_antidiag * 2 * sizeof(int) +
+                                     sizeof(int) +
+                                     dev_mem->max_align_cigar_len * sizeof(uint32_t)) +
+                       dev_mem->max_align_tasks * sizeof(int32_t) * 4;
+    fprintf(stderr, "[Info] Allocated alignment buffers: %.2f MB\n", align_mem / (1024.0*1024.0));
+#endif
     cudaCheck();
 }
 
 void plmem_free_device_mem(deviceMemPtr *dev_mem) { 
+    // chain buffer
     cudaFree(dev_mem->d_ax);
     cudaFree(dev_mem->d_ay);
     cudaFree(dev_mem->d_sid);
@@ -134,6 +236,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
 
     cudaFree(dev_mem->d_cut);
     cudaFree(dev_mem->d_long_seg);
+    cudaFree(dev_mem->d_long_seg_og);
     cudaFree(dev_mem->d_long_seg_count);
     cudaFree(dev_mem->d_mid_seg);
     cudaFree(dev_mem->d_mid_seg_count);
@@ -143,6 +246,42 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFree(dev_mem->d_sid_long);
     cudaFree(dev_mem->d_range_long);
     cudaFree(dev_mem->d_total_n_long);
+
+    // Backtrack buffers
+    if (dev_mem->d_bt_f) cudaFree(dev_mem->d_bt_f);
+    if (dev_mem->d_bt_p_rel) cudaFree(dev_mem->d_bt_p_rel);
+    if (dev_mem->d_bt_v) cudaFree(dev_mem->d_bt_v);
+    if (dev_mem->d_bt_t) cudaFree(dev_mem->d_bt_t);
+    if (dev_mem->d_bt_u) cudaFree(dev_mem->d_bt_u);
+    if (dev_mem->d_bt_n_u) cudaFree(dev_mem->d_bt_n_u);
+    if (dev_mem->d_bt_n_v) cudaFree(dev_mem->d_bt_n_v);
+
+    // Alignment buffers
+    if (dev_mem->d_align_unpacked_query) cudaFree(dev_mem->d_align_unpacked_query);
+    if (dev_mem->d_align_unpacked_target) cudaFree(dev_mem->d_align_unpacked_target);
+    if (dev_mem->d_align_packed_query) cudaFree(dev_mem->d_align_packed_query);
+    if (dev_mem->d_align_packed_target) cudaFree(dev_mem->d_align_packed_target);
+    if (dev_mem->d_align_query_offsets) cudaFree(dev_mem->d_align_query_offsets);
+    if (dev_mem->d_align_target_offsets) cudaFree(dev_mem->d_align_target_offsets);
+    if (dev_mem->d_align_query_lens) cudaFree(dev_mem->d_align_query_lens);
+    if (dev_mem->d_align_target_lens) cudaFree(dev_mem->d_align_target_lens);
+    if (dev_mem->d_align_flag) cudaFree(dev_mem->d_align_flag);
+    if (dev_mem->d_align_global_buffer) cudaFree(dev_mem->d_align_global_buffer);
+    if (dev_mem->d_align_ksw_temp_buffer) cudaFree(dev_mem->d_align_ksw_temp_buffer);
+    if (dev_mem->d_align_backtrack_p) cudaFree(dev_mem->d_align_backtrack_p);
+    if (dev_mem->d_align_backtrack_off) cudaFree(dev_mem->d_align_backtrack_off);
+    if (dev_mem->d_align_backtrack_off_end) cudaFree(dev_mem->d_align_backtrack_off_end);
+    if (dev_mem->d_align_backtrack_n_col) cudaFree(dev_mem->d_align_backtrack_n_col);
+    if (dev_mem->d_align_cigar_buffer) cudaFree(dev_mem->d_align_cigar_buffer);
+    if (dev_mem->d_align_cigar_lengths) cudaFree(dev_mem->d_align_cigar_lengths);
+    if (dev_mem->d_align_device_res) cudaFree(dev_mem->d_align_device_res);
+    if (dev_mem->d_align_ez_array) cudaFree(dev_mem->d_align_ez_array);
+    if (dev_mem->d_align_scores) cudaFree(dev_mem->d_align_scores);
+    if (dev_mem->d_align_query_ends) cudaFree(dev_mem->d_align_query_ends);
+    if (dev_mem->d_align_target_ends) cudaFree(dev_mem->d_align_target_ends);
+    if (dev_mem->d_align_task_to_align_id) cudaFree(dev_mem->d_align_task_to_align_id);
+    if (dev_mem->d_align_mat) cudaFree(dev_mem->d_align_mat);
+
     cudaCheck();
 }
 

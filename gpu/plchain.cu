@@ -97,7 +97,7 @@ static int64_t mg_chain_bk_end(int32_t max_drop, const mm128_t *z,
     return max_i;
 }
 
-void plchain_backtracking(hostMemPtr *host_mem, chain_read_t *reads, Misc misc, void* km){
+void plchain_backtracking(hostMemPtr *host_mem, deviceMemPtr *dev_mem, chain_read_t *reads, Misc misc, void* km){
     int max_drop = misc.bw;
     if (misc.max_dist_x < misc.bw) misc.max_dist_x = misc.bw;
     if (misc.max_dist_y < misc.bw && !misc.is_cdna) misc.max_dist_y = misc.bw;
@@ -109,21 +109,25 @@ void plchain_backtracking(hostMemPtr *host_mem, chain_read_t *reads, Misc misc, 
     int32_t* f = host_mem->f;
     for (int i = 0; i < n_read; i++) {
         int64_t n = reads[i].n;
-        if (n == 0) continue;
+        if (n == 0) {
+            f += reads[i].n;
+            continue;
+        }
 
-        // Allocate device memory for this read
-        int32_t *d_f = nullptr, *d_v = nullptr, *d_t = nullptr;
-        int64_t *d_p_rel = nullptr;
-        uint64_t *d_u = nullptr;
-        int32_t *d_n_u = nullptr, *d_n_v = nullptr;
-
-        cudaMalloc(&d_f, n * sizeof(int32_t));
-        cudaMalloc(&d_p_rel, n * sizeof(uint16_t));
-        cudaMalloc(&d_v, n * sizeof(int32_t));
-        cudaMalloc(&d_t, n * sizeof(int32_t));
-        cudaMalloc(&d_u, n * sizeof(uint64_t));
-        cudaMalloc(&d_n_u, sizeof(int32_t));
-        cudaMalloc(&d_n_v, sizeof(int32_t));
+        // Check if the read fits in pre-allocated buffer
+        if (n > dev_mem->max_backtrack_n) {
+            fprintf(stderr, "[WARNING] Read %d has %lld anchors, exceeds max_backtrack_n %zu. Skipping GPU backtrack.\n",
+                    i, n, dev_mem->max_backtrack_n);
+            continue;
+        }
+        // Use pre-allocated device memory from dev_mem
+        int32_t *d_f = dev_mem->d_bt_f;
+        uint16_t *d_p_rel = dev_mem->d_bt_p_rel;
+        int32_t *d_v = dev_mem->d_bt_v;
+        int32_t *d_t = dev_mem->d_bt_t;
+        uint64_t *d_u = dev_mem->d_bt_u;
+        int32_t *d_n_u = dev_mem->d_bt_n_u;
+        int32_t *d_n_v = dev_mem->d_bt_n_v;
 
         // Copy f and p to device
         cudaMemcpy(d_f, f, n * sizeof(int32_t), cudaMemcpyHostToDevice);
@@ -131,8 +135,8 @@ void plchain_backtracking(hostMemPtr *host_mem, chain_read_t *reads, Misc misc, 
 
         // Launch GPU backtracking kernel
         plbacktrack_gpu_async(n, d_f, d_p_rel, d_v, d_t,
-                            misc.min_cnt, misc.min_score, max_drop,
-                            d_n_u, d_n_v, d_u, nullptr);
+                    misc.min_cnt, misc.min_score, max_drop,
+                    d_n_u, d_n_v, d_u, nullptr);
 
         cudaDeviceSynchronize();
 
@@ -164,14 +168,6 @@ void plchain_backtracking(hostMemPtr *host_mem, chain_read_t *reads, Misc misc, 
             reads[i].a = new_a;
         }
 
-        // Free device memory
-        cudaFree(d_f);
-        cudaFree(d_p_rel);
-        cudaFree(d_v);
-        cudaFree(d_t);
-        cudaFree(d_u);
-        cudaFree(d_n_u);
-        cudaFree(d_n_v);
 
         f += reads[i].n;
         p_hostmem += reads[i].n;
@@ -312,6 +308,7 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id, Misc misc
 
         // backtrack after p/f is copied
         plchain_backtracking(&stream_setup.streams[stream_id].host_mems[uid],
+                            &stream_setup.streams[stream_id].dev_mem,
                             stream_setup.streams[stream_id].reads + n_reads, misc, km);
         // accumulate n_reads
         n_reads += stream_setup.streams[stream_id].host_mems[uid].size;
@@ -503,34 +500,18 @@ void plchain_cal_score_async(chain_read_t **reads_, int *n_read_, Misc misc, str
     unsigned int num_long_seg;
     cudaMemcpy(&num_long_seg, stream_setup.streams[stream_id].dev_mem.d_long_seg_count, sizeof(unsigned int),
                 cudaMemcpyDeviceToHost);
-    fprintf(stderr, "[DEBUG] num_long_seg = %u\n", num_long_seg);
 
     seg_t* long_segs_og = (seg_t*)malloc(sizeof(seg_t) * num_long_seg);
     cudaMemcpy(long_segs_og, stream_setup.streams[stream_id].dev_mem.d_long_seg_og, sizeof(seg_t) * num_long_seg,
                 cudaMemcpyDeviceToHost);
-fprintf(stderr, "[DEBUG] First 5 long_segs:\n");
-for (int i = 0; i < (num_long_seg < 5 ? num_long_seg : 5); i++) {
-    fprintf(stderr, "  [%d] start=%u, end=%u, len=%u\n", 
-            i, long_segs_og[i].start_idx, long_segs_og[i].end_idx,
-            long_segs_og[i].end_idx - long_segs_og[i].start_idx);
-}
     // step7: sort long segs in descent order
     unsigned *map = new unsigned[num_long_seg];
     for (unsigned i = 0; i < num_long_seg; i++) {
         map[i] = i;
     }
-    fprintf(stderr, "[DEBUG] Before sort: map[0]=%u, map[1]=%u\n", map[0], map[1]);
 
     pairsort(long_segs_og, map, num_long_seg);
-    // ✓ 添加打印4：排序后map的值
-fprintf(stderr, "[DEBUG] After sort: map[0]=%u, map[1]=%u, num_long_seg=%u\n", 
-        map[0], map[1], num_long_seg);
 
-// ✓ 添加打印5：检查map[0]是否越界
-if (map[0] >= num_long_seg) {
-    fprintf(stderr, "[ERROR] map[0]=%u >= num_long_seg=%u, OVERFLOW!\n", 
-            map[0], num_long_seg);
-}
     #ifdef DEBUG_VERBOSE
     auto last_length = long_segs_og[map[0]].end_idx - long_segs_og[map[0]].start_idx;
     for (int i = 1; i < num_long_seg; i++){

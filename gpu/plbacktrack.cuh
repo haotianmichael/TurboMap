@@ -28,7 +28,7 @@ extern "C" {
 void plbacktrack_gpu_async(
     int64_t n,
     const int32_t *d_f,
-    const int64_t *d_p_rel,
+    const uint16_t *d_p_rel,
     int32_t *d_v,
     int32_t *d_t,
     int32_t min_cnt,
@@ -46,7 +46,7 @@ void plbacktrack_gpu_async(
 void plbacktrack_alloc_device_mem(
     int64_t max_n,
     int32_t **d_f,
-    int64_t **d_p_rel,
+    uint16_t **d_p_rel,
     int32_t **d_v,
     int32_t **d_t,
     int32_t **d_n_u,
@@ -61,7 +61,7 @@ void plbacktrack_alloc_device_mem(
  */
 void plbacktrack_free_device_mem(
     int32_t *d_f,
-    int64_t *d_p_rel,
+    uint16_t *d_p_rel,
     int32_t *d_v,
     int32_t *d_t,
     int32_t *d_n_u,

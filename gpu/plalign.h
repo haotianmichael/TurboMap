@@ -107,4 +107,8 @@ typedef struct{
 void gasal_copy_subst_scores(gasal_subst_scores *subst);
 void gpu_align_cleanup();
 
+// Set the device memory pointer for alignment operations
+// This should be called before gpu_align_batch_execute
+void gpu_align_set_device_mem(void *dev_mem_ptr);
+
 #endif

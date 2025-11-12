@@ -94,6 +94,56 @@ typedef struct {
     size_t buffer_size_long;
     int32_t *d_f_long;  // score, size: buffer_size_long * sizeof(int32_t)
     uint16_t *d_p_long;  // predecessor, size: buffer_size_long * sizeof(uint16_t)
+
+    // ========== Backtrack Buffers (unified allocation) ==========
+    size_t max_backtrack_n;  // max number of anchors for backtracking per batch
+    int32_t *d_bt_f;         // backtrack scores
+    uint16_t *d_bt_p_rel;     // backtrack relative predecessors
+    int32_t *d_bt_v;         // backtrack vertices
+    int32_t *d_bt_t;         // backtrack temp markers
+    uint64_t *d_bt_u;        // backtrack chain metadata
+    int32_t *d_bt_n_u;       // backtrack number of chains
+    int32_t *d_bt_n_v;       // backtrack number of vertices
+
+    // ========== Alignment Buffers (unified allocation) ==========
+    size_t max_align_tasks;       // max number of alignment tasks
+    size_t max_align_seq_bytes;   // max sequence bytes
+    size_t max_align_query_len;   // max query length
+
+    // Sequence data
+    uint8_t *d_align_unpacked_query;
+    uint8_t *d_align_unpacked_target;
+    uint32_t *d_align_packed_query;
+    uint32_t *d_align_packed_target;
+    uint32_t *d_align_query_offsets;
+    uint32_t *d_align_target_offsets;
+    uint32_t *d_align_query_lens;
+    uint32_t *d_align_target_lens;
+    int32_t *d_align_flag;
+
+    // Working buffers
+    void *d_align_global_buffer;     // AGATHA working buffer
+    void *d_align_ksw_temp_buffer;   // KSW temp buffer
+    size_t align_ksw_temp_per_task;  // KSW temp size per task
+
+    // Backtrack buffers
+    uint8_t *d_align_backtrack_p;
+    int *d_align_backtrack_off;
+    int *d_align_backtrack_off_end;
+    int *d_align_backtrack_n_col;
+    uint32_t *d_align_cigar_buffer;
+    int *d_align_cigar_lengths;
+    size_t max_align_backtrack_size; // per task
+    size_t max_align_cigar_len;      // per task
+
+    // Result buffers
+    void *d_align_device_res;        // gasal_res_t structure
+    void *d_align_ez_array;          // ksw_extz_t array
+    int32_t *d_align_scores;
+    int32_t *d_align_query_ends;
+    int32_t *d_align_target_ends;
+    int32_t *d_align_task_to_align_id;
+    int8_t *d_align_mat;             // scoring matrix
 } deviceMemPtr;
 
 typedef struct stream_ptr_t{

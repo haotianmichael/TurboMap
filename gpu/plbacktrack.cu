@@ -45,7 +45,7 @@ __device__ int64_t gpu_chain_bk_end(
     int32_t z_score,
     int64_t z_idx,
     const int32_t *f,
-    const int64_t *p_rel,
+    const uint16_t *p_rel,
     int32_t *t
 ) {
     int64_t i = z_idx;
@@ -58,8 +58,7 @@ __device__ int64_t gpu_chain_bk_end(
     // Backtrack along predecessor chain
     do {
         t[i] = 2;  // Mark as temporarily visited
-        end_i = i;
-        i = p_rel2abs(p_rel[i], i);
+        end_i = i = p_rel2abs(p_rel[i], i);
 
         int32_t s = (i < 0) ? z_score : (z_score - f[i]);
         if (s > max_s) {
@@ -109,7 +108,7 @@ __device__ bool gpu_backtrack_chain_subwarp(
     const anchor_score_t *z,
     int64_t n,
     const int32_t *f,
-    const int64_t *p,
+    const uint16_t *p,
     int32_t *v,
     int32_t *t,
     int32_t min_cnt,
@@ -194,7 +193,7 @@ __device__ bool gpu_backtrack_chain_subwarp(
 __global__ void chain_backtrack_kernel_pass(
     int64_t n,
     const int32_t *f,
-    const int64_t *p_rel,
+    const uint16_t *p_rel,
     int32_t *v,
     int32_t *t,
     int32_t min_cnt,
@@ -372,7 +371,7 @@ __global__ void chain_backtrack_kernel_pass(
 void plbacktrack_gpu_async(
     int64_t n,
     const int32_t *d_f,
-    const int64_t *d_p_rel,
+    const uint16_t *d_p_rel,
     int32_t *d_v,
     int32_t *d_t,
     int32_t min_cnt,
@@ -416,7 +415,7 @@ void plbacktrack_gpu_async(
 void plbacktrack_alloc_device_mem(
     int64_t max_n,
     int32_t **d_f,
-    int64_t **d_p_rel,
+    uint16_t **d_p_rel,
     int32_t **d_v,
     int32_t **d_t,
     int32_t **d_n_u,
@@ -442,7 +441,7 @@ void plbacktrack_alloc_device_mem(
  */
 void plbacktrack_free_device_mem(
     int32_t *d_f,
-    int64_t *d_p_rel,
+    uint16_t *d_p_rel,
     int32_t *d_v,
     int32_t *d_t,
     int32_t *d_n_u,

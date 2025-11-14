@@ -167,6 +167,7 @@ typedef struct gputSetup_t {
 } streamSetup_t;
 
 extern streamSetup_t stream_setup;
+extern deviceMemPtr *g_current_dev_mem;
 
 /* memory management methods */
 // initialization and cleanup

@@ -10,6 +10,26 @@
 #include "plscore.cuh"
 #include <time.h>
 #define CUDA_DEVICE 0
+typedef struct {
+	int32_t *aln_score;
+	int32_t *query_batch_end;
+	int32_t *target_batch_end;
+	int32_t *query_batch_start;
+	int32_t *target_batch_start;
+	uint8_t *cigar;
+	uint32_t *n_cigar_ops;
+}gasal_res_t;
+typedef struct {
+    int32_t max;
+    uint32_t zdropped:1;
+    int32_t max_q, max_t;
+    int32_t mqe, mqe_t;
+    int32_t mte, mte_q;
+    int32_t score;
+    int32_t m_cigar, n_cigar;
+    int32_t reach_end;
+    uint32_t *cigar;
+} ksw_extz_t;
 void plmem_malloc_host_mem(hostMemPtr *host_mem, size_t anchor_per_batch,
                            int range_grid_size, size_t buffer_size_long) {
 #ifdef DEBUG_PRINT
@@ -163,7 +183,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     dev_mem->align_ksw_temp_per_task = (raw_size + 7) & ~7ULL;
     cudaMalloc(&dev_mem->d_align_ksw_temp_buffer, 225 * dev_mem->align_ksw_temp_per_task);
 
-    // Backtrack buffers (allocate for 20 tasks initially to save memory)
+    // Backtrack buffers (must match KSW temp buffer: 225 concurrent tasks)
     // ==================== Backtrack Buffers ====================
     // Purpose: Store information for CIGAR generation (alignment path reconstruction)
     // 
@@ -182,8 +202,12 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     //
     // backtrack_n_col[]: The n_col value for each task
     //   - Size per task: 1 integer
-    size_t alloc_tasks = 20;
-    size_t max_antidiag = 2 * dev_mem->max_align_query_len - 1;
+    // Note: kernel launches with 28 blocks, each block can process tasks independently
+    // We need enough buffers for concurrent task processing within GPU
+    size_t alloc_tasks = 28;  // Match kernel_blocks for safe concurrent execution
+    // Kernel uses (qlen + tlen) for backtrack_off indexing, not (qlen + tlen - 1)
+    // So max_antidiag should be 2 * max_query_len to cover qlen=max and tlen=max
+    size_t max_antidiag = 2 * dev_mem->max_align_query_len;
     size_t max_n_col = 751 + 1;  // bandwidth + 1
     dev_mem->max_align_backtrack_size = max_antidiag * max_n_col;
     dev_mem->max_align_cigar_len = 2 * dev_mem->max_align_query_len;
@@ -196,8 +220,8 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_align_cigar_lengths, alloc_tasks * sizeof(int));
 
     // Result structures
-    cudaMalloc(&dev_mem->d_align_device_res, sizeof(void*) * 6);  // gasal_res_t pointers
-    cudaMalloc(&dev_mem->d_align_ez_array, sizeof(void*) * 224);  // ksw_extz_t array (224 tasks)
+    cudaMalloc(&dev_mem->d_align_device_res, sizeof(gasal_res_t));  
+    cudaMalloc(&dev_mem->d_align_ez_array, sizeof(ksw_extz_t) * 224);  
     cudaMalloc(&dev_mem->d_align_scores, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_query_ends, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_target_ends, dev_mem->max_align_tasks * sizeof(int32_t));
@@ -764,10 +788,17 @@ cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
     stream_setup.max_range_grid = max_range_grid;
     stream_setup.max_num_cut = max_num_cut;
     stream_setup.long_seg_buffer_size_stream = long_seg_buffer_size;
+    g_current_dev_mem = &stream_setup.streams[0].dev_mem;
     cudaCheck();
 }
 
 void plmem_stream_cleanup() {
+    // Synchronize all streams before cleanup to ensure all GPU operations are complete
+    for (int i = 0; i < stream_setup.num_stream; i++) {
+        cudaStreamSynchronize(stream_setup.streams[i].cudastream);
+    }
+    cudaDeviceSynchronize();
+    cudaCheck();
     for (int i = 0; i < stream_setup.num_stream; i++) {
         cudaStreamDestroy(stream_setup.streams[i].cudastream);
         cudaEventDestroy(stream_setup.streams[i].stopevent);

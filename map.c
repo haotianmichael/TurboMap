@@ -9,8 +9,7 @@
 #include "mmpriv.h"
 #include "bseq.h"
 #include "khash.h"
-#include "gpu/plmanager.cuh"
-#include "gpu/plalign.h"
+#include "gpu/plalign.cuh"
 #include "ksw2.h"
 
 #define __AMD_SPLIT_KERNELS__ 1

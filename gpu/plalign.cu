@@ -1,4 +1,4 @@
-#include "plalign.h"
+#include "plalign.cuh"
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
 #include <algorithm>
@@ -29,7 +29,7 @@ static align_config_t g_config = {
 
 // Global pointer to current stream's device memory
 // Set by gpu_align_set_device_mem() before calling gpu_align_batch_execute()
-static deviceMemPtr *g_current_dev_mem = NULL;
+deviceMemPtr *g_current_dev_mem = NULL;
 static bool g_subst_scores_uploaded = false;
 
 static void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi)
@@ -66,8 +66,7 @@ void gasal_copy_subst_scores(gasal_subst_scores *subst){
 }
 
 // Set the device memory pointer for alignment operations
-void gpu_align_set_device_mem(void *dev_mem_ptr) {
-    g_current_dev_mem = (deviceMemPtr*)dev_mem_ptr;
+void gpu_align_copy_param() {
 
     // Upload substitution scores on first call
     if (!g_subst_scores_uploaded) {
@@ -91,7 +90,7 @@ extern "C" void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                             uint8_t *seq_buffer, uint32_t *cigar_buffer) {
     if (n_tasks <= 0) return;
-
+    gpu_align_copy_param();
     // Check that device memory has been set
     if (!g_current_dev_mem) {
         fprintf(stderr, "[ERROR] Device memory not set. Call gpu_align_set_device_mem() first.\n");
@@ -99,10 +98,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     }
 
     deviceMemPtr *dev_mem = g_current_dev_mem;
-    n_tasks = 20;  // FIXME: temporary limit
 
     // Create local variables for easier code migration
     int kernel_blocks = 28;
+    const int max_concurrent_tasks = 28;  // Must match kernel_blocks and backtrack buffer allocation
+    if (n_tasks > max_concurrent_tasks) {
+        fprintf(stderr, "[WARNING] n_tasks=%d exceeds max_concurrent_tasks=%d, clamping to max\n",
+                n_tasks, max_concurrent_tasks);
+        n_tasks = max_concurrent_tasks;
+    }
     int kernel_threads = 256;
     uint8_t *d_unpacked_query = dev_mem->d_align_unpacked_query;
     uint8_t *d_unpacked_target = dev_mem->d_align_unpacked_target;
@@ -133,11 +137,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *d_target_ends = dev_mem->d_align_target_ends;
 
     // Host buffers for CIGAR and results
-    uint32_t *h_cigar_buffer = (uint32_t*)calloc(20 * max_cigar_len, sizeof(uint32_t));
-    int *h_cigar_lengths = (int*)calloc(20, sizeof(int));
-    int32_t *h_scores = (int32_t*)calloc(20, sizeof(int32_t));
-    int32_t *h_query_ends = (int32_t*)calloc(20, sizeof(int32_t));
-    int32_t *h_target_ends = (int32_t*)calloc(20, sizeof(int32_t));
+    uint32_t *h_cigar_buffer = (uint32_t*)calloc(max_concurrent_tasks * max_cigar_len, sizeof(uint32_t));
+    int *h_cigar_lengths = (int*)calloc(max_concurrent_tasks, sizeof(int));
+    int32_t *h_scores = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_query_ends = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_target_ends = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
     short2 *h_sort_buffer = (short2*)calloc(n_tasks, sizeof(short2));
 
     // Calculate memory requirements
@@ -154,6 +158,18 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     // Calculate offsets and prepare sequences
     for (int i = 0; i < n_tasks; i++) {
+
+         // Validate sequence lengths against buffer limits
+        if (tasks[i].qlen > max_query_len_limit) {
+            fprintf(stderr, "[WARNING] Task %d: qlen=%d exceeds max_query_len=%zu, clamping\n",
+                    i, tasks[i].qlen, max_query_len_limit);
+            tasks[i].qlen = max_query_len_limit;
+        }
+        if (tasks[i].tlen > max_query_len_limit) {
+            fprintf(stderr, "[WARNING] Task %d: tlen=%d exceeds max_query_len=%zu, clamping\n",
+                    i, tasks[i].tlen, max_query_len_limit);
+            tasks[i].tlen = max_query_len_limit;
+        }
         // Align to 8-byte boundary for AGATHA
         size_t qlen_aligned = ((tasks[i].qlen + 7) / 8) * 8;
         size_t tlen_aligned = ((tasks[i].tlen + 7) / 8) * 8;
@@ -283,6 +299,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     h_res_ptrs.target_batch_end = d_target_ends;
     cudaMemcpy(device_res, &h_res_ptrs, sizeof(gasal_res_t), cudaMemcpyHostToDevice);
 
+    fprintf(stderr, "[Info::%s] gpu initialized for ksw with %d tasks\n", __func__, n_tasks);
+
     // ===== KSW Alignment Kernel (Phase 1: Compute scores and save backtrack) =====
     ksw_semi_global_cuda_kernel<<<kernel_blocks, kernel_threads,
                     shared_mem>>>(
@@ -354,6 +372,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     // Wait for completion
     cudaDeviceSynchronize();
+    cudaCheck();
 
     // Map results back to tasks
     for (int i = 0; i < n_tasks; i++) {

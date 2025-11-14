@@ -1,7 +1,15 @@
-#ifndef _PL_MANAGER_CUH_
-#define _PL_MANAGER_CUH_
+#ifndef _PLALIGN_H_
+#define _PLALIGN_H_
+
 #include "plutils.h"
+#include "../ksw2.h"
+#include <cuda_runtime.h>
+#include <stdlib.h>
+#include <stdint.h>
 #include <pthread.h>
+
+/*ChainQueue*/
+
 
 // Global seeded queue structure
 typedef struct {
@@ -142,4 +150,53 @@ void free_queue_read(chain_read_t *read) {
     }
 } 
 
-#endif // __PL_MANAGER_CUH_
+
+
+/*KSW */
+typedef struct {
+	int32_t *aln_score;
+	int32_t *query_batch_end;
+	int32_t *target_batch_end;
+	int32_t *query_batch_start;
+	int32_t *target_batch_start;
+	uint8_t *cigar;
+	uint32_t *n_cigar_ops;
+}gasal_res_t;
+
+// Configuration structure for alignment parameters
+typedef struct {
+    int32_t blocks;
+    int32_t threads;
+    int32_t slice_width;
+    int32_t z_threshold;
+    int32_t band_width;
+    int8_t match_score;
+    int8_t mismatch_score;
+    int8_t gap_open;
+    int8_t gap_extend;
+    int8_t gap_open_long;
+    int8_t gap_extend_long;
+} align_config_t;
+
+//match/mismatch and gap penalties
+typedef struct{
+	int8_t match;
+	int8_t mismatch;
+	int8_t gap_open;
+	int8_t gap_extend;
+	int8_t gap_open_long;
+	int8_t gap_extend_long;
+	int32_t slice_width;
+	int32_t z_threshold;
+	int32_t band_width;
+} gasal_subst_scores;
+
+
+void gasal_copy_subst_scores(gasal_subst_scores *subst);
+void gpu_align_cleanup();
+
+// Set the device memory pointer for alignment operations
+// This should be called before gpu_align_batch_execute
+void gpu_align_set_device_mem(void *dev_mem_ptr);
+
+#endif

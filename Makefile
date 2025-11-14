@@ -2,7 +2,7 @@ CFLAGS_NDEBUG = -DNDEBUG -O0
 CDEBUG_FLAGS= -g -O0 #-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-sign-compare -Wno-unused-function -Wno-c++17-extensions -Wno-\#warnings #-O0 -DNDEBUG
 CPPFLAGS=	-DHAVE_KALLOC -D__AMD_SPLIT_KERNELS__ # -Wno-unused-but-set-variable -Wno-unused-variable
 CPPFLAGS+= 	$(if $(MAX_MICRO_BATCH),-DMAX_MICRO_BATCH=\($(MAX_MICRO_BATCH)\))
-INCLUDES=	-I .
+INCLUDES=	-I . -I/usr/local/cuda/include
 OBJS=		kthread.o kalloc.o misc.o bseq.o sketch.o sdust.o options.o index.o \
 			lchain.o align.o hit.o seed.o map.o format.o pe.o esterr.o splitidx.o \
 			ksw2_ll_sse.o

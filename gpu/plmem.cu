@@ -155,8 +155,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
 
     // ========== Alignment Buffers ==========
     // Configuration for alignment
-    dev_mem->max_align_tasks = 20000;         // max tasks (can be configured)
-    dev_mem->max_align_seq_bytes = 100*1024*1024;  // 100MB for sequences
+    // OPTIMIZATION: Increased for large batch DP processing
+    // Can handle 100K+ tasks in single DP pass with 24GB GPU
+    dev_mem->max_align_tasks = 100000;        // Increased from 20K to 100K
+    dev_mem->max_align_seq_bytes = 2*1024*1024*1024;  // 2GB for sequences (was 100MB)
     dev_mem->max_align_query_len = 100000;    // max query length
 
     // Sequence data
@@ -204,7 +206,11 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     //   - Size per task: 1 integer
     // Note: kernel launches with 28 blocks, each block can process tasks independently
     // We need enough buffers for concurrent task processing within GPU
-    size_t alloc_tasks = 28;  // Match kernel_blocks for safe concurrent execution
+    // OPTIMIZATION: Backtrack buffer for staged execution
+    // - DP phase: 100K+ tasks (uses sequence buffer, ~6GB)
+    // - Backtrack phase: 120 tasks (uses backtrack buffer, ~17GB)
+    // - Peak memory: max(6GB, 17GB) = 17GB < 24GB GPU
+    size_t alloc_tasks = 120;  // Increased from 28 for larger backtrack batches   
     // Kernel uses (qlen + tlen) for backtrack_off indexing, not (qlen + tlen - 1)
     // So max_antidiag should be 2 * max_query_len to cover qlen=max and tlen=max
     size_t max_antidiag = 2 * dev_mem->max_align_query_len;

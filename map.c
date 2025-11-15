@@ -1198,10 +1198,7 @@ int mm_split_merge(int n_segs, const char **fn, const mm_mapopt_t *opt, int n_sp
 #if defined(__AMD_SPLIT_KERNELS__)
 
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks, 
-                                   uint8_t *seq_buffer, uint32_t *cigar_buffer);
-void gpu_align_staged_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
-                                   uint8_t *seq_buffer, uint32_t *cigar_buffer,
-                                   int dp_batch_size, int bt_batch_size, int32_t score_threshold);								   
+                                   uint8_t *seq_buffer, uint32_t *cigar_buffer);							   
 extern void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                              const mm_mapopt_t *opt, const mm_idx_t *mi, 
                              int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
@@ -1453,35 +1450,9 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
 {
     if (gpu_batch->n_tasks == 0) return;
     
-    // OPTIMIZATION: Staged execution with LARGE DP batch
-    // Strategy:
-    // 1. DP phase: Process ALL tasks in one batch (up to 100K+)
-    //    - Memory: ~6GB (sequence buffers)
-    // 2. Filter phase: Select high-scoring alignments
-    // 3. Backtrack phase: Small batches (120 tasks)
-    //    - Memory: ~17GB (backtrack buffers)
-    //    - Reuses memory freed from DP phase
-    //
-    // With 24GB GPU:
-    // - Peak memory: max(6GB, 17GB) = 17GB
-    // - Safe margin: 7GB
-    // - Performance: 100K tasks in ~9s (vs 357s original)
-
-    const int dp_batch_size = 100000;  // Process all tasks in DP phase
-    const int bt_batch_size = 120;     // Backtrack batch size (limited by buffer)
-    const int32_t score_threshold = opt->min_chain_score;  // Filter threshold
-    int total_tasks = gpu_batch->n_tasks;
-
-    if (total_tasks <= bt_batch_size) {
-        // Small batch: process normally (DP + Backtrack together)
-        gpu_align_batch_execute(opt, gpu_batch->tasks, total_tasks,
-                               gpu_batch->seq_buffer, gpu_batch->cigar_buffer);
-    } else {
-        // Large batch: use staged execution
-        gpu_align_staged_execute(opt, gpu_batch->tasks, total_tasks,
-                                gpu_batch->seq_buffer, gpu_batch->cigar_buffer,
-                                dp_batch_size, bt_batch_size, score_threshold);
-    }
+    // Submit to GPU kernel
+    gpu_align_batch_execute(opt, gpu_batch->tasks, gpu_batch->n_tasks, 
+                           gpu_batch->seq_buffer, gpu_batch->cigar_buffer);
     
     // Process results back to mm_reg1_t structures
     gpu_batch_process_results(gpu_batch, opt, mi, km);

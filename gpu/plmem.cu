@@ -97,84 +97,146 @@ void plmem_free_long_mem(longMemPtr *long_mem) {
 }
 
 void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int range_grid_size, int num_cut){
-    // data array	
+    fprintf(stderr, "\n========== GPU MEMORY ALLOCATION BREAKDOWN ==========\n");
+    fprintf(stderr, "Configuration: anchor_per_batch=%zu, range_grid_size=%d, num_cut=%d\n",
+            anchor_per_batch, range_grid_size, num_cut);
+    fprintf(stderr, "                buffer_size_long=%zu\n\n", dev_mem->buffer_size_long);
+
+    // data array
     cudaSetDevice(CUDA_DEVICE);
-    cudaMalloc(&dev_mem->d_ax, anchor_per_batch * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_ay, anchor_per_batch * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_sid, anchor_per_batch * sizeof(int8_t));
-    cudaMalloc(&dev_mem->d_xrev, anchor_per_batch * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_range, anchor_per_batch * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_f, anchor_per_batch * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_p, anchor_per_batch * sizeof(uint16_t));
+
+    fprintf(stderr, "[1] Chain Buffers (for chaining phase):\n");
+    size_t chain_ax_size = anchor_per_batch * sizeof(int32_t);
+    size_t chain_ay_size = anchor_per_batch * sizeof(int32_t);
+    size_t chain_sid_size = anchor_per_batch * sizeof(int8_t);
+    size_t chain_xrev_size = anchor_per_batch * sizeof(int32_t);
+    size_t chain_range_size = anchor_per_batch * sizeof(int32_t);
+    size_t chain_f_size = anchor_per_batch * sizeof(int32_t);
+    size_t chain_p_size = anchor_per_batch * sizeof(uint16_t);
+    size_t chain_total = chain_ax_size + chain_ay_size + chain_sid_size + chain_xrev_size +
+                         chain_range_size + chain_f_size + chain_p_size;
+
+    cudaMalloc(&dev_mem->d_ax, chain_ax_size);
+    cudaMalloc(&dev_mem->d_ay, chain_ay_size);
+    cudaMalloc(&dev_mem->d_sid, chain_sid_size);
+    cudaMalloc(&dev_mem->d_xrev, chain_xrev_size);
+    cudaMalloc(&dev_mem->d_range, chain_range_size);
+    cudaMalloc(&dev_mem->d_f, chain_f_size);
+    cudaMalloc(&dev_mem->d_p, chain_p_size);
+    fprintf(stderr, "  - Total chain buffers: %.2f MB\n\n", chain_total / (1024.0*1024.0));
 
     //index
+    fprintf(stderr, "[2] Index Buffers:\n");
+    size_t idx_total = range_grid_size * sizeof(size_t) * 3;
     cudaMalloc(&dev_mem->d_start_idx, range_grid_size * sizeof(size_t));
     cudaMalloc(&dev_mem->d_read_end_idx, range_grid_size * sizeof(size_t));
     cudaMalloc(&dev_mem->d_cut_start_idx, range_grid_size * sizeof(size_t));
+    fprintf(stderr, "  - Total index buffers: %.2f MB\n\n", idx_total / (1024.0*1024.0));
 
     // cut
-    cudaMalloc(&dev_mem->d_cut, num_cut * sizeof(size_t));
+    fprintf(stderr, "[3] Cut & Segment Tracking Buffers:\n");
+    size_t cut_size = num_cut * sizeof(size_t);
+    size_t long_seg_size = dev_mem->buffer_size_long / (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit) * sizeof(seg_t);
+    size_t mid_seg_size = num_cut/(score_kernel_config.mid_seg_cutoff + 1) * sizeof(seg_t);
+    cudaMalloc(&dev_mem->d_cut, cut_size);
     cudaMalloc(&dev_mem->d_long_seg_count, sizeof(unsigned int));
-    cudaMalloc(&dev_mem->d_long_seg, dev_mem->buffer_size_long / (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit) * sizeof(seg_t));
-    cudaMalloc(&dev_mem->d_long_seg_og, dev_mem->buffer_size_long / (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit) * sizeof(seg_t));
+    cudaMalloc(&dev_mem->d_long_seg, long_seg_size);
+    cudaMalloc(&dev_mem->d_long_seg_og, long_seg_size);
     cudaMalloc(&dev_mem->d_mid_seg_count, sizeof(unsigned int));
-    cudaMalloc(&dev_mem->d_mid_seg, num_cut/(score_kernel_config.mid_seg_cutoff + 1) * sizeof(seg_t));
-    int currentDevice;
-    cudaGetDevice(&currentDevice);
-    fprintf(stderr, "Device ID:%d\n", currentDevice);
-    size_t gpu_free_mem, gpu_total_mem;
-    cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
-#ifdef DEBUG_PRINT
-        fprintf(stderr, "[Info] GPU free mem: %f GB, total mem: %f GB (before alloc long seg buffer) \n", (float)gpu_free_mem / OneG, (float)gpu_total_mem / OneG);
-#endif
+    cudaMalloc(&dev_mem->d_mid_seg, mid_seg_size);
+    fprintf(stderr, "  - d_cut: %.2f MB, d_long_seg: %.2f MB (x2), d_mid_seg: %.2f MB\n",
+            cut_size / (1024.0*1024.0), long_seg_size / (1024.0*1024.0), mid_seg_size / (1024.0*1024.0));
+    fprintf(stderr, "  - Total: %.2f MB\n\n", (cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) / (1024.0*1024.0));
 
     // long seg buffer
-    cudaMalloc(&dev_mem->d_ax_long, dev_mem->buffer_size_long * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_ay_long, dev_mem->buffer_size_long  * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_sid_long, dev_mem->buffer_size_long  * sizeof(int8_t));
-    cudaMalloc(&dev_mem->d_range_long, dev_mem->buffer_size_long * sizeof(int32_t));
+    fprintf(stderr, "\n[4] Long Segment Buffers:\n");
+    size_t long_ax_size = dev_mem->buffer_size_long * sizeof(int32_t);
+    size_t long_ay_size = dev_mem->buffer_size_long * sizeof(int32_t);
+    size_t long_sid_size = dev_mem->buffer_size_long * sizeof(int8_t);
+    size_t long_range_size = dev_mem->buffer_size_long * sizeof(int32_t);
+    size_t long_f_size = dev_mem->buffer_size_long * sizeof(int32_t);
+    size_t long_p_size = dev_mem->buffer_size_long * sizeof(uint16_t);
+    size_t long_total = long_ax_size + long_ay_size + long_sid_size + long_range_size +
+                        long_f_size + long_p_size + sizeof(size_t);
+
+    cudaMalloc(&dev_mem->d_ax_long, long_ax_size);
+    cudaMalloc(&dev_mem->d_ay_long, long_ay_size);
+    cudaMalloc(&dev_mem->d_sid_long, long_sid_size);
+    cudaMalloc(&dev_mem->d_range_long, long_range_size);
     cudaMalloc(&dev_mem->d_total_n_long, sizeof(size_t));
-    cudaMalloc(&dev_mem->d_f_long, sizeof(int32_t) * dev_mem->buffer_size_long);
-    cudaMalloc(&dev_mem->d_p_long, sizeof(uint16_t) * dev_mem->buffer_size_long); 
+    cudaMalloc(&dev_mem->d_f_long, long_f_size);
+    cudaMalloc(&dev_mem->d_p_long, long_p_size);
+    fprintf(stderr, "  - d_ax_long: %.2f MB, d_ay_long: %.2f MB\n",
+            long_ax_size / (1024.0*1024.0), long_ay_size / (1024.0*1024.0));
+    fprintf(stderr, "  - d_sid_long: %.2f MB, d_range_long: %.2f MB\n",
+            long_sid_size / (1024.0*1024.0), long_range_size / (1024.0*1024.0));
+    fprintf(stderr, "  - d_f_long: %.2f MB, d_p_long: %.2f MB\n",
+            long_f_size / (1024.0*1024.0), long_p_size / (1024.0*1024.0));
+    fprintf(stderr, "  - Total long seg buffers: %.2f MB (%.2f GB)\n\n",
+            long_total / (1024.0*1024.0), long_total / (1024.0*1024.0*1024.0)); 
 
     // ========== Backtrack Buffers ==========
     // Use anchor_per_batch as max size for backtracking
     dev_mem->max_backtrack_n = anchor_per_batch;
-    cudaMalloc(&dev_mem->d_bt_f, dev_mem->max_backtrack_n * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_bt_p_rel, dev_mem->max_backtrack_n * sizeof(uint16_t));
-    cudaMalloc(&dev_mem->d_bt_v, dev_mem->max_backtrack_n * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_bt_t, dev_mem->max_backtrack_n * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_bt_u, dev_mem->max_backtrack_n * sizeof(uint64_t));
+    size_t bt_f_size = dev_mem->max_backtrack_n * sizeof(int32_t);
+    size_t bt_p_size = dev_mem->max_backtrack_n * sizeof(uint16_t);
+    size_t bt_v_size = dev_mem->max_backtrack_n * sizeof(int32_t);
+    size_t bt_t_size = dev_mem->max_backtrack_n * sizeof(int32_t);
+    size_t bt_u_size = dev_mem->max_backtrack_n * sizeof(uint64_t);
+
+    cudaMalloc(&dev_mem->d_bt_f, bt_f_size);
+    cudaMalloc(&dev_mem->d_bt_p_rel, bt_p_size);
+    cudaMalloc(&dev_mem->d_bt_v, bt_v_size);
+    cudaMalloc(&dev_mem->d_bt_t, bt_t_size);
+    cudaMalloc(&dev_mem->d_bt_u, bt_u_size);
     cudaMalloc(&dev_mem->d_bt_n_u, sizeof(int32_t));
     cudaMalloc(&dev_mem->d_bt_n_v, sizeof(int32_t));
+
+    size_t bt_total = bt_f_size + bt_p_size + bt_v_size + bt_t_size + bt_u_size + 2*sizeof(int32_t);
 #ifdef DEBUG_PRINT
     fprintf(stderr, "[Info] Allocated backtrack buffers: max_n=%zu (%.2f MB)\n",
-            dev_mem->max_backtrack_n,
-            (dev_mem->max_backtrack_n * (sizeof(int32_t)*3 + sizeof(int64_t)*2 + sizeof(uint64_t)) + 2*sizeof(int32_t)) / (1024.0*1024.0));
+            dev_mem->max_backtrack_n, bt_total / (1024.0*1024.0));
 #endif
 
     // ========== Alignment Buffers ==========
     // Configuration for alignment
-    // OPTIMIZATION: Increased for large batch DP processing
-    // Can handle 100K+ tasks in single DP pass with 24GB GPU
-    dev_mem->max_align_tasks = 100000;        // Increased from 20K to 100K
-    dev_mem->max_align_seq_bytes = 2*1024*1024*1024;  // 2GB for sequences (was 100MB)
-    dev_mem->max_align_query_len = 100000;    // max query length
+    // OPTIMIZATION: Adjusted for 24GB GPU memory constraints
+    // Key bottleneck: backtrack_p buffer = alloc_tasks × (2×max_query_len) × 752
+    dev_mem->max_align_tasks = 120000;        // For DP phase batching
+    dev_mem->max_align_seq_bytes = 1*1024*1024*1024;  // 1GB for sequences (reduced from 2GB)
+    dev_mem->max_align_query_len = 50000;    // max query length (reduced from 100000 to save ~9GB)
+
+    fprintf(stderr, "\n[Memory Allocation] Alignment Buffers Breakdown:\n");
 
     // Sequence data
-    cudaMalloc(&dev_mem->d_align_unpacked_query, dev_mem->max_align_seq_bytes);
-    cudaMalloc(&dev_mem->d_align_unpacked_target, dev_mem->max_align_seq_bytes);
-    cudaMalloc(&dev_mem->d_align_packed_query, (dev_mem->max_align_seq_bytes / 8) * sizeof(uint32_t));
-    cudaMalloc(&dev_mem->d_align_packed_target, (dev_mem->max_align_seq_bytes / 8) * sizeof(uint32_t));
-    cudaMalloc(&dev_mem->d_align_query_offsets, dev_mem->max_align_tasks * sizeof(uint32_t));
-    cudaMalloc(&dev_mem->d_align_target_offsets, dev_mem->max_align_tasks * sizeof(uint32_t));
-    cudaMalloc(&dev_mem->d_align_query_lens, dev_mem->max_align_tasks * sizeof(uint32_t));
-    cudaMalloc(&dev_mem->d_align_target_lens, dev_mem->max_align_tasks * sizeof(uint32_t));
-    cudaMalloc(&dev_mem->d_align_flag, dev_mem->max_align_tasks * sizeof(int32_t));
+    size_t seq_unpacked_size = dev_mem->max_align_seq_bytes;
+    size_t seq_packed_size = (dev_mem->max_align_seq_bytes / 8) * sizeof(uint32_t);
+    size_t metadata_size = dev_mem->max_align_tasks * sizeof(uint32_t);
+
+    cudaMalloc(&dev_mem->d_align_unpacked_query, seq_unpacked_size);
+    fprintf(stderr, "  - Unpacked query:     %8.2f MB\n", seq_unpacked_size / (1024.0*1024.0));
+
+    cudaMalloc(&dev_mem->d_align_unpacked_target, seq_unpacked_size);
+    fprintf(stderr, "  - Unpacked target:    %8.2f MB\n", seq_unpacked_size / (1024.0*1024.0));
+
+    cudaMalloc(&dev_mem->d_align_packed_query, seq_packed_size);
+    fprintf(stderr, "  - Packed query:       %8.2f MB\n", seq_packed_size / (1024.0*1024.0));
+
+    cudaMalloc(&dev_mem->d_align_packed_target, seq_packed_size);
+    fprintf(stderr, "  - Packed target:      %8.2f MB\n", seq_packed_size / (1024.0*1024.0));
+
+    cudaMalloc(&dev_mem->d_align_query_offsets, metadata_size);
+    cudaMalloc(&dev_mem->d_align_target_offsets, metadata_size);
+    cudaMalloc(&dev_mem->d_align_query_lens, metadata_size);
+    cudaMalloc(&dev_mem->d_align_target_lens, metadata_size);
+    cudaMalloc(&dev_mem->d_align_flag, metadata_size);
+    fprintf(stderr, "  - Metadata (5 arrays):%8.2f MB\n", 5 * metadata_size / (1024.0*1024.0));
 
     // AGATHA global buffer (28 blocks * 32 threads/warp * max_query_len * 4)
     size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_query_len * 4;
-    cudaMalloc(&dev_mem->d_align_global_buffer, global_buffer_size * sizeof(short2));
+    size_t global_buffer_bytes = global_buffer_size * sizeof(short2);
+    cudaMalloc(&dev_mem->d_align_global_buffer, global_buffer_bytes);
+    fprintf(stderr, "  - Global buffer:      %8.2f MB\n", global_buffer_bytes / (1024.0*1024.0));
 
     // KSW temp buffer (225 concurrent tasks)
     size_t max_len = dev_mem->max_align_query_len;
@@ -183,12 +245,14 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t seq_size = max_len * 2 * sizeof(uint8_t);
     size_t raw_size = H_size + u8_arrays_size + seq_size;
     dev_mem->align_ksw_temp_per_task = (raw_size + 7) & ~7ULL;
-    cudaMalloc(&dev_mem->d_align_ksw_temp_buffer, 225 * dev_mem->align_ksw_temp_per_task);
+    size_t ksw_temp_bytes = 225 * dev_mem->align_ksw_temp_per_task;
+    cudaMalloc(&dev_mem->d_align_ksw_temp_buffer, ksw_temp_bytes);
+    fprintf(stderr, "  - KSW temp (225 tasks): %6.2f MB\n", ksw_temp_bytes / (1024.0*1024.0));
 
     // Backtrack buffers (must match KSW temp buffer: 225 concurrent tasks)
     // ==================== Backtrack Buffers ====================
     // Purpose: Store information for CIGAR generation (alignment path reconstruction)
-    // 
+    //
     // For each alignment with qlen and tlen:
     // - Total antidiagonals: qlen + tlen - 1
     // - Cells per antidiagonal: n_col = min(bandwidth+1, min(qlen, tlen))
@@ -207,10 +271,11 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     // Note: kernel launches with 28 blocks, each block can process tasks independently
     // We need enough buffers for concurrent task processing within GPU
     // OPTIMIZATION: Backtrack buffer for staged execution
-    // - DP phase: 100K+ tasks (uses sequence buffer, ~6GB)
-    // - Backtrack phase: 120 tasks (uses backtrack buffer, ~17GB)
-    // - Peak memory: max(6GB, 17GB) = 17GB < 24GB GPU
-    size_t alloc_tasks = 120;  // Increased from 28 for larger backtrack batches   
+    // - DP phase: 100K+ tasks (uses sequence buffer, ~3GB)
+    // - Backtrack phase: 60 tasks (uses backtrack buffer, ~4.3GB)
+    // - With max_query_len=50k: backtrack_p = 60 × 100k × 752 ≈ 4.3GB
+    // - Total alignment phase: ~10GB, fits in 24GB GPU
+    size_t alloc_tasks = 60;  // Reduced from 120 to fit in 24GB GPU
     // Kernel uses (qlen + tlen) for backtrack_off indexing, not (qlen + tlen - 1)
     // So max_antidiag should be 2 * max_query_len to cover qlen=max and tlen=max
     size_t max_antidiag = 2 * dev_mem->max_align_query_len;
@@ -218,35 +283,72 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     dev_mem->max_align_backtrack_size = max_antidiag * max_n_col;
     dev_mem->max_align_cigar_len = 2 * dev_mem->max_align_query_len;
 
-    cudaMalloc(&dev_mem->d_align_backtrack_p, alloc_tasks * dev_mem->max_align_backtrack_size);
-    cudaMalloc(&dev_mem->d_align_backtrack_off, alloc_tasks * max_antidiag * sizeof(int));
-    cudaMalloc(&dev_mem->d_align_backtrack_off_end, alloc_tasks * max_antidiag * sizeof(int));
-    cudaMalloc(&dev_mem->d_align_backtrack_n_col, alloc_tasks * sizeof(int));
-    cudaMalloc(&dev_mem->d_align_cigar_buffer, alloc_tasks * dev_mem->max_align_cigar_len * sizeof(uint32_t));
-    cudaMalloc(&dev_mem->d_align_cigar_lengths, alloc_tasks * sizeof(int));
+    fprintf(stderr, "\n[Memory Allocation] Backtrack Buffers (for CIGAR generation):\n");
+    fprintf(stderr, "  - Config: alloc_tasks=%zu, max_antidiag=%zu, max_n_col=%zu\n",
+            alloc_tasks, max_antidiag, max_n_col);
+
+    size_t bt_p_bytes = alloc_tasks * dev_mem->max_align_backtrack_size;
+    size_t bt_off_bytes = alloc_tasks * max_antidiag * sizeof(int);
+    size_t bt_off_end_bytes = alloc_tasks * max_antidiag * sizeof(int);
+    size_t bt_n_col_bytes = alloc_tasks * sizeof(int);
+    size_t cigar_buf_bytes = alloc_tasks * dev_mem->max_align_cigar_len * sizeof(uint32_t);
+    size_t cigar_len_bytes = alloc_tasks * sizeof(int);
+
+    fprintf(stderr, "  - backtrack_p:       %8.2f MB (LARGEST!)\n", bt_p_bytes / (1024.0*1024.0));
+    fprintf(stderr, "  - backtrack_off:     %8.2f MB\n", bt_off_bytes / (1024.0*1024.0));
+    fprintf(stderr, "  - backtrack_off_end: %8.2f MB\n", bt_off_end_bytes / (1024.0*1024.0));
+    fprintf(stderr, "  - backtrack_n_col:   %8.2f MB\n", bt_n_col_bytes / (1024.0*1024.0));
+    fprintf(stderr, "  - cigar_buffer:      %8.2f MB\n", cigar_buf_bytes / (1024.0*1024.0));
+    fprintf(stderr, "  - cigar_lengths:     %8.2f MB\n", cigar_len_bytes / (1024.0*1024.0));
+    fprintf(stderr, "  - Backtrack TOTAL:   %8.2f MB (%.2f GB)\n",
+            (bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes + cigar_buf_bytes + cigar_len_bytes) / (1024.0*1024.0),
+            (bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes + cigar_buf_bytes + cigar_len_bytes) / (1024.0*1024.0*1024.0));
+
+    cudaMalloc(&dev_mem->d_align_backtrack_p, bt_p_bytes);
+    cudaMalloc(&dev_mem->d_align_backtrack_off, bt_off_bytes);
+    cudaMalloc(&dev_mem->d_align_backtrack_off_end, bt_off_end_bytes);
+    cudaMalloc(&dev_mem->d_align_backtrack_n_col, bt_n_col_bytes);
+    cudaMalloc(&dev_mem->d_align_cigar_buffer, cigar_buf_bytes);
+    cudaMalloc(&dev_mem->d_align_cigar_lengths, cigar_len_bytes);
 
     // Result structures
-    cudaMalloc(&dev_mem->d_align_device_res, sizeof(gasal_res_t));  
-    cudaMalloc(&dev_mem->d_align_ez_array, sizeof(ksw_extz_t) * 224);  
+    cudaMalloc(&dev_mem->d_align_device_res, sizeof(gasal_res_t));
+    cudaMalloc(&dev_mem->d_align_ez_array, sizeof(ksw_extz_t) * 224);
     cudaMalloc(&dev_mem->d_align_scores, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_query_ends, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_target_ends, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
 
-#ifdef DEBUG_PRINT
-    size_t align_mem = dev_mem->max_align_seq_bytes * 2 +  // unpacked
-                       (dev_mem->max_align_seq_bytes / 8) * 2 * sizeof(uint32_t) +  // packed
-                       dev_mem->max_align_tasks * sizeof(uint32_t) * 5 +  // metadata
-                       global_buffer_size * sizeof(short2) +
-                       225 * dev_mem->align_ksw_temp_per_task +
-                       alloc_tasks * (dev_mem->max_align_backtrack_size +
-                                     max_antidiag * 2 * sizeof(int) +
-                                     sizeof(int) +
-                                     dev_mem->max_align_cigar_len * sizeof(uint32_t)) +
-                       dev_mem->max_align_tasks * sizeof(int32_t) * 4;
-    fprintf(stderr, "[Info] Allocated alignment buffers: %.2f MB\n", align_mem / (1024.0*1024.0));
-#endif
+    // Calculate total memory allocated
+    size_t seq_buffers_total = seq_unpacked_size * 2 + seq_packed_size * 2 + 5 * metadata_size;
+    size_t align_total = seq_buffers_total + global_buffer_bytes + ksw_temp_bytes +
+                         bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes +
+                         cigar_buf_bytes + cigar_len_bytes +
+                         dev_mem->max_align_tasks * sizeof(int32_t) * 4 +
+                         sizeof(gasal_res_t) + sizeof(ksw_extz_t) * 224 + 25;
+
+    fprintf(stderr, "\n[Memory Summary] Alignment Phase TOTAL: %.2f MB (%.2f GB)\n",
+            align_total / (1024.0*1024.0), align_total / (1024.0*1024.0*1024.0));
+
+    // Grand total
+    size_t grand_total = chain_total + idx_total +
+                         (cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) +
+                         long_total + bt_total + align_total;
+
+    fprintf(stderr, "\n========== TOTAL GPU MEMORY ALLOCATED ==========\n");
+    fprintf(stderr, "  Chain buffers:       %8.2f MB\n", chain_total / (1024.0*1024.0));
+    fprintf(stderr, "  Index buffers:       %8.2f MB\n", idx_total / (1024.0*1024.0));
+    fprintf(stderr, "  Cut/Seg tracking:    %8.2f MB\n",
+            (cut_size + 2*long_seg_size + mid_seg_size) / (1024.0*1024.0));
+    fprintf(stderr, "  Long seg buffers:    %8.2f MB\n", long_total / (1024.0*1024.0));
+    fprintf(stderr, "  Backtrack (chain):   %8.2f MB\n", bt_total / (1024.0*1024.0));
+    fprintf(stderr, "  Alignment buffers:   %8.2f MB\n", align_total / (1024.0*1024.0));
+    fprintf(stderr, "  ----------------------------------------\n");
+    fprintf(stderr, "  GRAND TOTAL:         %8.2f MB (%.2f GB)\n",
+            grand_total / (1024.0*1024.0), grand_total / (1024.0*1024.0*1024.0));
+    fprintf(stderr, "===================================================\n\n");
+
     cudaCheck();
 }
 

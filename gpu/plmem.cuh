@@ -142,6 +142,10 @@ typedef struct {
     int32_t *d_align_scores;
     int32_t *d_align_query_ends;
     int32_t *d_align_target_ends;
+    int32_t *d_align_mqe;            // max score when reaching end of query
+    int32_t *d_align_mqe_t;          // target position when reaching end of query
+    int32_t *d_align_mte;            // max score when reaching end of target
+    int32_t *d_align_mte_q;          // query position when reaching end of target
     int32_t *d_align_task_to_align_id;
     int8_t *d_align_mat;             // scoring matrix
 } deviceMemPtr;

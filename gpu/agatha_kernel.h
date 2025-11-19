@@ -1250,6 +1250,10 @@ __global__ void ksw_semi_global_cuda_kernel(
     device_res->aln_score[task_id] = ez->score;
     device_res->query_batch_end[task_id] = ez->reach_end ? qlen - 1 : ez->max_q;
     device_res->target_batch_end[task_id] = ez->reach_end ? tlen - 1 : ez->max_t;
+    device_res->mqe[task_id] = ez->mqe;
+    device_res->mqe_t[task_id] = ez->mqe_t;
+    device_res->mte[task_id] = ez->mte;
+    device_res->mte_q[task_id] = ez->mte_q;
 
     if (with_cigar) {
         backtrack_n_col[task_id] = n_col;

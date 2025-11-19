@@ -123,7 +123,8 @@ typedef struct {
     // Result storage (to be filled by GPU)
     int32_t score;          // alignment score
     int32_t max_q, max_t;   // max positions
-    int32_t mqe_q, mqe_t;   // reached end positions
+    int32_t mqe, mqe_t;     // max score when reaching end of query
+    int32_t mte, mte_q;     // max score when reaching end of target
     int32_t n_cigar;        // number of CIGAR operations
     size_t cigar_offset;    // offset in batch CIGAR buffer
     int32_t max_cigar;      // max CIGAR capacity

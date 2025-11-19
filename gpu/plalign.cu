@@ -139,6 +139,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *d_scores = dev_mem->d_align_scores;
     int32_t *d_query_ends = dev_mem->d_align_query_ends;
     int32_t *d_target_ends = dev_mem->d_align_target_ends;
+    int32_t *d_mqe = dev_mem->d_align_mqe;
+    int32_t *d_mqe_t = dev_mem->d_align_mqe_t;
+    int32_t *d_mte = dev_mem->d_align_mte;
+    int32_t *d_mte_q = dev_mem->d_align_mte_q;
 
     // Host buffers for CIGAR and results (sized for one batch)
     uint32_t *h_cigar_buffer = (uint32_t*)calloc(max_concurrent_tasks * max_cigar_len, sizeof(uint32_t));
@@ -146,6 +150,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *h_scores = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
     int32_t *h_query_ends = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
     int32_t *h_target_ends = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_mqe = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_mqe_t = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_mte = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_mte_q = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
     short2 *h_sort_buffer = (short2*)calloc(max_concurrent_tasks, sizeof(short2));
 
     // Host arrays for batch preparation (sized for one batch)
@@ -162,9 +170,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     // Prepare device result structure
     gasal_res_t h_res_ptrs;
+    memset(&h_res_ptrs, 0, sizeof(gasal_res_t));  // Initialize all fields to NULL
     h_res_ptrs.aln_score = d_scores;
     h_res_ptrs.query_batch_end = d_query_ends;
     h_res_ptrs.target_batch_end = d_target_ends;
+    h_res_ptrs.mqe = d_mqe;
+    h_res_ptrs.mqe_t = d_mqe_t;
+    h_res_ptrs.mte = d_mte;
+    h_res_ptrs.mte_q = d_mte_q;
     cudaMemcpy(device_res, &h_res_ptrs, sizeof(gasal_res_t), cudaMemcpyHostToDevice);
 
     // ========== BATCHED PROCESSING LOOP ==========
@@ -392,6 +405,22 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                    d_target_ends,
                    batch_size * sizeof(int32_t),
                    cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mqe,
+                   d_mqe,
+                   batch_size * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mqe_t,
+                   d_mqe_t,
+                   batch_size * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mte,
+                   d_mte,
+                   batch_size * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mte_q,
+                   d_mte_q,
+                   batch_size * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost);
 
         // Wait for completion
         cudaDeviceSynchronize();
@@ -405,6 +434,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             tasks[task_idx].score = h_scores[align_id];
             tasks[task_idx].max_q = h_query_ends[align_id];
             tasks[task_idx].max_t = h_target_ends[align_id];
+            tasks[task_idx].mqe = h_mqe[align_id];
+            tasks[task_idx].mqe_t = h_mqe_t[align_id];
+            tasks[task_idx].mte = h_mte[align_id];
+            tasks[task_idx].mte_q = h_mte_q[align_id];
 
             // Copy CIGAR to output buffer
             if (cigar_buffer) {
@@ -453,5 +486,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     free(h_scores);
     free(h_query_ends);
     free(h_target_ends);
+    free(h_mqe);
+    free(h_mqe_t);
+    free(h_mte);
+    free(h_mte_q);
     free(h_sort_buffer);
 }

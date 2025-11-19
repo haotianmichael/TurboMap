@@ -281,6 +281,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_align_scores, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_query_ends, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_target_ends, dev_mem->max_align_tasks * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_align_mqe, dev_mem->max_align_tasks * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_align_mqe_t, dev_mem->max_align_tasks * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_align_mte, dev_mem->max_align_tasks * sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_align_mte_q, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
 

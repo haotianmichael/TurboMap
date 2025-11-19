@@ -1090,7 +1090,8 @@ static int gpu_batch_add_task(gpu_align_batch_t *gpu_batch,
     // Initialize results
     task->score = 0;
     task->max_q = task->max_t = 0;
-    task->mqe_q = task->mqe_t = 0;
+	task->mqe = task->mqe_t = -1;
+    task->mte = task->mte_q = -1;
     task->n_cigar = 0;
     task->zdropped = 0;
     task->reach_end = 0;

@@ -153,12 +153,16 @@ void free_queue_read(chain_read_t *read) {
 
 
 /*KSW */
-typedef struct {
+typedef struct __attribute__((aligned(8))){
 	int32_t *aln_score;
 	int32_t *query_batch_end;
 	int32_t *target_batch_end;
 	int32_t *query_batch_start;
 	int32_t *target_batch_start;
+    int32_t *mqe;           // max score when reaching end of query
+	int32_t *mqe_t;         // target position when reaching end of query
+	int32_t *mte;           // max score when reaching end of target
+	int32_t *mte_q;         // query position when reaching end of target
 	uint8_t *cigar;
 	uint32_t *n_cigar_ops;
 }gasal_res_t;

@@ -471,6 +471,7 @@ __global__ void agatha_sort(uint32_t *packed_query_batch, uint32_t *packed_ref_b
 #define KSW_CIGAR_MATCH  0
 #define KSW_CIGAR_INS    1
 #define KSW_CIGAR_DEL    2
+#define KSW_CIGAR_N_SKIP 3
 #define KSW_NEG_INF     -0x40000000
 
 
@@ -482,6 +483,17 @@ __device__ static inline uint32_t* ksw_push_cigar_device(
     uint32_t op, 
     int len)
 {
+    // Safety check: ensure op is in valid range (0-3 for M/I/D/N)
+    if (op > 3) {
+        // Invalid op, this should never happen - indicates a bug
+        // Set to MATCH (0) to avoid corruption
+        op = 0;
+    }
+
+    // Safety check: ensure length is positive
+    if (len <= 0) {
+        return cigar;  // Skip invalid entries
+    }
     // 如果CIGAR为空或者操作类型不同，添加新元素
     if (*n_cigar == 0 || op != (cigar[(*n_cigar) - 1] & 0xf)) {
         if (*n_cigar < max_cigar_len) {
@@ -498,6 +510,7 @@ __device__ static inline uint32_t* ksw_push_cigar_device(
 __global__ void ksw_backtrack_kernel(
     uint8_t *backtrack_p,           // 回溯方向数组
     int *backtrack_off,             // 每个反对角线的起始位置
+    int *backtrack_off_end,         // 每个反对角线的结束位置
     int *backtrack_n_col,           // 每个task的n_col值
     uint32_t *query_batch_lens,     // query长度数组
     uint32_t *target_batch_lens,    // target长度数组
@@ -540,6 +553,7 @@ __global__ void ksw_backtrack_kernel(
     // ========== 获取缓冲区指针 ==========
     uint8_t *p = backtrack_p + (size_t)task_id * max_backtrack_size;
     int *off = backtrack_off + (size_t)task_id * (qlen + tlen);
+    int *off_end = backtrack_off_end + (size_t)task_id * (qlen + tlen);
     uint32_t *cigar = cigar_buffer + (size_t)task_id * max_cigar_len;
     
     // ========== 回溯参数 ==========
@@ -566,7 +580,9 @@ __global__ void ksw_backtrack_kernel(
         if (i < off[r]) {
             force_state = 2;  // 强制为F状态（水平移动）
         }
-        
+        if (i > off_end[r]) {
+            force_state = 1;  // 强制为E状态（垂直移动）
+        } 
         // 读取回溯方向
         if (force_state < 0) {
             // 计算在回溯数组中的位置
@@ -830,7 +846,10 @@ __global__ void ksw_semi_global_cuda_kernel(
     int last_st = -1, last_en = -1;
     int n_col = (qlen < tlen) ? qlen : tlen;
     n_col = (n_col < w + 1) ? n_col : (w + 1);
-    
+    // Match CPU stride calculation: round up to 16-byte blocks (for SSE alignment)
+    // CPU: n_col_ = ((n_col_ < w + 1? n_col_ : w + 1) + 15) / 16 + 1; then passes n_col_*16
+    n_col = ((n_col + 15) / 16 + 1) * 16;  // Align to match CPU stride
+
     // 根据flag设置计算模式
     int with_cigar = !(flag & KSW_EZ_SCORE_ONLY);      // 是否需要回溯信息
     int approx_max = !!(flag & KSW_EZ_APPROX_MAX);     // 是否使用近似最大值
@@ -861,6 +880,11 @@ __global__ void ksw_semi_global_cuda_kernel(
 
         st0 = st;
         en0 = en;
+        // CRITICAL: Align st/en to 16-byte boundaries to match CPU backtrack array layout
+        // CPU does: st = st / 16 * 16, en = (en + 16) / 16 * 16 - 1
+        // This ensures off[r] aligns with n_col stride (which is also 16-byte aligned)
+        st = (st / 16) * 16;
+        en = ((en + 16) / 16) * 16 - 1;
 
         // ========== Initialize boundary conditions ==========
         int8_t x1, v1, x21;
@@ -929,6 +953,16 @@ __global__ void ksw_semi_global_cuda_kernel(
         
         uint8_t *pr = with_cigar ? (p + (size_t)r * n_col) : NULL;
         
+        // CRITICAL: Initialize aligned padding region [st, st0) with default direction (0)
+        // to match CPU which writes entire 16-byte SIMD blocks
+        if (pr != NULL) {
+            for (int t = st; t < st0; ++t) {
+                pr[t - st] = 0;  // default: match from s[t]
+            }
+            for (int t = en0 + 1; t <= en; ++t) {
+                pr[t - st] = 0;  // default: match from s[t]
+            }
+        }
         // ========== DP recurrence (three modes) ==========
         
         if (!with_cigar) {
@@ -1246,10 +1280,41 @@ __global__ void ksw_semi_global_cuda_kernel(
         last_en = en;
     }
     
+    // ========== Fix max_q and max_t for approx_max mode ==========
+    // In approx_max mode (KSW_EZ_APPROX_MAX), max_q and max_t are NOT tracked.
+    // They should remain -1, matching CPU behavior (see ksw2_extd2_sse.c:367-382).
+    // DO NOT set them to qlen-1/tlen-1, as that breaks compatibility with CPU version.
+
+    // ========== Determine backtrack endpoint (matching CPU logic) ==========
+    // See ksw2_extd2_sse.c:389-400 for reference
+    int backtrack_q = -1, backtrack_t = -1;
+
+    if (!ez->zdropped && !(flag & KSW_EZ_EXTZ_ONLY)) {
+        // Case 1: Normal alignment without EXTZ_ONLY flag
+        // Use sequence endpoints for backtracking
+        backtrack_q = qlen - 1;
+        backtrack_t = tlen - 1;
+    } else if (!ez->zdropped && (flag & KSW_EZ_EXTZ_ONLY) &&
+               ez->mqe + end_bonus > ez->max) {
+        // Case 2: Extension-only mode with mqe reaching end
+        backtrack_q = qlen - 1;
+        backtrack_t = ez->mqe_t;
+        ez->reach_end = 1;
+    } else if (ez->max_t >= 0 && ez->max_q >= 0) {
+        // Case 3: Use tracked maximum position (when available)
+        backtrack_q = ez->max_q;
+        backtrack_t = ez->max_t; 
+    }
+    // else: No valid backtrack endpoint (backtrack_q/t remain -1)
+
     // ========== Write results ==========
     device_res->aln_score[task_id] = ez->score;
-    device_res->query_batch_end[task_id] = ez->reach_end ? qlen - 1 : ez->max_q;
-    device_res->target_batch_end[task_id] = ez->reach_end ? tlen - 1 : ez->max_t;
+    device_res->query_batch_end[task_id] = backtrack_q;
+    device_res->target_batch_end[task_id] = backtrack_t;
+    device_res->mqe[task_id] = ez->mqe;
+    device_res->mqe_t[task_id] = ez->mqe_t;
+    device_res->mte[task_id] = ez->mte;
+    device_res->mte_q[task_id] = ez->mte_q;
 
     if (with_cigar) {
         backtrack_n_col[task_id] = n_col;

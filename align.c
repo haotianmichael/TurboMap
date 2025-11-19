@@ -1090,7 +1090,8 @@ static int gpu_batch_add_task(gpu_align_batch_t *gpu_batch,
     // Initialize results
     task->score = 0;
     task->max_q = task->max_t = 0;
-    task->mqe_q = task->mqe_t = 0;
+	task->mqe = task->mqe_t = -1;
+    task->mte = task->mte_q = -1;
     task->n_cigar = 0;
     task->zdropped = 0;
     task->reach_end = 0;
@@ -1118,6 +1119,9 @@ static void mm_align_pair_batched(gpu_align_batch_t *gpu_batch,
                                  int32_t read_idx, int32_t reg_idx, 
                                  int32_t task_type, int32_t task_sub_idx, task_ctx_t task_ctx)
 {
+	if (qlen <= 0 || tlen <= 0) {
+        return;
+    }
     // For very large alignments, skip GPU (fallback handled later)
     if (opt->max_sw_mat > 0 && (int64_t)tlen * qlen > opt->max_sw_mat) {
         return;

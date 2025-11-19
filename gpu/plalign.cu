@@ -85,6 +85,25 @@ void gpu_align_copy_param() {
     }
 }
 
+// Kernel to initialize gasal_res_t structure on device
+// This avoids cudaMemcpy host-to-device structure alignment issues
+__global__ void init_gasal_res(gasal_res_t *res,
+                                int32_t *aln_score, int32_t *query_batch_end, int32_t *target_batch_end,
+                                int32_t *mqe, int32_t *mqe_t, int32_t *mte, int32_t *mte_q) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        res->aln_score = aln_score;
+        res->query_batch_end = query_batch_end;
+        res->target_batch_end = target_batch_end;
+        res->query_batch_start = NULL;
+        res->target_batch_start = NULL;
+        res->mqe = mqe;
+        res->mqe_t = mqe_t;
+        res->mte = mte;
+        res->mte_q = mte_q;
+        res->cigar = NULL;
+        res->n_cigar_ops = NULL;
+    }
+}
 extern "C" void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                             uint8_t *seq_buffer, uint32_t *cigar_buffer);
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
@@ -139,6 +158,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *d_scores = dev_mem->d_align_scores;
     int32_t *d_query_ends = dev_mem->d_align_query_ends;
     int32_t *d_target_ends = dev_mem->d_align_target_ends;
+    int32_t *d_mqe = dev_mem->d_align_mqe;
+    int32_t *d_mqe_t = dev_mem->d_align_mqe_t;
+    int32_t *d_mte = dev_mem->d_align_mte;
+    int32_t *d_mte_q = dev_mem->d_align_mte_q;
 
     // Host buffers for CIGAR and results (sized for one batch)
     uint32_t *h_cigar_buffer = (uint32_t*)calloc(max_concurrent_tasks * max_cigar_len, sizeof(uint32_t));
@@ -146,6 +169,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *h_scores = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
     int32_t *h_query_ends = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
     int32_t *h_target_ends = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_mqe = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_mqe_t = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_mte = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
+    int32_t *h_mte_q = (int32_t*)calloc(max_concurrent_tasks, sizeof(int32_t));
     short2 *h_sort_buffer = (short2*)calloc(max_concurrent_tasks, sizeof(short2));
 
     // Host arrays for batch preparation (sized for one batch)
@@ -158,14 +185,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     int8_t h_scoring_matrix[25];
     ksw_gen_simple_mat(5, h_scoring_matrix, opt->a, opt->b, opt->sc_ambi);
-    cudaMemcpy(d_mat, h_scoring_matrix, 25 * sizeof(int8_t), cudaMemcpyHostToDevice);
+    cudaError_t err;
+    CHECKCUDAERROR(cudaMemcpy(d_mat, h_scoring_matrix, 25 * sizeof(int8_t), cudaMemcpyHostToDevice));
 
-    // Prepare device result structure
-    gasal_res_t h_res_ptrs;
-    h_res_ptrs.aln_score = d_scores;
-    h_res_ptrs.query_batch_end = d_query_ends;
-    h_res_ptrs.target_batch_end = d_target_ends;
-    cudaMemcpy(device_res, &h_res_ptrs, sizeof(gasal_res_t), cudaMemcpyHostToDevice);
+    // Initialize device result structure directly on device
+    // Using a kernel avoids host-device structure alignment issues with cudaMemcpy
+    // Performance impact: ~5-10 microseconds (negligible compared to alignment kernel runtime)
+    init_gasal_res<<<1, 1>>>((gasal_res_t*)device_res, d_scores, d_query_ends, d_target_ends,
+                              d_mqe, d_mqe_t, d_mte, d_mte_q);
+    CHECKCUDAERROR(cudaGetLastError());
 
     // ========== BATCHED PROCESSING LOOP ==========
     int tasks_processed = 0;
@@ -356,6 +384,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                             shared_mem>>>(
                 d_backtrack_p,
                 d_backtrack_off,
+                d_backtrack_off_end,
                 d_backtrack_n_col,
                 d_query_lens,
                 d_target_lens,
@@ -392,6 +421,22 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                    d_target_ends,
                    batch_size * sizeof(int32_t),
                    cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mqe,
+                   d_mqe,
+                   batch_size * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mqe_t,
+                   d_mqe_t,
+                   batch_size * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mte,
+                   d_mte,
+                   batch_size * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_mte_q,
+                   d_mte_q,
+                   batch_size * sizeof(int32_t),
+                   cudaMemcpyDeviceToHost);
 
         // Wait for completion
         cudaDeviceSynchronize();
@@ -403,27 +448,46 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             int align_id = h_task_to_align_id[i];
 
             tasks[task_idx].score = h_scores[align_id];
-            tasks[task_idx].max_q = h_query_ends[align_id];
-            tasks[task_idx].max_t = h_target_ends[align_id];
-
+            // In approx_max mode (KSW_EZ_APPROX_MAX), max_q/max_t are not tracked and should be -1
+            // h_query_ends/h_target_ends contain backtrack endpoints, not max score positions
+            if (tasks[task_idx].flag & KSW_EZ_APPROX_MAX) {
+                tasks[task_idx].max_q = -1;
+                tasks[task_idx].max_t = -1;
+            } else {
+                tasks[task_idx].max_q = h_query_ends[align_id];
+                tasks[task_idx].max_t = h_target_ends[align_id];
+            }
+            tasks[task_idx].mqe = h_mqe[align_id];
+            tasks[task_idx].mqe_t = h_mqe_t[align_id];
+            tasks[task_idx].mte = h_mte[align_id];
+            tasks[task_idx].mte_q = h_mte_q[align_id];
+            
             // Copy CIGAR to output buffer
             if (cigar_buffer) {
                 int n_cigar = h_cigar_lengths[align_id];
                 tasks[task_idx].n_cigar = n_cigar;
-
-                // Copy CIGAR operations
-                if (n_cigar > 0 && tasks[task_idx].cigar_offset + n_cigar <= tasks[task_idx].max_cigar) {
+                // Copy CIGAR operations (check n_cigar doesn't exceed allocated capacity)
+                if (n_cigar > 0 && n_cigar <= tasks[task_idx].max_cigar) {
                     memcpy(cigar_buffer + tasks[task_idx].cigar_offset,
                            h_cigar_buffer + align_id * max_cigar_len,
                            n_cigar * sizeof(uint32_t));
+                } else if (n_cigar > tasks[task_idx].max_cigar) {
+                    tasks[task_idx].n_cigar = 0;  // Reset to avoid corruption
                 }
             } else {
                 tasks[task_idx].n_cigar = 0;
             }
 
             // Set completion flags
-            tasks[task_idx].reach_end = (tasks[task_idx].max_q == tasks[task_idx].qlen) &&
-                                        (tasks[task_idx].max_t == tasks[task_idx].tlen);
+            // In approx_max mode, use backtrack endpoints (h_query_ends/h_target_ends) to check reach_end
+            // Otherwise use max_q/max_t (which are 0-based indices, compare with len-1)
+            if (tasks[task_idx].flag & KSW_EZ_APPROX_MAX) {
+                tasks[task_idx].reach_end = (h_query_ends[align_id] == tasks[task_idx].qlen - 1) &&
+                                            (h_target_ends[align_id] == tasks[task_idx].tlen - 1);
+            } else {
+                tasks[task_idx].reach_end = (tasks[task_idx].max_q == tasks[task_idx].qlen - 1) &&
+                                            (tasks[task_idx].max_t == tasks[task_idx].tlen - 1);
+            }
             tasks[task_idx].zdropped = 0;
         }
 
@@ -453,5 +517,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     free(h_scores);
     free(h_query_ends);
     free(h_target_ends);
+    free(h_mqe);
+    free(h_mqe_t);
+    free(h_mte);
+    free(h_mte_q);
     free(h_sort_buffer);
 }

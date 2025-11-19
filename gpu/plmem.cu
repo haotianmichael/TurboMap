@@ -196,24 +196,80 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t seq_packed_size = (dev_mem->max_align_seq_bytes / 8) * sizeof(uint32_t);
     size_t metadata_size = dev_mem->max_align_tasks * sizeof(uint32_t);
 
-    cudaMalloc(&dev_mem->d_align_unpacked_query, seq_unpacked_size);
+    cudaError_t cuda_err;
 
-    cudaMalloc(&dev_mem->d_align_unpacked_target, seq_unpacked_size);
+    cuda_err = cudaMalloc(&dev_mem->d_align_unpacked_query, seq_unpacked_size);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_unpacked_query (%.2f MB): %s\n",
+                seq_unpacked_size / (1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
 
-    cudaMalloc(&dev_mem->d_align_packed_query, seq_packed_size);
+    cuda_err = cudaMalloc(&dev_mem->d_align_unpacked_target, seq_unpacked_size);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_unpacked_target (%.2f MB): %s\n",
+                seq_unpacked_size / (1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
 
-    cudaMalloc(&dev_mem->d_align_packed_target, seq_packed_size);
+    cuda_err = cudaMalloc(&dev_mem->d_align_packed_query, seq_packed_size);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_packed_query (%.2f MB): %s\n",
+                seq_packed_size / (1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
 
-    cudaMalloc(&dev_mem->d_align_query_offsets, metadata_size);
-    cudaMalloc(&dev_mem->d_align_target_offsets, metadata_size);
-    cudaMalloc(&dev_mem->d_align_query_lens, metadata_size);
-    cudaMalloc(&dev_mem->d_align_target_lens, metadata_size);
-    cudaMalloc(&dev_mem->d_align_flag, metadata_size);
+    cuda_err = cudaMalloc(&dev_mem->d_align_packed_target, seq_packed_size);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_packed_target (%.2f MB): %s\n",
+                seq_packed_size / (1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_query_offsets, metadata_size);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_query_offsets: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_target_offsets, metadata_size);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_target_offsets: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_query_lens, metadata_size);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_query_lens: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_target_lens, metadata_size);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_target_lens: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_flag, metadata_size);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_flag: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
 
     // AGATHA global buffer (28 blocks * 32 threads/warp * max_query_len * 4)
     size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_query_len * 4;
     size_t global_buffer_bytes = global_buffer_size * sizeof(short2);
-    cudaMalloc(&dev_mem->d_align_global_buffer, global_buffer_bytes);
+    cuda_err = cudaMalloc(&dev_mem->d_align_global_buffer, global_buffer_bytes);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_global_buffer (%.2f MB): %s\n",
+                global_buffer_bytes / (1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
 
     // KSW temp buffer (225 concurrent tasks)
     size_t max_len = dev_mem->max_align_query_len;
@@ -223,7 +279,12 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t raw_size = H_size + u8_arrays_size + seq_size;
     dev_mem->align_ksw_temp_per_task = (raw_size + 7) & ~7ULL;
     size_t ksw_temp_bytes = 225 * dev_mem->align_ksw_temp_per_task;
-    cudaMalloc(&dev_mem->d_align_ksw_temp_buffer, ksw_temp_bytes);
+    cuda_err = cudaMalloc(&dev_mem->d_align_ksw_temp_buffer, ksw_temp_bytes);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_ksw_temp_buffer (%.2f MB): %s\n",
+                ksw_temp_bytes / (1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
 
     fprintf(stderr, " [Align] DP buffers: %.2f MB\n", (seq_unpacked_size *2 + seq_packed_size*2 + metadata_size*5 + global_buffer_bytes + ksw_temp_bytes) / (1024.0*1024.0));
     // Backtrack buffers (must match KSW temp buffer: 225 concurrent tasks)
@@ -268,25 +329,125 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t cigar_buf_bytes = alloc_tasks * dev_mem->max_align_cigar_len * sizeof(uint32_t);
     size_t cigar_len_bytes = alloc_tasks * sizeof(int);
 
-    cudaMalloc(&dev_mem->d_align_backtrack_p, bt_p_bytes);
-    cudaMalloc(&dev_mem->d_align_backtrack_off, bt_off_bytes);
-    cudaMalloc(&dev_mem->d_align_backtrack_off_end, bt_off_end_bytes);
-    cudaMalloc(&dev_mem->d_align_backtrack_n_col, bt_n_col_bytes);
-    cudaMalloc(&dev_mem->d_align_cigar_buffer, cigar_buf_bytes);
-    cudaMalloc(&dev_mem->d_align_cigar_lengths, cigar_len_bytes);
+    cuda_err = cudaMalloc(&dev_mem->d_align_backtrack_p, bt_p_bytes);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_backtrack_p (%.2f GB): %s\n",
+                bt_p_bytes / (1024.0*1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_backtrack_off, bt_off_bytes);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_backtrack_off (%.2f MB): %s\n",
+                bt_off_bytes / (1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_backtrack_off_end, bt_off_end_bytes);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_backtrack_off_end (%.2f MB): %s\n",
+                bt_off_end_bytes / (1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_backtrack_n_col, bt_n_col_bytes);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_backtrack_n_col: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_cigar_buffer, cigar_buf_bytes);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_cigar_buffer (%.2f MB): %s\n",
+                cigar_buf_bytes / (1024.0*1024.0), cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_cigar_lengths, cigar_len_bytes);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_cigar_lengths: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
 
     // Result structures
-    cudaMalloc(&dev_mem->d_align_device_res, sizeof(gasal_res_t));
-    cudaMalloc(&dev_mem->d_align_ez_array, sizeof(ksw_extz_t) * 224);
-    cudaMalloc(&dev_mem->d_align_scores, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_query_ends, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_target_ends, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mqe, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mqe_t, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mte, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mte_q, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
+    cuda_err = cudaMalloc(&dev_mem->d_align_device_res, sizeof(gasal_res_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_device_res: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_ez_array, sizeof(ksw_extz_t) * 224);
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_ez_array: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_scores, dev_mem->max_align_tasks * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_scores: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_query_ends, dev_mem->max_align_tasks * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_query_ends: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_target_ends, dev_mem->max_align_tasks * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_target_ends: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_mqe, dev_mem->max_align_tasks * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_mqe: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_mqe_t, dev_mem->max_align_tasks * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_mqe_t: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_mte, dev_mem->max_align_tasks * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_mte: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_mte_q, dev_mem->max_align_tasks * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_mte_q: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_task_to_align_id: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
+
+    cuda_err = cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
+    if (cuda_err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] cudaMalloc failed for d_align_mat: %s\n",
+                cudaGetErrorString(cuda_err));
+        return -1;
+    }
 
     // Calculate total memory allocated for alignment backtrack
     size_t bck_total = bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes +

@@ -166,7 +166,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     int8_t h_scoring_matrix[25];
     ksw_gen_simple_mat(5, h_scoring_matrix, opt->a, opt->b, opt->sc_ambi);
-    cudaMemcpy(d_mat, h_scoring_matrix, 25 * sizeof(int8_t), cudaMemcpyHostToDevice);
+
+    // Check for any previous CUDA errors first
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] Previous CUDA error detected before cudaMemcpy: %s\n", cudaGetErrorString(err));
+        return;
+    }
+
+    CHECKCUDAERROR(cudaMemcpy(d_mat, h_scoring_matrix, 25 * sizeof(int8_t), cudaMemcpyHostToDevice));
 
     // Prepare device result structure
     gasal_res_t h_res_ptrs;
@@ -178,7 +186,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     h_res_ptrs.mqe_t = d_mqe_t;
     h_res_ptrs.mte = d_mte;
     h_res_ptrs.mte_q = d_mte_q;
-    cudaMemcpy(device_res, &h_res_ptrs, sizeof(gasal_res_t), cudaMemcpyHostToDevice);
+
+    // Verify device_res is valid before using it
+    if (device_res == NULL) {
+        fprintf(stderr, "[ERROR] device_res is NULL. Device memory allocation may have failed.\n");
+        return;
+    }
+
+    CHECKCUDAERROR(cudaMemcpy(device_res, &h_res_ptrs, sizeof(gasal_res_t), cudaMemcpyHostToDevice));
 
     // ========== BATCHED PROCESSING LOOP ==========
     int tasks_processed = 0;

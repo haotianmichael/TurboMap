@@ -1310,9 +1310,17 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         if (i == cnt1 - 1 || (a[as1+i].y&MM_SEED_LONG_JOIN) || 
             (qe - qs >= opt->min_ksw_len && re - rs >= opt->min_ksw_len)) {
             int bw1 = bw_long;
-            if (a[as1+i].y & MM_SEED_LONG_JOIN)
-                bw1 = qe - qs > re - rs? qe - qs : re - rs;
-            
+				int max_seq_len = qe - qs > re - rs ? qe - qs : re - rs;
+
+            if (a[as1+i].y & MM_SEED_LONG_JOIN) {
+                bw1 = max_seq_len;
+            } else {
+                // Limit bandwidth to avoid alignment wandering too far
+                // Use 2x sequence length to allow for reasonable indels
+                if (bw1 > max_seq_len * 2) {
+                    bw1 = max_seq_len * 2;
+                }
+            }
             if (opt->flag & MM_F_QSTRAND) {
                 qseq = &qseq0[0][qs];
                 mm_idx_getseq2(mi, rev, rid, rs, re, tseq);
@@ -1340,7 +1348,7 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
 	            task_ctx.ref_rs = rs;
 	            task_ctx.ref_re = re;
                 mm_align_pair_batched(gpu_batch, opt, qe - qs, qseq, re - rs, tseq, junc, mat,
-                                     bw1, -1, opt->zdrop, extra_flag|KSW_EZ_APPROX_MAX,
+                                     bw1, -1, opt->zdrop, extra_flag,
                                      read_idx, reg_idx, GPU_TASK_GAP_FILL, i, task_ctx);
             }
             rs = re, qs = qe;

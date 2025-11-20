@@ -519,6 +519,7 @@ __global__ void ksw_backtrack_kernel(
     int *cigar_lengths,             // CIGAR长度输出
     int max_cigar_len,              // 每个task的最大CIGAR长度
     int max_backtrack_size,         // 每个task的回溯缓冲区大小
+    int max_antidiag,               // NEW: stride for off/off_end arrays (fixed per-task size)
     int32_t *d_flag,                // 标志位
     int n_tasks                    // 任务数量
 )
@@ -552,8 +553,9 @@ __global__ void ksw_backtrack_kernel(
     
     // ========== 获取缓冲区指针 ==========
     uint8_t *p = backtrack_p + (size_t)task_id * max_backtrack_size;
-    int *off = backtrack_off + (size_t)task_id * (qlen + tlen);
-    int *off_end = backtrack_off_end + (size_t)task_id * (qlen + tlen);
+    // CRITICAL: Use max_antidiag stride, NOT (qlen+tlen), to match memory allocation
+    int *off = backtrack_off + (size_t)task_id * max_antidiag;
+    int *off_end = backtrack_off_end + (size_t)task_id * max_antidiag;
     uint32_t *cigar = cigar_buffer + (size_t)task_id * max_cigar_len;
     
     // ========== 回溯参数 ==========
@@ -691,6 +693,7 @@ __global__ void ksw_semi_global_cuda_kernel(
     int *backtrack_off_end,
     int *backtrack_n_col,
     int max_backtrack_size,
+    int max_antidiag,           // NEW: stride for off/off_end arrays (fixed per-task size)
     ksw_extz_t *ez_array,
     void *d_temp_buffer,       
     int *d_flag,
@@ -856,8 +859,9 @@ __global__ void ksw_semi_global_cuda_kernel(
     int right_align = !!(flag & KSW_EZ_RIGHT);    // gap右对齐 vs 左对齐
 
     uint8_t *p = backtrack_p + (size_t)task_id * max_backtrack_size;
-    int *off = backtrack_off + (size_t)task_id * (qlen + tlen);
-    int *off_end = backtrack_off_end + (size_t)task_id * (qlen + tlen);
+    // CRITICAL: Use max_antidiag stride, NOT (qlen+tlen), to match memory allocation
+    int *off = backtrack_off + (size_t)task_id * max_antidiag;
+    int *off_end = backtrack_off_end + (size_t)task_id * max_antidiag;
 
     // ========== Main DP loop (anti-diagonal traversal) ==========
     // r是反对角线编号: r=0时(q=qlen-1,t=0), r=qlen+tlen-2时(q=0,t=tlen-1)
@@ -880,11 +884,6 @@ __global__ void ksw_semi_global_cuda_kernel(
 
         st0 = st;
         en0 = en;
-        // CRITICAL: Align st/en to 16-byte boundaries to match CPU backtrack array layout
-        // CPU does: st = st / 16 * 16, en = (en + 16) / 16 * 16 - 1
-        // This ensures off[r] aligns with n_col stride (which is also 16-byte aligned)
-        st = (st / 16) * 16;
-        en = ((en + 16) / 16) * 16 - 1;
 
         // ========== Initialize boundary conditions ==========
         int8_t x1, v1, x21;
@@ -953,16 +952,6 @@ __global__ void ksw_semi_global_cuda_kernel(
         
         uint8_t *pr = with_cigar ? (p + (size_t)r * n_col) : NULL;
         
-        // CRITICAL: Initialize aligned padding region [st, st0) with default direction (0)
-        // to match CPU which writes entire 16-byte SIMD blocks
-        if (pr != NULL) {
-            for (int t = st; t < st0; ++t) {
-                pr[t - st] = 0;  // default: match from s[t]
-            }
-            for (int t = en0 + 1; t <= en; ++t) {
-                pr[t - st] = 0;  // default: match from s[t]
-            }
-        }
         // ========== DP recurrence (three modes) ==========
         
         if (!with_cigar) {

@@ -352,6 +352,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                            ((32 * (8 * (g_config.slice_width + 1))) + 28) * sizeof(int32_t);
         cudaFuncSetAttribute(agatha_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);
 
+        // Calculate max_antidiag from dev_mem (should match plmem.cu allocation)
+        int max_antidiag = dev_mem->max_align_backtrack_size / 752;  // backtrack_size / (bandwidth+1)
+
         // ===== KSW Alignment Kernel (Phase 1: Compute scores and save backtrack) =====
         ksw_semi_global_cuda_kernel<<<kernel_blocks, kernel_threads,
                         shared_mem>>>(
@@ -368,6 +371,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             d_backtrack_off_end,
             d_backtrack_n_col,
             max_backtrack_size,
+            max_antidiag,       // CRITICAL: stride for off/off_end arrays
             (ksw_extz_t*)d_ez_array,
             (uint8_t*)d_ksw_temp_buffer,
             d_flag,
@@ -393,6 +397,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 d_cigar_lengths,
                 max_cigar_len,
                 max_backtrack_size,
+                max_antidiag,       // CRITICAL: stride for off/off_end arrays
                 d_flag,
                 batch_size
             );

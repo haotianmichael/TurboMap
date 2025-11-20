@@ -1330,11 +1330,6 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
         // 处理CIGAR（左扩展需要反向）
         if (has_valid_alignment && task->n_cigar > 0) {
             uint32_t *cigar = gpu_batch->cigar_buffer + task->cigar_offset;
-			    // Debug: show CIGAR buffer content
-            for (int k = 0; k < task->n_cigar && k < 10; k++) {
-                uint32_t op = cigar[k] & 0xf;
-                uint32_t len = cigar[k] >> 4;
-            }
 
             if (task->task_type == GPU_TASK_LEFT_EXT) {
                 // 左扩展的CIGAR需要反向
@@ -1347,12 +1342,50 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             } else {
                 mm_append_cigar(r, task->n_cigar, cigar);
             }
+			// For GAP_FILL tasks: if alignment terminated early, add CIGAR ops to cover unaligned region
+            if (task->task_type == GPU_TASK_GAP_FILL && has_valid_alignment) {
+                int aligned_qlen = task->max_q + 1;
+                int aligned_tlen = task->max_t + 1;
+                int expected_qlen = task->task_ctx.ref_qe - task->task_ctx.ref_qs;
+                int expected_tlen = task->task_ctx.ref_re - task->task_ctx.ref_rs;
+
+                if (aligned_tlen < expected_tlen || aligned_qlen < expected_qlen) {
+                    // Alignment terminated early - need to fill the gap
+                    int remaining_qlen = expected_qlen - aligned_qlen;
+                    int remaining_tlen = expected_tlen - aligned_tlen;
+
+                    // Add CIGAR operations to cover the remaining region
+                    if (remaining_qlen > 0 && remaining_tlen > 0) {
+                        // Both query and target have remaining bases
+                        int min_len = remaining_qlen < remaining_tlen ? remaining_qlen : remaining_tlen;
+                        uint32_t match_op = min_len << 4 | MM_CIGAR_MATCH;
+                        mm_append_cigar(r, 1, &match_op);
+
+                        if (remaining_tlen > remaining_qlen) {
+                            uint32_t del_op = (remaining_tlen - remaining_qlen) << 4 | MM_CIGAR_DEL;
+                            mm_append_cigar(r, 1, &del_op);
+                        } else if (remaining_qlen > remaining_tlen) {
+                            uint32_t ins_op = (remaining_qlen - remaining_tlen) << 4 | MM_CIGAR_INS;
+                            mm_append_cigar(r, 1, &ins_op);
+                        }
+                    } else if (remaining_tlen > 0) {
+                        // Only target has remaining bases - add deletion
+                        uint32_t del_op = remaining_tlen << 4 | MM_CIGAR_DEL;
+                        mm_append_cigar(r, 1, &del_op);
+                    } else if (remaining_qlen > 0) {
+                        // Only query has remaining bases - add insertion
+                        uint32_t ins_op = remaining_qlen << 4 | MM_CIGAR_INS;
+                        mm_append_cigar(r, 1, &ins_op);
+                    }
+                }
+            }
         }
         
         // 累积score
         if (has_valid_alignment && r->p && task->score > 0) {
+			int old_score = r->p->dp_score;
             r->p->dp_score += task->score;
-        }
+        } 
         
         // 根据任务类型更新边界
         switch (task->task_type) {
@@ -1416,10 +1449,11 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                     re1 = task->task_ctx.ref_re;
                     qe1 = task->task_ctx.ref_qe;
                 } else {
-					 // 正常填充或无效对齐：更新终点到gap的终点（ref_qe/ref_re）
-                    // 即使任务失败（qlen=0或tlen=0），也要更新坐标以保持连续性
+					// Normal GAP_FILL: update to end of gap
+                    // Note: We add filler CIGAR ops for early termination above,
+                    // so we can always use ref_re/ref_qe here
                     re1 = task->task_ctx.ref_re;
-                    qe1 = task->task_ctx.ref_qe;
+                    qe1 = task->task_ctx.ref_qe;	
                 }
                 // rs1/qs1保持不变（已经由左扩展或初始化确定）
                 break;
@@ -1468,7 +1502,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 if(!rev || (opt->flag & MM_F_QSTRAND)) {
                     qseq = ctx->qseq0[0] + qs1;
                 } else {
-                    qseq = ctx->qseq0[1] + (qlen - qe1);
+					qseq = ctx->qseq0[1] + qs1;  // Fix: use qs1, not qlen-qe1
                 }
                 uint8_t *tseq = (uint8_t*)kmalloc(km, re1 - rs1);
                 mm_idx_getseq(mi, task->task_ctx.rid, rs1, re1, tseq);

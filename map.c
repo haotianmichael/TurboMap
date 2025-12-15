@@ -1213,8 +1213,8 @@ static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
     
     // Conservative estimates for task and buffer requirements
     int estimated_tasks = n_reads * 5000; // ~200 tasks per read on average
-    size_t estimated_seq_size = n_reads * (1024 * 1024); // ~1MB sequences per read
-	size_t estimated_cigar_bytes = n_reads * (1024 * 1024); // ~1MB CIGAR per read (in bytes)
+    size_t estimated_seq_size = n_reads * (4 * 1024 * 1024); // ~1MB sequences per read
+	size_t estimated_cigar_bytes = n_reads * (4 * 1024 * 1024); // ~1MB CIGAR per read (in bytes)
     size_t estimated_cigar_size = estimated_cigar_bytes / sizeof(uint32_t); // Convert to uint32_t count
 
     

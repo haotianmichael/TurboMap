@@ -447,11 +447,13 @@ void plchain_cal_score_async(chain_read_t **reads_, int *n_read_, Misc misc, str
     pairsort(long_segs_og, map, num_long_seg);
 
     #ifdef DEBUG_VERBOSE
-    auto last_length = long_segs_og[map[0]].end_idx - long_segs_og[map[0]].start_idx;
-    for (int i = 1; i < num_long_seg; i++){
-        auto this_length = long_segs_og[map[i]].end_idx - long_segs_og[map[i]].start_idx;
-        if (this_length > last_length)
-            fprintf(stderr, "Failed sort at: %d - %u\n", i, map[i]);
+    if(num_long_seg != 0) {
+        auto last_length = long_segs_og[map[0]].end_idx - long_segs_og[map[0]].start_idx;
+        for (int i = 1; i < num_long_seg; i++){
+            auto this_length = long_segs_og[map[i]].end_idx - long_segs_og[map[i]].start_idx;
+            if (this_length > last_length)
+                fprintf(stderr, "Failed sort at: %d - %u\n", i, map[i]);
+        }
     }
     #endif // DEBUG_VERBOSE
     free(long_segs_og);

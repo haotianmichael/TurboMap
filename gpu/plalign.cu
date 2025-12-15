@@ -1,6 +1,7 @@
 #include "plalign.cuh"
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
+#include "plksw_kernel.cuh"
 #include <algorithm>
 
 
@@ -318,7 +319,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         );
 
         // Launch sorting kernel
-        agatha_sort<<<kernel_blocks, kernel_threads>>>(
+        ksw_sort<<<kernel_blocks, kernel_threads>>>(
             d_packed_query,
             d_packed_target,
             d_query_lens,
@@ -350,14 +351,18 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         // Configure and launch AGATHA kernel
         size_t shared_mem = (kernel_threads / 32) *
                            ((32 * (8 * (g_config.slice_width + 1))) + 28) * sizeof(int32_t);
-        cudaFuncSetAttribute(agatha_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);
+        //cudaFuncSetAttribute(agatha_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);
 
         // Calculate max_antidiag from dev_mem (should match plmem.cu allocation)
         int max_antidiag = dev_mem->max_align_backtrack_size / 752;  // backtrack_size / (bandwidth+1)
 
         // ===== KSW Alignment Kernel (Phase 1: Compute scores and save backtrack) =====
-        ksw_semi_global_cuda_kernel<<<kernel_blocks, kernel_threads,
-                        shared_mem>>>(
+        int parallel_threads = 32;  // One warp per block
+        int parallel_blocks = batch_size;  // One block per task
+        size_t parallel_smem = 3072;  // Shared memory per SM: 98,304 bytes-> blocks per SM: min(32, 98,304 ÷ 3,072) = min(32, 32) = 32 blocks
+
+        ksw_semi_global_kernel<<<parallel_blocks, parallel_threads,
+                        parallel_smem>>>(
             d_packed_query,
             d_packed_target,
             d_query_lens,
@@ -371,7 +376,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             d_backtrack_off_end,
             d_backtrack_n_col,
             max_backtrack_size,
-            max_antidiag,       // CRITICAL: stride for off/off_end arrays
+            max_antidiag,
             (ksw_extz_t*)d_ez_array,
             (uint8_t*)d_ksw_temp_buffer,
             d_flag,
@@ -380,7 +385,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             5,  // m = alphabet size(ACGTN)
             opt->zdrop,
             opt->end_bonus
-        );
+        ); 
 
         // ===== KSW Backtracking Kernel (Phase 2: Generate CIGAR) =====
         if (cigar_buffer) {

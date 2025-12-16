@@ -27,7 +27,7 @@ typedef struct {
 
 seeded_queue_t* init_seeded_queue(int capacity, int n_workers) {
     seeded_queue_t *q = (seeded_queue_t*)malloc(sizeof(seeded_queue_t));
-    q->reads = (chain_read_t*)malloc(capacity * sizeof(chain_read_t));
+    q->reads = (chain_read_t*)calloc(capacity, sizeof(chain_read_t));  // Use calloc to zero-initialize
     q->capacity = capacity;
     q->count = 0;
     q->head = 0;
@@ -43,6 +43,13 @@ seeded_queue_t* init_seeded_queue(int capacity, int n_workers) {
 // Destroy global seeded queue
 void destroy_seeded_queue(seeded_queue_t *q) {
     if (q) {
+        // Free any remaining allocated memory in queue slots
+        for (int i = 0; i < q->capacity; i++) {
+            if (q->reads[i].qlens) free(q->reads[i].qlens);
+            if (q->reads[i].qseqs) free(q->reads[i].qseqs);
+            if (q->reads[i].mini_pos) free(q->reads[i].mini_pos);
+            if (q->reads[i].a) free(q->reads[i].a);
+        }
         free(q->reads);
         pthread_mutex_destroy(&q->mutex);
         pthread_cond_destroy(&q->not_empty);
@@ -64,11 +71,43 @@ void push_seeded_read(seeded_queue_t *q, chain_read_t *read) {
     // Deep copy read to queue - 使用malloc分配独立内存
     chain_read_t *queue_read = &q->reads[q->tail];
     
-    // Copy basic fields
-    *queue_read = *read;
-    
-    // Deep copy qlens
-    if (read->n_seg > 0) {
+   // Free any old data at this position (should be NULL after pop, but check anyway)
+    if (queue_read->qlens) {
+        free(queue_read->qlens);
+        queue_read->qlens = NULL;
+    }
+    if (queue_read->qseqs) {
+        free(queue_read->qseqs);
+        queue_read->qseqs = NULL;
+    }
+    if (queue_read->mini_pos) {
+        free(queue_read->mini_pos);
+        queue_read->mini_pos = NULL;
+    }
+    if (queue_read->a) {
+        free(queue_read->a);
+        queue_read->a = NULL;
+    }
+
+    // Copy non-pointer fields manually to avoid copying pointers from kmalloc
+    queue_read->seq = read->seq;
+    queue_read->n_seg = read->n_seg;
+    queue_read->rep_len = read->rep_len;
+    queue_read->frag_gap = read->frag_gap;
+    queue_read->n_mini_pos = read->n_mini_pos;
+    queue_read->n = read->n;
+    queue_read->n_u = read->n_u;
+    queue_read->thread_id = read->thread_id;
+
+    // Now initialize all pointers to NULL first
+    queue_read->qlens = NULL;
+    queue_read->qseqs = NULL;
+    queue_read->mini_pos = NULL;
+    queue_read->a = NULL;
+    queue_read->u = NULL;
+
+    // Deep copy qlens and qseqs
+    if (read->n_seg > 0 && read->qlens && read->qseqs) { 
         queue_read->qlens = (int*)malloc(sizeof(int) * read->n_seg);
         memcpy(queue_read->qlens, read->qlens, sizeof(int) * read->n_seg);
         
@@ -77,13 +116,13 @@ void push_seeded_read(seeded_queue_t *q, chain_read_t *read) {
     }
     
     // Deep copy mini_pos
-    if (read->n_mini_pos > 0) {
+    if (read->n_mini_pos > 0 && read->mini_pos) {
         queue_read->mini_pos = (uint64_t*)malloc(read->n_mini_pos * sizeof(uint64_t));
         memcpy(queue_read->mini_pos, read->mini_pos, read->n_mini_pos * sizeof(uint64_t));
     }
     
     // Deep copy anchors array
-    if (read->n > 0) {
+    if (read->n > 0  && read->a) {
         queue_read->a = (mm128_t*)malloc(read->n * sizeof(mm128_t));
         memcpy(queue_read->a, read->a, read->n * sizeof(mm128_t));
     }
@@ -113,6 +152,12 @@ int pop_seeded_read(seeded_queue_t *q, chain_read_t *read) {
     
     // Pop read from queue
     *read = q->reads[q->head];
+    // Clear the pointers in queue to prevent double free
+    q->reads[q->head].qlens = NULL;
+    q->reads[q->head].qseqs = NULL;
+    q->reads[q->head].mini_pos = NULL;
+    q->reads[q->head].a = NULL;
+    q->reads[q->head].u = NULL;
     q->head = (q->head + 1) % q->capacity;
     q->count--;
     

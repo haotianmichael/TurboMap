@@ -110,6 +110,11 @@ typedef struct {
     size_t max_align_seq_bytes;   // max sequence bytes
     size_t max_align_query_len;   // max query length
 
+    // Two-tier batch processing configuration
+    size_t short_task_batch_size; // batch size for short tasks (max(qlen,tlen) <= 1000bp)
+    size_t long_task_batch_size;  // batch size for long tasks (max(qlen,tlen) > 1000bp)
+    size_t short_task_max_len;    // max sequence length for short tasks (1000bp)
+    
     // Sequence data
     uint8_t *d_align_unpacked_query;
     uint8_t *d_align_unpacked_target;

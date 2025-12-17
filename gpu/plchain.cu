@@ -199,36 +199,23 @@ int plchain_schedule_stream(const streamSetup_t stream_setup, const int batchid)
  * Finish and cleanup the stream, save primary chain results to unpinned CPU memory.  
  * RETURN: number of reads in last batch 
 */
-int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id, Misc misc, void* km){
-    int n_reads = 0; // Number of reads in the batch
-
-#if defined(DEBUG_CHECK)
-    planalyze_long_kernel(stream_setup.streams[stream_id], kernel_throughput);
-#endif  // DEBUG_CHECK
-
-#ifdef DEBUG_PRINT
-    kernel_mem_usage[score_kernel_config.micro_batch] = (float)(*stream_setup.streams[stream_id].long_mem.total_long_segs_n)/stream_setup.long_seg_buffer_size_stream*100;
-
-    float kernel_runtime_ms[MAX_MICRO_BATCH + 1] = {0};
-    float kernel_throughput_anchors[MAX_MICRO_BATCH + 1] = {0};
-    cudaEventElapsedTime(&kernel_runtime_ms[score_kernel_config.micro_batch], stream_setup.streams[stream_id].long_kernel_event, stream_setup.streams[stream_id].stopevent);
-    kernel_throughput_anchors[score_kernel_config.micro_batch] = *stream_setup.streams[stream_id].long_mem.total_long_segs_n / kernel_runtime_ms[score_kernel_config.micro_batch] / (float)1000;
-#endif
-
-
+int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id, 
+                            Misc misc, void* km)
+{
+    int n_reads = 0;
+    
     seg_t* long_segs = stream_setup.streams[stream_id].long_mem.long_segs_og_idx;
     size_t long_seg_idx = 0;
     size_t long_i = 0;
+    
     for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) {
         if (stream_setup.streams[stream_id].host_mems[uid].size == 0) continue;
-        // regorg long to each host mem ptr
-        // NOTE: this is the number of long segs till this microbatch
-        unsigned int long_segs_num = stream_setup.streams[stream_id].host_mems[uid].long_segs_num[0];
-#ifdef DEBUG_VERBOSE
-    fprintf(stderr, "[Debug] %s (%s:%d) MICROBATCH$%d FINISHED: long seg %lu - %u", 
-                __func__, __FILE__, __LINE__, uid, long_seg_idx, long_segs_num);
-#endif // DEBUG_VERBOSE
+        
+        unsigned int long_segs_num = 
+            stream_setup.streams[stream_id].host_mems[uid].long_segs_num[0];
         size_t total_n_long_segs = 0;
+        
+        // Copy long segment results back
         for (; long_seg_idx < long_segs_num; long_seg_idx++) {
             for (size_t i = long_segs[long_seg_idx].start_idx;
                  i < long_segs[long_seg_idx].end_idx; i++, long_i++) {
@@ -237,61 +224,26 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id, Misc misc
                 stream_setup.streams[stream_id].host_mems[uid].p[i] =
                     stream_setup.streams[stream_id].long_mem.p_long[long_i];
             }
-            total_n_long_segs += long_segs[long_seg_idx].end_idx - long_segs[long_seg_idx].start_idx;
+            total_n_long_segs += 
+                long_segs[long_seg_idx].end_idx - long_segs[long_seg_idx].start_idx;
         }
-
-        // backtrack after p/f is copied
+        
         plchain_backtracking(&stream_setup.streams[stream_id].host_mems[uid],
                             &stream_setup.streams[stream_id].dev_mem,
                             stream_setup.streams[stream_id].reads + n_reads, misc, km);
-        // accumulate n_reads
+        
         n_reads += stream_setup.streams[stream_id].host_mems[uid].size;
-#ifdef DEBUG_PRINT
-        cudaEventElapsedTime(&kernel_runtime_ms[uid], stream_setup.streams[stream_id].short_kernel_start_event[uid], stream_setup.streams[stream_id].short_kernel_stop_event[uid]);
-        kernel_throughput_anchors[uid] =
-            (stream_setup.streams[stream_id].host_mems[uid].total_n - total_n_long_segs) /
-            kernel_runtime_ms[uid] / (float)1000;
-#ifdef DEBUG_VERBOSE
-        fprintf(stderr, ", %.2f%% anchors are in long segs. \n", (float)total_n_long_segs /  stream_setup.streams[stream_id].host_mems[uid].total_n * 100);
-#endif // DEBUG_VERBOSE
-#endif // DEBUG_PRINT
     }
-
-#ifdef DEBUG_PRINT
-    fprintf(stderr, "----------------------------------------------------------------------------\n                  ");
-    for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) fprintf(stderr, "Short%d     ", uid);
-    fprintf(stderr, "Long\n");
-    fprintf(stderr, "----------------------------------------------------------------------------\n");
-    fprintf(stderr, "Mem Usage  = ");
-    for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) fprintf(stderr, " %9.2f%%", kernel_mem_usage[uid]);
-    fprintf(stderr, " %9.2f %%\n", kernel_mem_usage[score_kernel_config.micro_batch]);
-    fprintf(stderr, "Runtime(s) = ");
-    for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) fprintf(stderr, "%11.2f", kernel_runtime_ms[uid] / 1000);
-    fprintf(stderr, " %11.2f\n", kernel_runtime_ms[score_kernel_config.micro_batch] / 1000);
-    fprintf(stderr, "BW (Ma/s)  = ");
-    for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) fprintf(stderr, "%11.2f", kernel_throughput_anchors[uid]);
-    fprintf(stderr, " %11.2f\n", kernel_throughput_anchors[score_kernel_config.micro_batch]);
-    fprintf(stderr, "BW(Mpair/s)= ");
-        for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) fprintf(stderr, "%11.2f", kernel_throughput[uid]);
-    fprintf(stderr, " %11.2f\n", kernel_throughput[score_kernel_config.micro_batch]);
-    fprintf(stderr, "----------------------------------------------------------------------------\n");
-    if (kernel_mem_usage[score_kernel_config.micro_batch] > 99){
-        fprintf(stderr,
-                "[WARNING] long segment buffer is full. Consider increase "
-                "long_seg_buffer_size to improve performance.\n");
-    }
-#endif 
-
+    
     return n_reads;
-} 
-
+}
 
 /* 
  * 1. synchronize stream and process previous batch. cleanup stream
  * 2. launch kernels (asynchornizely) for the input batch 
  */
 
-void plchain_cal_score_async(chain_read_t **reads_, int *n_read_, Misc misc, streamSetup_t stream_setup, int thread_id, void* km){
+void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t **reads_, int *n_read_, Misc misc, streamSetup_t stream_setup, int thread_id, void* km){
 	cudaSetDevice(CUDA_DEVICE);
     chain_read_t* reads = *reads_;
     *reads_ = NULL;
@@ -305,6 +257,13 @@ void plchain_cal_score_async(chain_read_t **reads_, int *n_read_, Misc misc, str
         *n_read_ = plchain_post_gpu_helper(stream_setup, stream_id, misc, km);
         *reads_ = stream_setup.streams[stream_id].reads;
         stream_setup.streams[stream_id].busy = false;
+
+        if (*reads_) {
+            chain_read_t* out_arr = *reads_;
+            for (int i = 0; i < *n_read_; i++) {
+                post_chaining_helper(mi, opt, &out_arr[i], misc, km);
+            }
+        }
     }
 
 #ifdef DEBUG_PRINT
@@ -509,14 +468,7 @@ void chain_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t *
     // assume only one seg. and qlen_sum desn't matter
     assert(opt->max_frag_len <= 0);
     Misc misc = build_misc(mi, opt, 0, 1);
-    plchain_cal_score_async(in_arr_, n_read_, misc, stream_setup, thread_id, km);
-    if (in_arr_) {
-        int n_read = *n_read_;
-        chain_read_t* out_arr = *in_arr_;
-        for (int i = 0; i < n_read; i++) {
-            post_chaining_helper(mi, opt, &out_arr[i], misc, km);
-        }
-    }
+    plchain_cal_score_async(mi, opt, in_arr_, n_read_, misc, stream_setup, thread_id, km);
 }
 
 

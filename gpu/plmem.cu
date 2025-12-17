@@ -164,7 +164,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
 
     // ========== Backtrack Buffers ==========
     // Use anchor_per_batch as max size for backtracking
-    dev_mem->max_backtrack_n = anchor_per_batch;
+    /*dev_mem->max_backtrack_n = anchor_per_batch;
     size_t bt_f_size = dev_mem->max_backtrack_n * sizeof(int32_t);
     size_t bt_p_size = dev_mem->max_backtrack_n * sizeof(uint16_t);
     size_t bt_v_size = dev_mem->max_backtrack_n * sizeof(int32_t);
@@ -180,7 +180,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_bt_n_v, sizeof(int32_t));
 
     size_t bt_total = bt_f_size + bt_p_size + bt_v_size + bt_t_size + bt_u_size + 2*sizeof(int32_t);
-    fprintf(stderr, " [Chain] Total backtrack buffers: %.2f MB\n", bt_total / (1024.0*1024.0));
+    fprintf(stderr, " [Chain] Total backtrack buffers: %.2f MB\n", bt_total / (1024.0*1024.0));*/
 
     // ========== Alignment Buffers ==========
     // Configuration for alignment
@@ -210,23 +210,27 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_align_target_lens, metadata_size);
     cudaMalloc(&dev_mem->d_align_flag, metadata_size);
 
-    // AGATHA global buffer (28 blocks * 32 threads/warp * max_query_len * 4)
+    // global buffer (28 blocks * 32 threads/warp * max_query_len * 4)
     size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_query_len * 4;
     size_t global_buffer_bytes = global_buffer_size * sizeof(short2);
     cudaMalloc(&dev_mem->d_align_global_buffer, global_buffer_bytes);
 
-    // KSW temp buffer (225 concurrent tasks)
+    size_t short_task_batch_size = 7000; // For tasks with max(qlen, tlen) <= 1000bp
+    size_t long_task_batch_size = 128;    // For tasks with max(qlen, tlen) > 1000bp
+    size_t short_task_max_len = 1000;     // Max qlen or tlen for short tasks
+
+    // KSW temp buffer (sized for short_task_batch_size concurrent tasks)
     size_t max_len = dev_mem->max_align_query_len;
     size_t H_size = max_len * sizeof(int32_t);
     size_t u8_arrays_size = (max_len + 1) * 7 * sizeof(int8_t);
     size_t seq_size = max_len * 2 * sizeof(uint8_t);
     size_t raw_size = H_size + u8_arrays_size + seq_size;
     dev_mem->align_ksw_temp_per_task = (raw_size + 7) & ~7ULL;
-    size_t ksw_temp_bytes = 225 * dev_mem->align_ksw_temp_per_task;
+    size_t ksw_temp_bytes = short_task_batch_size * dev_mem->align_ksw_temp_per_task;
     cudaMalloc(&dev_mem->d_align_ksw_temp_buffer, ksw_temp_bytes);
 
     fprintf(stderr, " [Align] DP buffers: %.2f MB\n", (seq_unpacked_size *2 + seq_packed_size*2 + metadata_size*5 + global_buffer_bytes + ksw_temp_bytes) / (1024.0*1024.0));
-    // Backtrack buffers (must match KSW temp buffer: 225 concurrent tasks)
+    // Backtrack buffers(Strategy: Two-tier allocation for short vs long tasks)
     // ==================== Backtrack Buffers ====================
     // Purpose: Store information for CIGAR generation (alignment path reconstruction)
     //
@@ -245,25 +249,45 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     //
     // backtrack_n_col[]: The n_col value for each task
     //   - Size per task: 1 integer
-    // Note: kernel launches with 28 blocks, each block can process tasks independently
-    // We need enough buffers for concurrent task processing within GPU
-   // OPTIMIZATION: Backtrack buffer for batched execution
-    // Strategy: Process 100K+ tasks in batches of ~200 tasks each
-    // - Each batch: DP + Backtrack (with CIGAR generation)
-    // - Memory per batch: backtrack_p = 200 × 100k × 752 ≈ 14.3GB
-    // - Total with chain buffers (~3GB): ~17GB, safely fits in 24GB GPU
-    // - This enables processing 100K+ tasks/batch with full CIGAR output
-    size_t alloc_tasks = 200;  // Increased from 60 for batched processing
-    // Kernel uses (qlen + tlen) for backtrack_off indexing, not (qlen + tlen - 1)
-    // So max_antidiag should be 2 * max_query_len to cover qlen=max and tlen=max
-    size_t max_antidiag = 2 * dev_mem->max_align_query_len;
+    //=============================================================
+    // SHORT TASKS (max(qlen, tlen) <= 1000bp, ~90% of workload):
+    //   - Allocate based on 1000bp max per sequence
+    //   - Backtrack size per task: (1000+1000) × 752 = 1.5MB
+    //   - With 32GB GPU memory, ~28GB available for backtrack
+    //   - Theoretical max: 28GB / 1.5MB ≈ 18,000 tasks
+    //   - Conservative allocation: 10,000 tasks (accounts for DP buffers, safety margin)
+    //   - Memory: 10,000 × 1.5MB ≈ 15GB backtrack + other buffers ≈ 18GB total
+    //
+    // LONG TASKS (max(qlen, tlen) > 1000bp, ~10% of workload):
+    //   - Allocate based on max length (50000bp)
+    //   - Backtrack size per task: (50000+50000) × 752 = 75MB
+    //   - Batch size: 200 tasks (original conservative value)
+    //   - Memory: 200 × 75MB ≈ 14.3GB
+    //
+    // Processing flow in plalign.cu:
+    //   1. Scan all tasks, classify by max(qlen, tlen)
+    //   2. Process short tasks first (high throughput, 10,000 at a time)
+    //   3. Process long tasks separately (low throughput, 200 at a time)
+    //
+
+   
+    // Allocate buffers for SHORT tasks (most common case, optimized for throughput)
+    size_t alloc_tasks = short_task_batch_size;
+
+    // Calculate max_antidiag based on SHORT task length (1000bp per sequence)
+    size_t max_antidiag_short = 2 * short_task_max_len;  // 2000 antidiagonals for 1000+1000bp
     size_t max_n_col = 751 + 1;  // bandwidth + 1
-    dev_mem->max_align_backtrack_size = max_antidiag * max_n_col;
-    dev_mem->max_align_cigar_len = 2 * dev_mem->max_align_query_len;
+
+    // Store configuration in deviceMemPtr for plalign.cu to use
+    dev_mem->short_task_batch_size = short_task_batch_size;
+    dev_mem->long_task_batch_size = long_task_batch_size;
+    dev_mem->short_task_max_len = short_task_max_len;
+    dev_mem->max_align_backtrack_size = max_antidiag_short * max_n_col;  // Optimized for short tasks
+    dev_mem->max_align_cigar_len = 2 * short_task_max_len;  // Optimized for short tasks
 
     size_t bt_p_bytes = alloc_tasks * dev_mem->max_align_backtrack_size;
-    size_t bt_off_bytes = alloc_tasks * max_antidiag * sizeof(int);
-    size_t bt_off_end_bytes = alloc_tasks * max_antidiag * sizeof(int);
+    size_t bt_off_bytes = alloc_tasks * max_antidiag_short * sizeof(int);
+    size_t bt_off_end_bytes = alloc_tasks * max_antidiag_short * sizeof(int);
     size_t bt_n_col_bytes = alloc_tasks * sizeof(int);
     size_t cigar_buf_bytes = alloc_tasks * dev_mem->max_align_cigar_len * sizeof(uint32_t);
     size_t cigar_len_bytes = alloc_tasks * sizeof(int);
@@ -277,7 +301,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
 
     // Result structures
     cudaMalloc(&dev_mem->d_align_device_res, sizeof(gasal_res_t));
-    cudaMalloc(&dev_mem->d_align_ez_array, sizeof(ksw_extz_t) * 224);
+    cudaMalloc(&dev_mem->d_align_ez_array, sizeof(ksw_extz_t) * short_task_batch_size);
     cudaMalloc(&dev_mem->d_align_scores, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_query_ends, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_target_ends, dev_mem->max_align_tasks * sizeof(int32_t));
@@ -292,7 +316,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t bck_total = bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes +
                          cigar_buf_bytes + cigar_len_bytes +
                          dev_mem->max_align_tasks * sizeof(int32_t) * 4 +  // scores, ends, and task mapping
-                         sizeof(gasal_res_t) + sizeof(ksw_extz_t) * 224 + 25;  // 25 bytes for d_align_mat
+                         sizeof(gasal_res_t) + sizeof(ksw_extz_t) * short_task_batch_size + 25;  // 25 bytes for d_align_mat
 
     fprintf(stderr, " [Align] Total BackTrack buffers: %.2f GB\n", bck_total / (1024.0*1024.0*1024.0));
 
@@ -300,7 +324,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     // Chain total: sum of all chain-related allocations
     size_t chain_total_all = chain_total + 
                             (idx_total + cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) +
-                            long_total + bt_total;
+                            long_total;
     
     // Align total: DP buffers + BackTrack buffers
     size_t align_dp_total = (seq_unpacked_size *2 + seq_packed_size*2 + 

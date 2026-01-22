@@ -272,9 +272,9 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     int is_qstrand = 0;
     uint32_t hash = 11; // Default seed hash
 
-    // Allocate ONLY temporary buffers (reuse GPU data already uploaded)
+    // Allocate temporary buffers + output buffers for compacted anchors
     int64_t *d_zx, *d_zy, *d_v, *d_p_abs;
-    int32_t *d_t;
+    int32_t *d_t, *d_ax_out, *d_ay_out;
     uint64_t *d_u;
     int *d_n_a, *d_offset, *d_ofs_end, *d_num_elements, *d_n_v, *d_n_u;
     void *d_temp_storage = nullptr;
@@ -285,6 +285,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMalloc(&d_p_abs, sizeof(int64_t) * total_n);
     cudaMalloc(&d_t, sizeof(int32_t) * total_n);
     cudaMalloc(&d_u, sizeof(uint64_t) * total_n);
+    cudaMalloc(&d_ax_out, sizeof(int32_t) * total_n);
+    cudaMalloc(&d_ay_out, sizeof(int32_t) * total_n);
     cudaMalloc(&d_n_a, sizeof(int) * n_reads);
     cudaMalloc(&d_offset, sizeof(int) * n_reads);
     cudaMalloc(&d_ofs_end, sizeof(int) * n_reads);
@@ -352,9 +354,9 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // Step 5: Set chain information
+    // Step 5: Set chain information (write to output buffers)
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
-        d_n_a, n_reads, dev_mem->d_ax, dev_mem->d_ay, d_offset, d_ofs_end,
+        d_n_a, n_reads, d_ax_out, d_ay_out, d_offset, d_ofs_end,
         dev_mem->d_f, d_p_abs, d_u, d_zx, d_zy, d_t, d_v);
 
     cudaStreamSynchronize(stream);
@@ -371,9 +373,9 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     int32_t *h_ax = (int32_t*)malloc(sizeof(int32_t) * total_n);
     int32_t *h_ay = (int32_t*)malloc(sizeof(int32_t) * total_n);
 
-    // Copy compacted anchors from GPU
-    cudaMemcpy(h_ax, dev_mem->d_ax, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ay, dev_mem->d_ay, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
+    // Copy compacted anchors from output buffers
+    cudaMemcpy(h_ax, d_ax_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ay, d_ay_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
 
     // Update read structures
     for (int i = 0; i < n_reads; i++) {
@@ -415,6 +417,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaFree(d_p_abs);
     cudaFree(d_t);
     cudaFree(d_u);
+    cudaFree(d_ax_out);
+    cudaFree(d_ay_out);
     cudaFree(d_n_a);
     cudaFree(d_offset);
     cudaFree(d_ofs_end);

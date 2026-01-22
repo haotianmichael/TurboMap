@@ -33,37 +33,8 @@ __device__ static inline uint32_t __ac_Wang_hash(uint32_t key) {
     return key;
 }
 
-__device__ static inline void mm_cal_fuzzy_len(mm_reg1_t *r, const mm128_t *a)
-{
-    int i;
-    r->mlen = r->blen = 0;
-    if (r->cnt <= 0) return;
-    r->mlen = r->blen = a[r->as].y>>32&0xff;
-    for (i = r->as + 1; i < r->as + r->cnt; ++i) {
-        int span = a[i].y>>32&0xff;
-        int tl = (int32_t)a[i].x - (int32_t)a[i-1].x;
-        int ql = (int32_t)a[i].y - (int32_t)a[i-1].y;
-        r->blen += tl > ql? tl : ql;
-        r->mlen += tl > span && ql > span? span : tl < ql? tl : ql;
-    }
-}
-
-__device__ static inline void mm_reg_set_coor(mm_reg1_t *r, int32_t qlen, const mm128_t *a, int is_qstrand)
-{
-    int32_t k = r->as, q_span = (int32_t)(a[k].y>>32&0xff);
-    r->rev = a[k].x>>63;
-    r->rid = a[k].x<<1>>33;
-    r->rs = (int32_t)a[k].x + 1 > q_span? (int32_t)a[k].x + 1 - q_span : 0;
-    r->re = (int32_t)a[k + r->cnt - 1].x + 1;
-    if (!r->rev || is_qstrand) {
-        r->qs = (int32_t)a[k].y + 1 - q_span;
-        r->qe = (int32_t)a[k + r->cnt - 1].y + 1;
-    } else {
-        r->qs = qlen - ((int32_t)a[k + r->cnt - 1].y + 1);
-        r->qe = qlen - ((int32_t)a[k].y + 1 - q_span);
-    }
-    mm_cal_fuzzy_len(r, a);
-}
+// Note: mm_cal_fuzzy_len and mm_reg_set_coor removed
+// These are not needed since region generation happens on CPU
 
 __device__ static int64_t mg_chain_bk_end(int32_t max_drop, const int64_t *z_x,
                                           const int64_t *z_y, const int32_t *f,
@@ -264,83 +235,9 @@ __global__ void mm_set_chain(int* g_na, int n_task, mm128_t* g_a, int* offset,
     }
 }
 
-// Kernel 4: Prepare data for sorting by score
-__global__ void mm_gen_regs_prep(int* n_a, mm128_t* g_a, uint64_t* g_u,
-                                 int64_t* g_zx, int64_t* g_zy, int* g_n_v,
-                                 int* g_n_u, int* ofs_end, uint32_t hash,
-                                 int* offset, int n_task)
-{
-    int id = threadIdx.x + blockIdx.x * blockDim.x;
-
-    for(int job_idx = id; job_idx < n_task; job_idx += gridDim.x * blockDim.x) {
-        int ofs = offset[job_idx];
-        int n_u = ofs_end[job_idx] - ofs;
-        mm128_t* a = &g_a[ofs];
-
-        int64_t* z_x = &g_zx[ofs];
-        int64_t* z_y = &g_zy[ofs];
-        uint64_t* u = &g_u[ofs];
-
-        if (n_u == 0) {
-            continue;
-        }
-
-        // Prepare for sort by score
-        for (int i = 0, k = 0; i < n_u; ++i) {
-            uint32_t h;
-            h = (uint32_t)hash64((hash64(a[k].x) + hash64(a[k].y)) ^ hash);
-            z_x[i] = u[i] ^ h;
-            z_y[i] = (uint64_t)k << 32 | (int32_t)u[i];
-            k += (int32_t)u[i];
-        }
-    }
-}
-
-// Kernel 5: Generate final region structures after sorting
-__global__ void mm_gen_regs_finalize(int* n_a, mm128_t* g_a, uint64_t* g_u,
-                                     int64_t* g_zx, int64_t* g_zy, int* g_n_v,
-                                     int* g_n_u, int* ofs_end,
-                                     int* offset, int* qlen, int is_qstrand,
-                                     mm_reg1_t* g_regs, int n_task)
-{
-    int id = threadIdx.x + blockIdx.x * blockDim.x;
-
-    for(int job_idx = id; job_idx < n_task; job_idx += gridDim.x * blockDim.x) {
-        int ofs = offset[job_idx];
-        int n_u = ofs_end[job_idx] - ofs;
-        mm128_t* a = &g_a[ofs];
-        int qlen_val = qlen[job_idx];
-
-        int64_t* z_x = &g_zx[ofs];
-        int64_t* z_y = &g_zy[ofs];
-
-        if (n_u == 0) {
-            g_n_u[job_idx] = 0;
-            n_a[job_idx] = 0;
-            continue;
-        }
-
-        // z arrays should now be sorted by calling code using CUB
-
-        // Store the number of regions for this read
-        g_n_u[job_idx] = n_u;
-
-        // Generate region structures
-        for (int i = 0; i < n_u; ++i) {
-            mm_reg1_t *ri = &g_regs[ofs + i];
-            ri->id = i;
-            ri->parent = MM_PARENT_UNSET;
-            ri->score = ri->score0 = z_x[i] >> 32;
-            ri->hash = (uint32_t)z_x[i];
-            ri->cnt = (int32_t)z_y[i];
-            ri->as = z_y[i] >> 32;
-            ri->div = -1.0f;
-            mm_reg_set_coor(ri, qlen_val, a, is_qstrand);
-        }
-
-        n_a[job_idx] = ofs;
-    }
-}
+// Note: mm_gen_regs kernels removed - region generation happens on CPU
+// This matches the CPU version behavior in lchain.c where mg_chain_backtrack
+// returns the compacted anchor array and u metadata, then the CPU generates regs
 
 // Helper to convert relative predecessor to absolute
 __global__ void convert_p_rel_to_abs(uint16_t* p_rel, int64_t* p_abs, int* offset, int* n_a, int n_task)
@@ -373,29 +270,33 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     int is_qstrand = 0;
     uint32_t hash = 11; // Default seed hash
 
-    // Allocate temporary buffers for backtracking
-    int64_t *d_zx, *d_zy, *d_v, *d_p_abs;
-    int32_t *d_t, *d_n_a;
-    uint64_t *d_u;
-    int *d_offset, *d_ofs_end, *d_num_elements, *d_n_v, *d_n_u, *d_qlen;
-    mm128_t *d_a;
-    mm_reg1_t *d_regs;
+    // Check buffer size limits
+    if (total_n > dev_mem->max_backtrack_n) {
+        fprintf(stderr, "[Warning] Backtrack buffer overflow: %zu > %zu\n",
+                total_n, dev_mem->max_backtrack_n);
+        return;
+    }
+    if (n_reads > dev_mem->max_backtrack_reads) {
+        fprintf(stderr, "[Warning] Too many reads for backtrack: %d > %zu\n",
+                n_reads, dev_mem->max_backtrack_reads);
+        return;
+    }
 
-    cudaMalloc(&d_zx, sizeof(int64_t) * total_n);
-    cudaMalloc(&d_zy, sizeof(int64_t) * total_n);
-    cudaMalloc(&d_v, sizeof(int64_t) * total_n);
-    cudaMalloc(&d_p_abs, sizeof(int64_t) * total_n);
-    cudaMalloc(&d_t, sizeof(int32_t) * total_n);
-    cudaMalloc(&d_u, sizeof(uint64_t) * total_n);
-    cudaMalloc(&d_a, sizeof(mm128_t) * total_n);
-    cudaMalloc(&d_regs, sizeof(mm_reg1_t) * total_n);
-    cudaMalloc(&d_n_a, sizeof(int) * n_reads);
-    cudaMalloc(&d_offset, sizeof(int) * n_reads);
-    cudaMalloc(&d_ofs_end, sizeof(int) * n_reads);
-    cudaMalloc(&d_num_elements, sizeof(int) * n_reads);
-    cudaMalloc(&d_n_v, sizeof(int) * n_reads);
-    cudaMalloc(&d_n_u, sizeof(int) * n_reads);
-    cudaMalloc(&d_qlen, sizeof(int) * n_reads);
+    // Use pre-allocated buffers from dev_mem
+    int64_t *d_zx = dev_mem->d_bt_zx;
+    int64_t *d_zy = dev_mem->d_bt_zy;
+    int64_t *d_v = dev_mem->d_bt_v;
+    int64_t *d_p_abs = dev_mem->d_bt_p_abs;
+    int32_t *d_t = dev_mem->d_bt_t;
+    uint64_t *d_u = dev_mem->d_bt_u;
+    mm128_t *d_a = dev_mem->d_bt_a;
+    int *d_n_a = dev_mem->d_bt_n_a;
+    int *d_offset = dev_mem->d_bt_offset;
+    int *d_ofs_end = dev_mem->d_bt_ofs_end;
+    int *d_num_elements = dev_mem->d_bt_num_elements;
+    int *d_n_v = dev_mem->d_bt_n_v;
+    int *d_n_u = dev_mem->d_bt_n_u;
+    int *d_qlen = dev_mem->d_bt_qlen;
 
     // Copy input data to device
     // Convert anchors from host to device format
@@ -435,8 +336,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaStreamSynchronize(stream);
 
     // Step 2: Sort z arrays by score using CUB (per-read segmented sort)
-    void *d_temp_storage = nullptr;
-    size_t temp_storage_bytes = 0;
+    void *d_temp_storage = dev_mem->d_bt_temp_storage;
+    size_t temp_storage_bytes = dev_mem->bt_temp_storage_bytes;
 
     // Determine temporary storage requirements
     cub::DeviceSegmentedRadixSort::SortPairsDescending(
@@ -444,7 +345,13 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         d_zx, d_zx, d_zy, d_zy,
         total_n, n_reads, d_offset, d_ofs_end);
 
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    // Allocate if needed or reallocate if too small
+    if (d_temp_storage == nullptr || temp_storage_bytes > dev_mem->bt_temp_storage_bytes) {
+        if (dev_mem->d_bt_temp_storage) cudaFree(dev_mem->d_bt_temp_storage);
+        cudaMalloc(&dev_mem->d_bt_temp_storage, temp_storage_bytes);
+        dev_mem->bt_temp_storage_bytes = temp_storage_bytes;
+        d_temp_storage = dev_mem->d_bt_temp_storage;
+    }
 
     // Sort descending by score
     cub::DeviceSegmentedRadixSort::SortPairsDescending(
@@ -478,26 +385,9 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // Step 6: Prepare for sort by score
-    mm_gen_regs_prep<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
-        d_n_a, d_a, d_u, d_zx, d_zy, d_n_v, d_n_u, d_ofs_end, hash, d_offset, n_reads);
-
-    cudaStreamSynchronize(stream);
-
-    // Step 7: Sort by score (descending)
-    cub::DeviceSegmentedRadixSort::SortPairsDescending(
-        d_temp_storage, temp_storage_bytes,
-        d_zx, d_zx, d_zy, d_zy,
-        total_n, n_reads, d_offset, d_ofs_end);
-
-    cudaStreamSynchronize(stream);
-
-    // Step 8: Generate final regions
-    mm_gen_regs_finalize<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
-        d_n_a, d_a, d_u, d_zx, d_zy, d_n_v, d_n_u, d_ofs_end,
-        d_offset, d_qlen, is_qstrand, d_regs, n_reads);
-
-    cudaStreamSynchronize(stream);
+    // Note: Steps 6-8 (gen_regs) are not needed here
+    // The CPU side will generate regions from the u array
+    // This matches the CPU version in lchain.c
 
     // Copy results back to host
     int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
@@ -516,27 +406,12 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         }
     }
 
-    // Cleanup
+    // Cleanup (only free host memory, device buffers are pre-allocated)
     free(h_offset);
     free(h_n_a);
     free(h_qlen);
     free(h_n_u);
-    cudaFree(d_zx);
-    cudaFree(d_zy);
-    cudaFree(d_v);
-    cudaFree(d_p_abs);
-    cudaFree(d_t);
-    cudaFree(d_u);
-    cudaFree(d_a);
-    cudaFree(d_regs);
-    cudaFree(d_n_a);
-    cudaFree(d_offset);
-    cudaFree(d_ofs_end);
-    cudaFree(d_num_elements);
-    cudaFree(d_n_v);
-    cudaFree(d_n_u);
-    cudaFree(d_qlen);
-    cudaFree(d_temp_storage);
+    // Note: device buffers are managed by deviceMemPtr and freed in plmem_free_device_mem
 }
 
 void plbacktrack_init_memory(deviceMemPtr *dev_mem, size_t max_anchors)

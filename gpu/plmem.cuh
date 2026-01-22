@@ -96,14 +96,24 @@ typedef struct {
     uint16_t *d_p_long;  // predecessor, size: buffer_size_long * sizeof(uint16_t)
 
     // ========== Backtrack Buffers (unified allocation) ==========
-    size_t max_backtrack_n;  // max number of anchors for backtracking per batch
-    int32_t *d_bt_f;         // backtrack scores
-    uint16_t *d_bt_p_rel;     // backtrack relative predecessors
-    int32_t *d_bt_v;         // backtrack vertices
-    int32_t *d_bt_t;         // backtrack temp markers
-    uint64_t *d_bt_u;        // backtrack chain metadata
-    int32_t *d_bt_n_u;       // backtrack number of chains
-    int32_t *d_bt_n_v;       // backtrack number of vertices
+    size_t max_backtrack_n;      // max number of anchors for backtracking per batch
+    size_t max_backtrack_reads;  // max number of reads for backtracking
+    int64_t *d_bt_zx;            // filtered anchor scores (for sorting)
+    int64_t *d_bt_zy;            // filtered anchor indices (for sorting)
+    int64_t *d_bt_v;             // backtrack vertices (int64_t!)
+    int64_t *d_bt_p_abs;         // backtrack absolute predecessors (int64_t!)
+    int32_t *d_bt_t;             // backtrack temp markers
+    uint64_t *d_bt_u;            // backtrack chain metadata
+    int *d_bt_n_u;               // backtrack number of chains per read
+    int *d_bt_n_v;               // backtrack number of vertices per read
+    int *d_bt_offset;            // anchor offset for each read
+    int *d_bt_ofs_end;           // end offset for each read (after filter/sort)
+    int *d_bt_num_elements;      // number of filtered elements per read
+    int *d_bt_qlen;              // query length for each read
+    int *d_bt_n_a;               // number of anchors per read
+    mm128_t *d_bt_a;             // anchor array (copied for backtrack)
+    void *d_bt_temp_storage;     // CUB temp storage
+    size_t bt_temp_storage_bytes; // CUB temp storage size
 
     // ========== Alignment Buffers (unified allocation) ==========
     size_t max_align_tasks;       // max number of alignment tasks

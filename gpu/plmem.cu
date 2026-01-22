@@ -164,23 +164,40 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
 
     // ========== Backtrack Buffers ==========
     // Use anchor_per_batch as max size for backtracking
-    /*dev_mem->max_backtrack_n = anchor_per_batch;
-    size_t bt_f_size = dev_mem->max_backtrack_n * sizeof(int32_t);
-    size_t bt_p_size = dev_mem->max_backtrack_n * sizeof(uint16_t);
-    size_t bt_v_size = dev_mem->max_backtrack_n * sizeof(int32_t);
+    dev_mem->max_backtrack_n = anchor_per_batch;
+    dev_mem->max_backtrack_reads = 10000;  // Estimate max reads per batch
+
+    size_t bt_zx_size = dev_mem->max_backtrack_n * sizeof(int64_t);
+    size_t bt_zy_size = dev_mem->max_backtrack_n * sizeof(int64_t);
+    size_t bt_v_size = dev_mem->max_backtrack_n * sizeof(int64_t);
+    size_t bt_p_abs_size = dev_mem->max_backtrack_n * sizeof(int64_t);
     size_t bt_t_size = dev_mem->max_backtrack_n * sizeof(int32_t);
     size_t bt_u_size = dev_mem->max_backtrack_n * sizeof(uint64_t);
+    size_t bt_a_size = dev_mem->max_backtrack_n * sizeof(mm128_t);
+    size_t bt_read_meta_size = dev_mem->max_backtrack_reads * sizeof(int);
 
-    cudaMalloc(&dev_mem->d_bt_f, bt_f_size);
-    cudaMalloc(&dev_mem->d_bt_p_rel, bt_p_size);
+    cudaMalloc(&dev_mem->d_bt_zx, bt_zx_size);
+    cudaMalloc(&dev_mem->d_bt_zy, bt_zy_size);
     cudaMalloc(&dev_mem->d_bt_v, bt_v_size);
+    cudaMalloc(&dev_mem->d_bt_p_abs, bt_p_abs_size);
     cudaMalloc(&dev_mem->d_bt_t, bt_t_size);
     cudaMalloc(&dev_mem->d_bt_u, bt_u_size);
-    cudaMalloc(&dev_mem->d_bt_n_u, sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_bt_n_v, sizeof(int32_t));
+    cudaMalloc(&dev_mem->d_bt_a, bt_a_size);
+    cudaMalloc(&dev_mem->d_bt_n_u, bt_read_meta_size);
+    cudaMalloc(&dev_mem->d_bt_n_v, bt_read_meta_size);
+    cudaMalloc(&dev_mem->d_bt_offset, bt_read_meta_size);
+    cudaMalloc(&dev_mem->d_bt_ofs_end, bt_read_meta_size);
+    cudaMalloc(&dev_mem->d_bt_num_elements, bt_read_meta_size);
+    cudaMalloc(&dev_mem->d_bt_qlen, bt_read_meta_size);
+    cudaMalloc(&dev_mem->d_bt_n_a, bt_read_meta_size);
 
-    size_t bt_total = bt_f_size + bt_p_size + bt_v_size + bt_t_size + bt_u_size + 2*sizeof(int32_t);
-    fprintf(stderr, " [Chain] Total backtrack buffers: %.2f MB\n", bt_total / (1024.0*1024.0));*/
+    // CUB temp storage will be allocated dynamically when needed
+    dev_mem->d_bt_temp_storage = nullptr;
+    dev_mem->bt_temp_storage_bytes = 0;
+
+    size_t bt_total = bt_zx_size + bt_zy_size + bt_v_size + bt_p_abs_size + bt_t_size +
+                      bt_u_size + bt_a_size + bt_read_meta_size * 7;
+    fprintf(stderr, " [Chain] Total backtrack buffers: %.2f MB\n", bt_total / (1024.0*1024.0));
 
     // ========== Alignment Buffers ==========
     // Configuration for alignment
@@ -372,13 +389,21 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFree(dev_mem->d_total_n_long);
 
     // Backtrack buffers
-    if (dev_mem->d_bt_f) cudaFree(dev_mem->d_bt_f);
-    if (dev_mem->d_bt_p_rel) cudaFree(dev_mem->d_bt_p_rel);
+    if (dev_mem->d_bt_zx) cudaFree(dev_mem->d_bt_zx);
+    if (dev_mem->d_bt_zy) cudaFree(dev_mem->d_bt_zy);
     if (dev_mem->d_bt_v) cudaFree(dev_mem->d_bt_v);
+    if (dev_mem->d_bt_p_abs) cudaFree(dev_mem->d_bt_p_abs);
     if (dev_mem->d_bt_t) cudaFree(dev_mem->d_bt_t);
     if (dev_mem->d_bt_u) cudaFree(dev_mem->d_bt_u);
+    if (dev_mem->d_bt_a) cudaFree(dev_mem->d_bt_a);
     if (dev_mem->d_bt_n_u) cudaFree(dev_mem->d_bt_n_u);
     if (dev_mem->d_bt_n_v) cudaFree(dev_mem->d_bt_n_v);
+    if (dev_mem->d_bt_offset) cudaFree(dev_mem->d_bt_offset);
+    if (dev_mem->d_bt_ofs_end) cudaFree(dev_mem->d_bt_ofs_end);
+    if (dev_mem->d_bt_num_elements) cudaFree(dev_mem->d_bt_num_elements);
+    if (dev_mem->d_bt_qlen) cudaFree(dev_mem->d_bt_qlen);
+    if (dev_mem->d_bt_n_a) cudaFree(dev_mem->d_bt_n_a);
+    if (dev_mem->d_bt_temp_storage) cudaFree(dev_mem->d_bt_temp_storage);
 
     // Alignment buffers
     if (dev_mem->d_align_unpacked_query) cudaFree(dev_mem->d_align_unpacked_query);

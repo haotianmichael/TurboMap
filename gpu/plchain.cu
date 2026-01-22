@@ -9,6 +9,7 @@
 #include "plmem.cuh"
 #include "plrange.cuh"
 #include "plscore.cuh"
+#include "plbacktrack.cuh"
 #include "plchain.h"
 #include <utility>
 #include <algorithm>
@@ -228,9 +229,11 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id,
                 long_segs[long_seg_idx].end_idx - long_segs[long_seg_idx].start_idx;
         }
         
-        plchain_backtracking(&stream_setup.streams[stream_id].host_mems[uid],
-                            &stream_setup.streams[stream_id].dev_mem,
-                            stream_setup.streams[stream_id].reads + n_reads, misc, km);
+        // Use GPU backtracking instead of CPU
+        plbacktrack_gpu(&stream_setup.streams[stream_id].host_mems[uid],
+                       &stream_setup.streams[stream_id].dev_mem,
+                       stream_setup.streams[stream_id].reads + n_reads, misc, km,
+                       stream_setup.streams[stream_id].cudastream);
         
         n_reads += stream_setup.streams[stream_id].host_mems[uid].size;
     }

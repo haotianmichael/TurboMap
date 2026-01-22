@@ -208,7 +208,8 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
         int64_t *b_y = &g_zy[ofs];
         int64_t *w_x = &g_p[ofs];
         int64_t *w_y = &g_v[ofs];
-        int64_t *u2 = (int64_t*)(&g_t[ofs]);
+        // Reuse g_p for u2 since w_x is no longer needed after sorting
+        int64_t *u2 = &g_p[ofs];
         uint64_t* u = &g_u[ofs];
         int32_t* ax = &g_ax[ofs];
         int32_t* ay = &g_ay[ofs];

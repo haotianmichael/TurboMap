@@ -98,8 +98,8 @@ __global__ void mm_filter_anchors(int* n_a, int* offset, int32_t min_sc,
 }
 
 // Kernel 2: Backtrack filtered anchors in parallel
-__global__ void mm_chain_backtrack_parallel(int* n_a, mm128_t* g_a, int32_t* g_sc,
-                                            int64_t *g_p, uint64_t* g_u,
+__global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_ay,
+                                            int32_t* g_sc, int64_t *g_p, uint64_t* g_u,
                                             int64_t* g_zx, int64_t* g_zy, int32_t* g_t,
                                             int64_t* g_v, int* offset, int32_t min_cnt,
                                             int32_t min_sc, int32_t max_drop,
@@ -128,7 +128,8 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, mm128_t* g_a, int32_t* g_s
 
         int64_t* z_x = &g_zx[ofs];
         int64_t* z_y = &g_zy[ofs];
-        mm128_t* a = &g_a[ofs];
+        int32_t* ax = &g_ax[ofs];
+        int32_t* ay = &g_ay[ofs];
         int32_t* f = &g_sc[ofs];
         int64_t* p = &g_p[ofs];
 
@@ -169,8 +170,8 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, mm128_t* g_a, int32_t* g_s
         for (int i = 0, k = 0; i < n_u; ++i) {
             int32_t k0 = k, ni = (int32_t)u[i];
             for(int j = tid; j < ni; j += blockDim.x){
-                b_x[k + j] = a[v[k0 + (ni-j-1)]].x;
-                b_y[k + j] = a[v[k0 + (ni-j-1)]].y;
+                b_x[k + j] = ax[v[k0 + (ni-j-1)]];
+                b_y[k + j] = ay[v[k0 + (ni-j-1)]];
             }
             k += ni;
             __syncthreads();
@@ -191,8 +192,8 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, mm128_t* g_a, int32_t* g_s
 
 // Kernel 3: Set chain anchor information
 // Note: Sorting is done separately using CUB
-__global__ void mm_set_chain(int* g_na, int n_task, mm128_t* g_a, int* offset,
-                             int* ofs_end, int32_t* g_sc, int64_t *g_p,
+__global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay,
+                             int* offset, int* ofs_end, int32_t* g_sc, int64_t *g_p,
                              uint64_t* g_u, int64_t* g_zx, int64_t* g_zy,
                              int32_t* g_t, int64_t* g_v)
 {
@@ -209,7 +210,8 @@ __global__ void mm_set_chain(int* g_na, int n_task, mm128_t* g_a, int* offset,
         int64_t *w_y = &g_v[ofs];
         int64_t *u2 = (int64_t*)(&g_t[ofs]);
         uint64_t* u = &g_u[ofs];
-        mm128_t* a = &g_a[ofs];
+        int32_t* ax = &g_ax[ofs];
+        int32_t* ay = &g_ay[ofs];
         int n_a = g_na[job_idx];
 
         // w_x and w_y should already be sorted by calling code using CUB
@@ -220,8 +222,8 @@ __global__ void mm_set_chain(int* g_na, int n_task, mm128_t* g_a, int* offset,
             if(tid == 0) u2[i] = u[j];
 
             for(int x = tid; x < n; x += blockDim.x){
-                a[k+x].x = b_x[(w_y[i]>>32)+x];
-                a[k+x].y = b_y[(w_y[i]>>32)+x];
+                ax[k+x] = (int32_t)b_x[(w_y[i]>>32)+x];
+                ay[k+x] = (int32_t)b_y[(w_y[i]>>32)+x];
             }
             k += n;
         }
@@ -270,12 +272,11 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     int is_qstrand = 0;
     uint32_t hash = 11; // Default seed hash
 
-    // Allocate temporary buffers for backtracking (like new GPU version)
+    // Allocate ONLY temporary buffers (reuse GPU data already uploaded)
     int64_t *d_zx, *d_zy, *d_v, *d_p_abs;
     int32_t *d_t;
     uint64_t *d_u;
-    mm128_t *d_a;
-    int *d_n_a, *d_offset, *d_ofs_end, *d_num_elements, *d_n_v, *d_n_u, *d_qlen;
+    int *d_n_a, *d_offset, *d_ofs_end, *d_num_elements, *d_n_v, *d_n_u;
     void *d_temp_storage = nullptr;
 
     cudaMalloc(&d_zx, sizeof(int64_t) * total_n);
@@ -284,40 +285,24 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMalloc(&d_p_abs, sizeof(int64_t) * total_n);
     cudaMalloc(&d_t, sizeof(int32_t) * total_n);
     cudaMalloc(&d_u, sizeof(uint64_t) * total_n);
-    cudaMalloc(&d_a, sizeof(mm128_t) * total_n);
     cudaMalloc(&d_n_a, sizeof(int) * n_reads);
     cudaMalloc(&d_offset, sizeof(int) * n_reads);
     cudaMalloc(&d_ofs_end, sizeof(int) * n_reads);
     cudaMalloc(&d_num_elements, sizeof(int) * n_reads);
     cudaMalloc(&d_n_v, sizeof(int) * n_reads);
     cudaMalloc(&d_n_u, sizeof(int) * n_reads);
-    cudaMalloc(&d_qlen, sizeof(int) * n_reads);
-
-    // Copy input data to device
-    // Convert anchors from host to device format
-    size_t ofs = 0;
-    for (int i = 0; i < n_reads; i++) {
-        cudaMemcpy(&d_a[ofs], reads[i].a, sizeof(mm128_t) * reads[i].n, cudaMemcpyHostToDevice);
-        ofs += reads[i].n;
-    }
 
     // Set up offset array
     int *h_offset = (int*)malloc(sizeof(int) * n_reads);
     int *h_n_a = (int*)malloc(sizeof(int) * n_reads);
-    int *h_qlen = (int*)malloc(sizeof(int) * n_reads);
-    ofs = 0;
+    int ofs = 0;
     for (int i = 0; i < n_reads; i++) {
         h_offset[i] = ofs;
         h_n_a[i] = reads[i].n;
-        h_qlen[i] = reads[i].qlens[0];  // Assuming n_seg == 1
         ofs += reads[i].n;
     }
     cudaMemcpy(d_offset, h_offset, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
     cudaMemcpy(d_n_a, h_n_a, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_qlen, h_qlen, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
-
-    // Copy scores and predecessors from device memory (already on GPU)
-    cudaMemcpy(d_p_abs, dev_mem->d_f, sizeof(int32_t) * total_n, cudaMemcpyDeviceToDevice);
 
     // Convert relative predecessors to absolute
     convert_p_rel_to_abs<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
@@ -352,7 +337,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     // Step 3: Backtrack
     mm_chain_backtrack_parallel<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
-        d_n_a, d_a, dev_mem->d_f, d_p_abs, d_u,
+        d_n_a, dev_mem->d_ax, dev_mem->d_ay, dev_mem->d_f, d_p_abs, d_u,
         d_zx, d_zy, d_t, d_v, d_offset, min_cnt, min_sc, max_drop,
         n_reads, d_n_v, d_n_u, d_num_elements, d_ofs_end);
 
@@ -369,8 +354,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     // Step 5: Set chain information
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
-        d_n_a, n_reads, d_a, d_offset, d_ofs_end, dev_mem->d_f, d_p_abs,
-        d_u, d_zx, d_zy, d_t, d_v);
+        d_n_a, n_reads, dev_mem->d_ax, dev_mem->d_ay, d_offset, d_ofs_end,
+        dev_mem->d_f, d_p_abs, d_u, d_zx, d_zy, d_t, d_v);
 
     cudaStreamSynchronize(stream);
 
@@ -382,6 +367,14 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
     cudaMemcpy(h_n_u, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
 
+    // Allocate temporary host buffers for compacted anchors
+    int32_t *h_ax = (int32_t*)malloc(sizeof(int32_t) * total_n);
+    int32_t *h_ay = (int32_t*)malloc(sizeof(int32_t) * total_n);
+
+    // Copy compacted anchors from GPU
+    cudaMemcpy(h_ax, dev_mem->d_ax, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ay, dev_mem->d_ay, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
+
     // Update read structures
     for (int i = 0; i < n_reads; i++) {
         reads[i].n_u = h_n_u[i];
@@ -390,15 +383,29 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             KMALLOC(km, reads[i].u, h_n_u[i]);
             cudaMemcpy(reads[i].u, &d_u[h_offset[i]], sizeof(uint64_t) * h_n_u[i], cudaMemcpyDeviceToHost);
 
-            // Update anchor array
-            cudaMemcpy(reads[i].a, &d_a[h_offset[i]], sizeof(mm128_t) * reads[i].n, cudaMemcpyDeviceToHost);
+            // Calculate new anchor count (sum of chain lengths)
+            int new_n = 0;
+            for (int j = 0; j < h_n_u[i]; j++) {
+                new_n += (int32_t)reads[i].u[j];
+            }
+
+            // Combine ax/ay back into mm128_t format
+            for (int j = 0; j < new_n; j++) {
+                reads[i].a[j].x = h_ax[h_offset[i] + j];
+                reads[i].a[j].y = h_ay[h_offset[i] + j];
+            }
+
+            // Update anchor count
+            reads[i].n = new_n;
         }
     }
+
+    free(h_ax);
+    free(h_ay);
 
     // Cleanup
     free(h_offset);
     free(h_n_a);
-    free(h_qlen);
     free(h_n_u);
 
     // Free device buffers
@@ -408,14 +415,12 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaFree(d_p_abs);
     cudaFree(d_t);
     cudaFree(d_u);
-    cudaFree(d_a);
     cudaFree(d_n_a);
     cudaFree(d_offset);
     cudaFree(d_ofs_end);
     cudaFree(d_num_elements);
     cudaFree(d_n_v);
     cudaFree(d_n_u);
-    cudaFree(d_qlen);
     cudaFree(d_temp_storage);
 }
 

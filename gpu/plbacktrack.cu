@@ -241,18 +241,16 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
 // This matches the CPU version behavior in lchain.c where mg_chain_backtrack
 // returns the compacted anchor array and u metadata, then the CPU generates regs
 
-// Helper to convert relative predecessor to absolute
-__global__ void convert_p_rel_to_abs(uint16_t* p_rel, int64_t* p_abs, int* offset, int* n_a, int n_task)
+// Helper to expand uint16_t predecessor to int64_t (keep relative distance semantics)
+__global__ void expand_p_to_int64(uint16_t* p_rel, int64_t* p_expanded, int* offset, int* n_a, int n_task)
 {
     int id = threadIdx.x + blockIdx.x * blockDim.x;
     for(int job_idx = id; job_idx < n_task; job_idx += gridDim.x * blockDim.x) {
         int ofs = offset[job_idx];
         int n = n_a[job_idx];
         for (int i = 0; i < n; ++i) {
-            if (p_rel[ofs + i] == 0)
-                p_abs[ofs + i] = -1;
-            else
-                p_abs[ofs + i] = i - p_rel[ofs + i];
+            // Keep relative distance: 0 means no predecessor (-1), others stay as-is
+            p_expanded[ofs + i] = (p_rel[ofs + i] == 0) ? -1 : (int64_t)p_rel[ofs + i];
         }
     }
 }
@@ -306,8 +304,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMemcpy(d_offset, h_offset, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
     cudaMemcpy(d_n_a, h_n_a, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
 
-    // Convert relative predecessors to absolute
-    convert_p_rel_to_abs<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
+    // Expand uint16_t predecessors to int64_t (keep relative distance semantics)
+    expand_p_to_int64<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         dev_mem->d_p, d_p_abs, d_offset, d_n_a, n_reads);
 
     // Step 1: Filter anchors by score

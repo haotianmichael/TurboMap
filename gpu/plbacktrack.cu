@@ -270,33 +270,28 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     int is_qstrand = 0;
     uint32_t hash = 11; // Default seed hash
 
-    // Check buffer size limits
-    if (total_n > dev_mem->max_backtrack_n) {
-        fprintf(stderr, "[Warning] Backtrack buffer overflow: %zu > %zu\n",
-                total_n, dev_mem->max_backtrack_n);
-        return;
-    }
-    if (n_reads > dev_mem->max_backtrack_reads) {
-        fprintf(stderr, "[Warning] Too many reads for backtrack: %d > %zu\n",
-                n_reads, dev_mem->max_backtrack_reads);
-        return;
-    }
+    // Allocate temporary buffers for backtracking (like new GPU version)
+    int64_t *d_zx, *d_zy, *d_v, *d_p_abs;
+    int32_t *d_t;
+    uint64_t *d_u;
+    mm128_t *d_a;
+    int *d_n_a, *d_offset, *d_ofs_end, *d_num_elements, *d_n_v, *d_n_u, *d_qlen;
+    void *d_temp_storage = nullptr;
 
-    // Use pre-allocated buffers from dev_mem
-    int64_t *d_zx = dev_mem->d_bt_zx;
-    int64_t *d_zy = dev_mem->d_bt_zy;
-    int64_t *d_v = dev_mem->d_bt_v;
-    int64_t *d_p_abs = dev_mem->d_bt_p_abs;
-    int32_t *d_t = dev_mem->d_bt_t;
-    uint64_t *d_u = dev_mem->d_bt_u;
-    mm128_t *d_a = dev_mem->d_bt_a;
-    int *d_n_a = dev_mem->d_bt_n_a;
-    int *d_offset = dev_mem->d_bt_offset;
-    int *d_ofs_end = dev_mem->d_bt_ofs_end;
-    int *d_num_elements = dev_mem->d_bt_num_elements;
-    int *d_n_v = dev_mem->d_bt_n_v;
-    int *d_n_u = dev_mem->d_bt_n_u;
-    int *d_qlen = dev_mem->d_bt_qlen;
+    cudaMalloc(&d_zx, sizeof(int64_t) * total_n);
+    cudaMalloc(&d_zy, sizeof(int64_t) * total_n);
+    cudaMalloc(&d_v, sizeof(int64_t) * total_n);
+    cudaMalloc(&d_p_abs, sizeof(int64_t) * total_n);
+    cudaMalloc(&d_t, sizeof(int32_t) * total_n);
+    cudaMalloc(&d_u, sizeof(uint64_t) * total_n);
+    cudaMalloc(&d_a, sizeof(mm128_t) * total_n);
+    cudaMalloc(&d_n_a, sizeof(int) * n_reads);
+    cudaMalloc(&d_offset, sizeof(int) * n_reads);
+    cudaMalloc(&d_ofs_end, sizeof(int) * n_reads);
+    cudaMalloc(&d_num_elements, sizeof(int) * n_reads);
+    cudaMalloc(&d_n_v, sizeof(int) * n_reads);
+    cudaMalloc(&d_n_u, sizeof(int) * n_reads);
+    cudaMalloc(&d_qlen, sizeof(int) * n_reads);
 
     // Copy input data to device
     // Convert anchors from host to device format
@@ -336,8 +331,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaStreamSynchronize(stream);
 
     // Step 2: Sort z arrays by score using CUB (per-read segmented sort)
-    void *d_temp_storage = dev_mem->d_bt_temp_storage;
-    size_t temp_storage_bytes = dev_mem->bt_temp_storage_bytes;
+    size_t temp_storage_bytes = 0;
 
     // Determine temporary storage requirements
     cub::DeviceSegmentedRadixSort::SortPairsDescending(
@@ -345,13 +339,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         d_zx, d_zx, d_zy, d_zy,
         total_n, n_reads, d_offset, d_ofs_end);
 
-    // Allocate if needed or reallocate if too small
-    if (d_temp_storage == nullptr || temp_storage_bytes > dev_mem->bt_temp_storage_bytes) {
-        if (dev_mem->d_bt_temp_storage) cudaFree(dev_mem->d_bt_temp_storage);
-        cudaMalloc(&dev_mem->d_bt_temp_storage, temp_storage_bytes);
-        dev_mem->bt_temp_storage_bytes = temp_storage_bytes;
-        d_temp_storage = dev_mem->d_bt_temp_storage;
-    }
+    // Allocate temporary storage
+    cudaMalloc(&d_temp_storage, temp_storage_bytes);
 
     // Sort descending by score
     cub::DeviceSegmentedRadixSort::SortPairsDescending(
@@ -406,12 +395,28 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         }
     }
 
-    // Cleanup (only free host memory, device buffers are pre-allocated)
+    // Cleanup
     free(h_offset);
     free(h_n_a);
     free(h_qlen);
     free(h_n_u);
-    // Note: device buffers are managed by deviceMemPtr and freed in plmem_free_device_mem
+
+    // Free device buffers
+    cudaFree(d_zx);
+    cudaFree(d_zy);
+    cudaFree(d_v);
+    cudaFree(d_p_abs);
+    cudaFree(d_t);
+    cudaFree(d_u);
+    cudaFree(d_a);
+    cudaFree(d_n_a);
+    cudaFree(d_offset);
+    cudaFree(d_ofs_end);
+    cudaFree(d_num_elements);
+    cudaFree(d_n_v);
+    cudaFree(d_n_u);
+    cudaFree(d_qlen);
+    cudaFree(d_temp_storage);
 }
 
 void plbacktrack_init_memory(deviceMemPtr *dev_mem, size_t max_anchors)

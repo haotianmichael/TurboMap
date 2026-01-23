@@ -351,6 +351,27 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
+    // Debug: Check results after backtracking
+    int *h_n_u_debug = (int*)malloc(sizeof(int) * n_reads);
+    int *h_n_v_debug = (int*)malloc(sizeof(int) * n_reads);
+    int *h_n_z_debug = (int*)malloc(sizeof(int) * n_reads);
+    cudaMemcpy(h_n_u_debug, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_n_v_debug, d_n_v, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_n_z_debug, d_num_elements, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+
+    fprintf(stderr, "[DEBUG] plbacktrack_gpu: n_reads=%d, total_n=%zu\n", n_reads, total_n);
+    int total_chains = 0, total_filtered = 0;
+    for (int i = 0; i < min(5, n_reads); i++) {
+        fprintf(stderr, "[DEBUG]   Read %d: n_a=%d, n_z=%d, n_u=%d, n_v=%d\n",
+                i, reads[i].n, h_n_z_debug[i], h_n_u_debug[i], h_n_v_debug[i]);
+        total_chains += h_n_u_debug[i];
+        total_filtered += h_n_z_debug[i];
+    }
+    fprintf(stderr, "[DEBUG] First 5 reads: total_chains=%d, total_filtered=%d\n", total_chains, total_filtered);
+    free(h_n_u_debug);
+    free(h_n_v_debug);
+    free(h_n_z_debug);
+
     // Step 4: Sort by target position using CUB
     // Reuse temp storage
     cub::DeviceSegmentedRadixSort::SortPairs(
@@ -385,6 +406,14 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMemcpy(h_ay, d_ay_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_xrev, d_xrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
 
+    // Debug: Check first few anchors after copy
+    fprintf(stderr, "[DEBUG] First 5 compacted anchors:\n");
+    for (int i = 0; i < min(5, (int)total_n); i++) {
+        uint64_t x_full = ((uint64_t)h_xrev[i] << 32) | (uint32_t)h_ax[i];
+        fprintf(stderr, "[DEBUG]   Anchor %d: x=0x%lx (ax=0x%x, xrev=0x%x), y=0x%x\n",
+                i, x_full, h_ax[i], h_xrev[i], h_ay[i]);
+    }
+
     // Update read structures
     for (int i = 0; i < n_reads; i++) {
         reads[i].n_u = h_n_u[i];
@@ -408,8 +437,31 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
             // Update anchor count
             reads[i].n = new_n;
+
+            // Debug: Print first read's chain info
+            if (i == 0) {
+                fprintf(stderr, "[DEBUG] Read 0 after reconstruction: n_u=%d, new_n=%d\n", h_n_u[i], new_n);
+                fprintf(stderr, "[DEBUG]   u array (first 3 chains):\n");
+                for (int j = 0; j < min(3, h_n_u[i]); j++) {
+                    fprintf(stderr, "[DEBUG]     Chain %d: score=%u, len=%u\n",
+                            j, (uint32_t)(reads[i].u[j] >> 32), (uint32_t)reads[i].u[j]);
+                }
+                fprintf(stderr, "[DEBUG]   First 3 reconstructed anchors:\n");
+                for (int j = 0; j < min(3, new_n); j++) {
+                    fprintf(stderr, "[DEBUG]     Anchor %d: x=0x%lx, y=0x%lx\n",
+                            j, reads[i].a[j].x, reads[i].a[j].y);
+                }
+            }
         }
     }
+
+    // Debug: Count reads with chains
+    int reads_with_chains = 0;
+    for (int i = 0; i < n_reads; i++) {
+        if (h_n_u[i] > 0) reads_with_chains++;
+    }
+    fprintf(stderr, "[DEBUG] Backtracking complete. Reads with chains: %d/%d\n",
+            reads_with_chains, n_reads);
 
     free(h_ax);
     free(h_ay);

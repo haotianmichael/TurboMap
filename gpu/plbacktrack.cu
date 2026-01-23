@@ -223,11 +223,32 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
 
         // w_x and w_y should already be sorted by calling code using CUB
 
+        // Debug: Print first few w values for first job
+        if (job_idx < 2 && tid == 0 && n_u > 0) {
+            printf("[GPU-SETCHAIN] job %d: n_u=%d, n_a=%d\n", job_idx, n_u, n_a);
+            for (int dbg = 0; dbg < min(3, n_u); dbg++) {
+                printf("[GPU-SETCHAIN]   w[%d]: w_x=0x%lx, w_y=0x%lx (j=%d, k_offset=%u)\n",
+                       dbg, w_x[dbg], w_y[dbg], (int32_t)w_y[dbg], (uint32_t)(w_y[dbg]>>32));
+                int32_t j_dbg = (int32_t)w_y[dbg];
+                if (j_dbg >= 0 && j_dbg < n_u) {
+                    printf("[GPU-SETCHAIN]     u[%d]=0x%lx (chain_len=%d)\n",
+                           j_dbg, u[j_dbg], (int32_t)u[j_dbg]);
+                }
+            }
+        }
+        __syncthreads();
+
         // Copy sorted anchors back - decompose 64-bit values into ax/ay/xrev/yrev
         // CRITICAL: k must be shared across all threads, so declare in shared memory or compute per-iteration
         for (int i = 0; i < n_u; ++i) {
             int32_t j = (int32_t)w_y[i], n = (int32_t)u[j];
             if(tid == 0) u2[i] = u[j];
+
+            // Validate indices
+            if (tid == 0 && (j < 0 || j >= n_u || n <= 0 || n > 100000)) {
+                printf("[GPU-SETCHAIN-ERROR] job %d, i=%d: invalid j=%d or n=%d (n_u=%d)\n",
+                       job_idx, i, j, n, n_u);
+            }
 
             // Compute k for this iteration (sum of all previous chain lengths)
             int k = 0;
@@ -235,13 +256,39 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
                 k += (int32_t)u[(int32_t)w_y[ii]];
             }
 
+            // Validate k and b array indices
+            uint32_t b_offset = (uint32_t)(w_y[i]>>32);
+            if (tid == 0 && job_idx < 2 && i < 3) {
+                printf("[GPU-SETCHAIN]   Processing chain %d: j=%d, n=%d, k=%d, b_offset=%u\n",
+                       i, j, n, k, b_offset);
+            }
+
             for(int x = tid; x < n; x += blockDim.x){
-                uint64_t b_x_val = b_x[(w_y[i]>>32)+x];
-                uint64_t b_y_val = b_y[(w_y[i]>>32)+x];
-                ax[k+x] = (int32_t)b_x_val;  // Low 32 bits
-                xrev[k+x] = (int32_t)(b_x_val >> 32);  // High 32 bits
-                ay[k+x] = (int32_t)b_y_val;  // Low 32 bits
-                yrev[k+x] = (int32_t)(b_y_val >> 32);  // High 32 bits
+                uint32_t b_idx = b_offset + x;
+
+                // Bounds check
+                if (b_idx >= n_a) {
+                    if (job_idx < 2 && i < 3 && x == 0) {
+                        printf("[GPU-SETCHAIN-ERROR] Out of bounds: b_idx=%u >= n_a=%d\n", b_idx, n_a);
+                    }
+                    continue;
+                }
+
+                uint64_t b_x_val = b_x[b_idx];
+                uint64_t b_y_val = b_y[b_idx];
+
+                int out_idx = k + x;
+                if (out_idx >= n_a) {
+                    if (job_idx < 2 && i < 3 && x == 0) {
+                        printf("[GPU-SETCHAIN-ERROR] Output out of bounds: out_idx=%d >= n_a=%d\n", out_idx, n_a);
+                    }
+                    continue;
+                }
+
+                ax[out_idx] = (int32_t)b_x_val;  // Low 32 bits
+                xrev[out_idx] = (int32_t)(b_x_val >> 32);  // High 32 bits
+                ay[out_idx] = (int32_t)b_y_val;  // Low 32 bits
+                yrev[out_idx] = (int32_t)(b_y_val >> 32);  // High 32 bits
             }
             __syncthreads();
         }
@@ -434,21 +481,35 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             // Copy to new array to avoid stale data in old oversized array
             int max_qpos_found = -1;
             int min_qpos_found = INT_MAX;
+            int invalid_count = 0;
             for (int j = 0; j < new_n; j++) {
                 int idx = h_offset[i] + j;
                 new_a[j].x = ((uint64_t)h_xrev[idx] << 32) | (uint32_t)h_ax[idx];
                 new_a[j].y = ((uint64_t)h_yrev[idx] << 32) | (uint32_t)h_ay[idx];
 
-                // Validate qpos
+                // Validate qpos and q_span
                 uint32_t qpos = (uint32_t)new_a[j].y;
+                uint32_t q_span = (uint32_t)(new_a[j].y >> 32) & 0xff;
+
                 if (qpos > max_qpos_found) max_qpos_found = qpos;
                 if (qpos < min_qpos_found) min_qpos_found = qpos;
+
+                // Check for obviously invalid values
+                if (qpos > 1000000 || q_span > 255 || q_span == 0) {
+                    if (i < 3 && invalid_count < 5) {
+                        fprintf(stderr, "[DEBUG-ANCHOR] Read %d, anchor %d: ax=%d, ay=%d, xrev=%d, yrev=%d\n",
+                                i, j, h_ax[idx], h_ay[idx], h_xrev[idx], h_yrev[idx]);
+                        fprintf(stderr, "[DEBUG-ANCHOR]   Reconstructed: x=0x%lx, y=0x%lx (qpos=%u, q_span=%u)\n",
+                                new_a[j].x, new_a[j].y, qpos, q_span);
+                    }
+                    invalid_count++;
+                }
             }
 
-            // Only print if suspicious qpos values detected
-            if (i < 5 && max_qpos_found > 200000) {
-                fprintf(stderr, "[WARNING] Read %d: Suspicious qpos range [%d, %d], new_n=%d\n",
-                        i, min_qpos_found, max_qpos_found, new_n);
+            // Print diagnostics for first few reads or suspicious data
+            if (i < 5 || invalid_count > 0) {
+                fprintf(stderr, "[DEBUG-BACKTRACK] Read %d: n_u=%d, new_n=%d, qpos range [%d, %d], invalid=%d\n",
+                        i, h_n_u[i], new_n, min_qpos_found, max_qpos_found, invalid_count);
             }
 
             // Free old oversized array and update pointer to new right-sized array

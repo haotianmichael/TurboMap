@@ -448,6 +448,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             // Reconstruct complete mm128_t from ax/xrev (x field) and ay/yrev (y field)
             // Copy to new array to avoid stale data in old oversized array
             int max_qpos_found = -1;
+            int min_qpos_found = INT_MAX;
             for (int j = 0; j < new_n; j++) {
                 int idx = h_offset[i] + j;
                 new_a[j].x = ((uint64_t)h_xrev[idx] << 32) | (uint32_t)h_ax[idx];
@@ -456,18 +457,27 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                 // Validate qpos
                 uint32_t qpos = (uint32_t)new_a[j].y;
                 if (qpos > max_qpos_found) max_qpos_found = qpos;
+                if (qpos < min_qpos_found) min_qpos_found = qpos;
             }
 
-            // Debug: Check if any qpos exceeds expected range
-            if (i < 3 && max_qpos_found > 200000) {  // Suspicious if > 200k
-                fprintf(stderr, "[DEBUG] WARNING: Read %d has suspicious max qpos=%u, new_n=%d, n_u=%d\n",
-                        i, max_qpos_found, new_n, h_n_u[i]);
-                fprintf(stderr, "[DEBUG]   Input n_a=%d, offset=%d\n", h_n_a[i], h_offset[i]);
-                // Print first few anchors
-                for (int j = 0; j < min(3, new_n); j++) {
+            // Debug: Print anchor range for first 25 reads after copy
+            if (i < 25) {
+                fprintf(stderr, "[DEBUG-COPY] Read %d: new_n=%d, qpos range [%d, %d]\n",
+                        i, new_n, min_qpos_found, max_qpos_found);
+                // Print first and last few anchors
+                int print_count = min(3, new_n);
+                for (int j = 0; j < print_count; j++) {
                     uint32_t qp = (uint32_t)new_a[j].y;
                     uint32_t qs = (uint32_t)(new_a[j].y >> 32) & 0xff;
-                    fprintf(stderr, "[DEBUG]   Anchor %d: qpos=%u, qspan=%u\n", j, qp, qs);
+                    fprintf(stderr, "[DEBUG-COPY]   Anchor[%d]: qpos=%u, qspan=%u\n", j, qp, qs);
+                }
+                if (new_n > print_count) {
+                    fprintf(stderr, "[DEBUG-COPY]   ...\n");
+                    for (int j = max(print_count, new_n - 2); j < new_n; j++) {
+                        uint32_t qp = (uint32_t)new_a[j].y;
+                        uint32_t qs = (uint32_t)(new_a[j].y >> 32) & 0xff;
+                        fprintf(stderr, "[DEBUG-COPY]   Anchor[%d]: qpos=%u, qspan=%u\n", j, qp, qs);
+                    }
                 }
             }
 

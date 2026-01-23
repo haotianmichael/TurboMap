@@ -166,17 +166,15 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_
         int64_t *b_y = z_y;
         int64_t *w_x = p;
         int64_t *w_y = v;
-        // Use t array space for xrev compact (won't be used until later)
-        int32_t *xrev_compact = t;
 
-        // Compact anchors (parallel version) - also compact xrev
+        // Compact anchors (parallel version) - reconstruct full 64-bit values
         for (int i = 0, k = 0; i < n_u; ++i) {
             int32_t k0 = k, ni = (int32_t)u[i];
             for(int j = tid; j < ni; j += blockDim.x){
                 int v_idx = v[k0 + (ni-j-1)];
-                b_x[k + j] = ax[v_idx];
+                // Reconstruct complete 64-bit anchor values
+                b_x[k + j] = ((uint64_t)xrev[v_idx] << 32) | (uint32_t)ax[v_idx];
                 b_y[k + j] = ay[v_idx];
-                xrev_compact[k + j] = xrev[v_idx];
             }
             k += ni;
             __syncthreads();
@@ -219,20 +217,20 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
         int32_t* ax = &g_ax[ofs];
         int32_t* ay = &g_ay[ofs];
         int32_t* xrev = &g_xrev[ofs];
-        int32_t* xrev_compact = &g_t[ofs];
         int n_a = g_na[job_idx];
 
         // w_x and w_y should already be sorted by calling code using CUB
 
-        // Copy sorted anchors back (including xrev)
+        // Copy sorted anchors back - decompose 64-bit values into ax/ay/xrev
         for (int i = 0, k = 0; i < n_u; ++i) {
             int32_t j = (int32_t)w_y[i], n = (int32_t)u[j];
             if(tid == 0) u2[i] = u[j];
 
             for(int x = tid; x < n; x += blockDim.x){
-                ax[k+x] = (int32_t)b_x[(w_y[i]>>32)+x];
+                uint64_t b_x_val = b_x[(w_y[i]>>32)+x];
+                ax[k+x] = (int32_t)b_x_val;  // Low 32 bits
+                xrev[k+x] = (int32_t)(b_x_val >> 32);  // High 32 bits
                 ay[k+x] = (int32_t)b_y[(w_y[i]>>32)+x];
-                xrev[k+x] = xrev_compact[(w_y[i]>>32)+x];
             }
             k += n;
         }

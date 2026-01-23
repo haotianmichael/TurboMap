@@ -317,6 +317,26 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMemcpy(d_offset, h_offset, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
     cudaMemcpy(d_n_a, h_n_a, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
 
+    // Debug: Check input anchor data from device memory
+    if (n_reads > 0 && reads[0].n > 0) {
+        int32_t h_check_input_ax[3], h_check_input_ay[3], h_check_input_xrev[3], h_check_input_yrev[3];
+        int check_n = min(3, reads[0].n);
+        cudaMemcpy(h_check_input_ax, dev_mem->d_ax, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_check_input_ay, dev_mem->d_ay, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_check_input_xrev, dev_mem->d_xrev, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_check_input_yrev, dev_mem->d_yrev, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
+        fprintf(stderr, "[DEBUG] Input anchors from device memory (first read, first %d anchors):\n", check_n);
+        for (int i = 0; i < check_n; i++) {
+            uint64_t x = ((uint64_t)h_check_input_xrev[i] << 32) | (uint32_t)h_check_input_ax[i];
+            uint64_t y = ((uint64_t)h_check_input_yrev[i] << 32) | (uint32_t)h_check_input_ay[i];
+            uint32_t q_pos = (uint32_t)y;
+            uint32_t q_span = (uint32_t)(y >> 32) & 0xff;
+            uint32_t seg_id = (uint32_t)(y >> 48) & 0xff;
+            fprintf(stderr, "[DEBUG]   Input anchor %d: x=0x%lx, y=0x%lx (qpos=%u, qspan=%u, seg=%u)\n",
+                    i, x, y, q_pos, q_span, seg_id);
+        }
+    }
+
     // Expand uint16_t predecessors to int64_t (keep relative distance semantics)
     expand_p_to_int64<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         dev_mem->d_p, d_p_abs, d_offset, d_n_a, n_reads);
@@ -467,10 +487,17 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                     fprintf(stderr, "[DEBUG]     Chain %d: score=%u, len=%u\n",
                             j, (uint32_t)(reads[i].u[j] >> 32), (uint32_t)reads[i].u[j]);
                 }
-                fprintf(stderr, "[DEBUG]   First 3 reconstructed anchors:\n");
+                fprintf(stderr, "[DEBUG]   First 3 reconstructed anchors (with field breakdown):\n");
                 for (int j = 0; j < min(3, new_n); j++) {
-                    fprintf(stderr, "[DEBUG]     Anchor %d: x=0x%lx, y=0x%lx\n",
-                            j, reads[i].a[j].x, reads[i].a[j].y);
+                    uint64_t x = reads[i].a[j].x;
+                    uint64_t y = reads[i].a[j].y;
+                    uint32_t q_pos = (uint32_t)y;
+                    uint32_t q_span = (uint32_t)(y >> 32) & 0xff;
+                    uint32_t seg_id = (uint32_t)(y >> 48) & 0xff;
+                    uint32_t t_pos = (uint32_t)x;
+                    uint32_t rid_rev = (uint32_t)(x >> 32);
+                    fprintf(stderr, "[DEBUG]     Anchor %d: x=0x%lx (tid_rev=0x%x, tpos=%u), y=0x%lx (qpos=%u, qspan=%u, seg=%u)\n",
+                            j, x, rid_rev, t_pos, y, q_pos, q_span, seg_id);
                 }
             }
         }

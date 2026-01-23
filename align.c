@@ -1193,8 +1193,22 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         re0 = re + l < (int32_t)mi->seq[rid].len? re + l : mi->seq[rid].len;
     } else {
         // Complex region computation logic from original mm_align1
+        uint32_t q_span_start = (uint32_t)(a[r->as].y>>32&0xff);
+        uint32_t q_pos_start = (uint32_t)a[r->as].y;
         rs0 = (int32_t)a[r->as].x + 1 - (int32_t)(a[r->as].y>>32&0xff);
         qs0 = (int32_t)a[r->as].y + 1 - (int32_t)(a[r->as].y>>32&0xff);
+
+        // Debug: Check if qs0/rs0 are reasonable
+        if (qs0 < 0 || qs0 > qlen) {
+            fprintf(stderr, "[DEBUG] Invalid qs0 calculation: read_idx=%d, reg_idx=%d, qlen=%d\n", read_idx, reg_idx, qlen);
+            fprintf(stderr, "[DEBUG]   a[r->as].y=0x%lx, q_pos=%u, q_span=%u\n", a[r->as].y, q_pos_start, q_span_start);
+            fprintf(stderr, "[DEBUG]   Calculated qs0=%d (should be 0 <= qs0 <= %d)\n", qs0, qlen);
+            fprintf(stderr, "[DEBUG]   qs=%d, qe=%d, rs=%d, re=%d\n", qs, qe, rs, re);
+            // Clamp qs0 to valid range to prevent crash
+            if (qs0 < 0) qs0 = 0;
+            if (qs0 > qlen) qs0 = qlen;
+            fprintf(stderr, "[DEBUG]   Clamped qs0 to %d\n", qs0);
+        }
         if (rs0 < 0) rs0 = 0;
         assert(qs0 >= 0);
         rs1 = qs1 = 0;

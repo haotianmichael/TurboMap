@@ -317,25 +317,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMemcpy(d_offset, h_offset, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
     cudaMemcpy(d_n_a, h_n_a, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
 
-    // Debug: Check input anchor data from device memory
-    if (n_reads > 0 && reads[0].n > 0) {
-        int32_t h_check_input_ax[3], h_check_input_ay[3], h_check_input_xrev[3], h_check_input_yrev[3];
-        int check_n = min(3, (int)reads[0].n);
-        cudaMemcpy(h_check_input_ax, dev_mem->d_ax, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_check_input_ay, dev_mem->d_ay, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_check_input_xrev, dev_mem->d_xrev, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_check_input_yrev, dev_mem->d_yrev, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
-        fprintf(stderr, "[DEBUG] Input anchors from device memory (first read, first %d anchors):\n", check_n);
-        for (int i = 0; i < check_n; i++) {
-            uint64_t x = ((uint64_t)h_check_input_xrev[i] << 32) | (uint32_t)h_check_input_ax[i];
-            uint64_t y = ((uint64_t)h_check_input_yrev[i] << 32) | (uint32_t)h_check_input_ay[i];
-            uint32_t q_pos = (uint32_t)y;
-            uint32_t q_span = (uint32_t)(y >> 32) & 0xff;
-            uint32_t seg_id = (uint32_t)(y >> 48) & 0xff;
-            fprintf(stderr, "[DEBUG]   Input anchor %d: x=0x%lx, y=0x%lx (qpos=%u, qspan=%u, seg=%u)\n",
-                    i, x, y, q_pos, q_span, seg_id);
-        }
-    }
+    // Input validation removed to reduce debug output
 
     // Expand uint16_t predecessors to int64_t (keep relative distance semantics)
     expand_p_to_int64<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
@@ -376,26 +358,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // Debug: Check results after backtracking
-    int *h_n_u_debug = (int*)malloc(sizeof(int) * n_reads);
-    int *h_n_v_debug = (int*)malloc(sizeof(int) * n_reads);
-    int *h_n_z_debug = (int*)malloc(sizeof(int) * n_reads);
-    cudaMemcpy(h_n_u_debug, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_n_v_debug, d_n_v, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_n_z_debug, d_num_elements, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-
-    fprintf(stderr, "[DEBUG] plbacktrack_gpu: n_reads=%d, total_n=%zu\n", n_reads, total_n);
-    int total_chains = 0, total_filtered = 0;
-    for (int i = 0; i < min(5, n_reads); i++) {
-        fprintf(stderr, "[DEBUG]   Read %d: n_a=%d, n_z=%d, n_u=%d, n_v=%d\n",
-                i, reads[i].n, h_n_z_debug[i], h_n_u_debug[i], h_n_v_debug[i]);
-        total_chains += h_n_u_debug[i];
-        total_filtered += h_n_z_debug[i];
-    }
-    fprintf(stderr, "[DEBUG] First 5 reads: total_chains=%d, total_filtered=%d\n", total_chains, total_filtered);
-    free(h_n_u_debug);
-    free(h_n_v_debug);
-    free(h_n_z_debug);
+    // Backtracking statistics removed to reduce debug output
 
     // Step 4: Sort by target position using CUB
     // Reuse temp storage
@@ -413,18 +376,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // Debug: Check if output buffers have data
-    int32_t h_check_ax[5], h_check_ay[5], h_check_xrev[5], h_check_yrev[5];
-    cudaMemcpy(h_check_ax, d_ax_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_check_ay, d_ay_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_check_xrev, d_xrev_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_check_yrev, d_yrev_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
-    fprintf(stderr, "[DEBUG] Output buffers after mm_set_chain:\n");
-    for (int i = 0; i < 5; i++) {
-        uint64_t x_val = ((uint64_t)h_check_xrev[i] << 32) | (uint32_t)h_check_ax[i];
-        uint64_t y_val = ((uint64_t)h_check_yrev[i] << 32) | (uint32_t)h_check_ay[i];
-        fprintf(stderr, "[DEBUG]   [%d]: x=0x%lx, y=0x%lx\n", i, x_val, y_val);
-    }
+    // Output buffer check removed to reduce debug output
 
     // Note: Steps 6-8 (gen_regs) are not needed here
     // The CPU side will generate regions from the u array
@@ -446,14 +398,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMemcpy(h_xrev, d_xrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_yrev, d_yrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
 
-    // Debug: Check first few anchors after copy
-    fprintf(stderr, "[DEBUG] First 5 compacted anchors:\n");
-    for (int i = 0; i < min(5, (int)total_n); i++) {
-        uint64_t x_full = ((uint64_t)h_xrev[i] << 32) | (uint32_t)h_ax[i];
-        uint64_t y_full = ((uint64_t)h_yrev[i] << 32) | (uint32_t)h_ay[i];
-        fprintf(stderr, "[DEBUG]   Anchor %d: x=0x%lx (ax=0x%x, xrev=0x%x), y=0x%lx (ay=0x%x, yrev=0x%x)\n",
-                i, x_full, h_ax[i], h_xrev[i], y_full, h_ay[i], h_yrev[i]);
-    }
+    // Compacted anchors check removed to reduce debug output
 
     // Update read structures
     for (int i = 0; i < n_reads; i++) {
@@ -498,37 +443,11 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             // Update anchor count
             reads[i].n = new_n;
 
-            // Debug: Print first read's chain info
-            if (i == 0) {
-                fprintf(stderr, "[DEBUG] Read 0 after reconstruction: n_u=%d, new_n=%d\n", h_n_u[i], new_n);
-                fprintf(stderr, "[DEBUG]   u array (first 3 chains):\n");
-                for (int j = 0; j < min(3, h_n_u[i]); j++) {
-                    fprintf(stderr, "[DEBUG]     Chain %d: score=%u, len=%u\n",
-                            j, (uint32_t)(reads[i].u[j] >> 32), (uint32_t)reads[i].u[j]);
-                }
-                fprintf(stderr, "[DEBUG]   First 3 reconstructed anchors (with field breakdown):\n");
-                for (int j = 0; j < min(3, new_n); j++) {
-                    uint64_t x = reads[i].a[j].x;
-                    uint64_t y = reads[i].a[j].y;
-                    uint32_t q_pos = (uint32_t)y;
-                    uint32_t q_span = (uint32_t)(y >> 32) & 0xff;
-                    uint32_t seg_id = (uint32_t)(y >> 48) & 0xff;
-                    uint32_t t_pos = (uint32_t)x;
-                    uint32_t rid_rev = (uint32_t)(x >> 32);
-                    fprintf(stderr, "[DEBUG]     Anchor %d: x=0x%lx (tid_rev=0x%x, tpos=%u), y=0x%lx (qpos=%u, qspan=%u, seg=%u)\n",
-                            j, x, rid_rev, t_pos, y, q_pos, q_span, seg_id);
-                }
-            }
+            // Read 0 reconstruction info removed to reduce debug output
         }
     }
 
-    // Debug: Count reads with chains
-    int reads_with_chains = 0;
-    for (int i = 0; i < n_reads; i++) {
-        if (h_n_u[i] > 0) reads_with_chains++;
-    }
-    fprintf(stderr, "[DEBUG] Backtracking complete. Reads with chains: %d/%d\n",
-            reads_with_chains, n_reads);
+    // Backtracking statistics removed to reduce debug output
 
     free(h_ax);
     free(h_ay);

@@ -398,7 +398,33 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMemcpy(h_xrev, d_xrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_yrev, d_yrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
 
-    // Compacted anchors check removed to reduce debug output
+    // Debug: Verify output buffer data BEFORE reading into reads[]
+    // Check if output buffer contains valid data at expected offsets
+    for (int i = 0; i < min(3, n_reads); i++) {
+        if (h_n_u[i] > 0) {
+            // Calculate expected new_n
+            int new_n = 0;
+            for (int j = 0; j < h_n_u[i]; j++) {
+                // Need to get u[j] value - read it from device
+                uint64_t u_val;
+                cudaMemcpy(&u_val, &d_u[h_offset[i] + j], sizeof(uint64_t), cudaMemcpyDeviceToHost);
+                new_n += (int32_t)u_val;
+            }
+
+            fprintf(stderr, "[DEBUG-VERIFY] Read %d: input_n=%d, offset=%d, n_u=%d, new_n=%d\n",
+                    i, h_n_a[i], h_offset[i], h_n_u[i], new_n);
+
+            // Check first few anchors in output buffer at this read's offset
+            for (int j = 0; j < min(5, new_n); j++) {
+                int idx = h_offset[i] + j;
+                uint64_t y_val = ((uint64_t)h_yrev[idx] << 32) | (uint32_t)h_ay[idx];
+                uint32_t qpos = (uint32_t)y_val;
+                uint32_t qspan = (uint32_t)(y_val >> 32) & 0xff;
+                fprintf(stderr, "[DEBUG-VERIFY]   Output buf [offset+%d=%d]: qpos=%u, qspan=%u\n",
+                        j, idx, qpos, qspan);
+            }
+        }
+    }
 
     // Update read structures
     for (int i = 0; i < n_reads; i++) {

@@ -398,34 +398,6 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMemcpy(h_xrev, d_xrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_yrev, d_yrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
 
-    // Debug: Verify output buffer data BEFORE reading into reads[]
-    // Check if output buffer contains valid data at expected offsets
-    for (int i = 0; i < min(25, n_reads); i++) {
-        if (h_n_u[i] > 0) {
-            // Calculate expected new_n
-            int new_n = 0;
-            for (int j = 0; j < h_n_u[i]; j++) {
-                // Need to get u[j] value - read it from device
-                uint64_t u_val;
-                cudaMemcpy(&u_val, &d_u[h_offset[i] + j], sizeof(uint64_t), cudaMemcpyDeviceToHost);
-                new_n += (int32_t)u_val;
-            }
-
-            fprintf(stderr, "[DEBUG-VERIFY] Read %d: input_n=%d, offset=%d, n_u=%d, new_n=%d\n",
-                    i, h_n_a[i], h_offset[i], h_n_u[i], new_n);
-
-            // Check first few anchors in output buffer at this read's offset
-            for (int j = 0; j < min(5, new_n); j++) {
-                int idx = h_offset[i] + j;
-                uint64_t y_val = ((uint64_t)h_yrev[idx] << 32) | (uint32_t)h_ay[idx];
-                uint32_t qpos = (uint32_t)y_val;
-                uint32_t qspan = (uint32_t)(y_val >> 32) & 0xff;
-                fprintf(stderr, "[DEBUG-VERIFY]   Output buf [offset+%d=%d]: qpos=%u, qspan=%u\n",
-                        j, idx, qpos, qspan);
-            }
-        }
-    }
-
     // Update read structures
     for (int i = 0; i < n_reads; i++) {
         reads[i].n_u = h_n_u[i];
@@ -460,25 +432,10 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                 if (qpos < min_qpos_found) min_qpos_found = qpos;
             }
 
-            // Debug: Print anchor range for first 25 reads after copy
-            if (i < 25) {
-                fprintf(stderr, "[DEBUG-COPY] Read %d: new_n=%d, qpos range [%d, %d]\n",
-                        i, new_n, min_qpos_found, max_qpos_found);
-                // Print first and last few anchors
-                int print_count = min(3, new_n);
-                for (int j = 0; j < print_count; j++) {
-                    uint32_t qp = (uint32_t)new_a[j].y;
-                    uint32_t qs = (uint32_t)(new_a[j].y >> 32) & 0xff;
-                    fprintf(stderr, "[DEBUG-COPY]   Anchor[%d]: qpos=%u, qspan=%u\n", j, qp, qs);
-                }
-                if (new_n > print_count) {
-                    fprintf(stderr, "[DEBUG-COPY]   ...\n");
-                    for (int j = max(print_count, new_n - 2); j < new_n; j++) {
-                        uint32_t qp = (uint32_t)new_a[j].y;
-                        uint32_t qs = (uint32_t)(new_a[j].y >> 32) & 0xff;
-                        fprintf(stderr, "[DEBUG-COPY]   Anchor[%d]: qpos=%u, qspan=%u\n", j, qp, qs);
-                    }
-                }
+            // Only print if suspicious qpos values detected
+            if (i < 5 && max_qpos_found > 200000) {
+                fprintf(stderr, "[WARNING] Read %d: Suspicious qpos range [%d, %d], new_n=%d\n",
+                        i, min_qpos_found, max_qpos_found, new_n);
             }
 
             // Free old oversized array and update pointer to new right-sized array
@@ -488,20 +445,15 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             // Update anchor count
             reads[i].n = new_n;
 
-            // Debug: Verify u array and cumulative anchor counts
+            // Verify u array cumulative count
             if (i < 5) {
                 int cumulative = 0;
-                fprintf(stderr, "[DEBUG-U-ARRAY] Read %d: n_u=%d, new_n=%d\n", i, h_n_u[i], new_n);
-                for (int j = 0; j < min(10, h_n_u[i]); j++) {
-                    int chain_len = (int32_t)reads[i].u[j];
-                    int chain_score = reads[i].u[j] >> 32;
-                    fprintf(stderr, "[DEBUG-U-ARRAY]   u[%d]: len=%d, score=%d, cumulative_as=%d\n",
-                            j, chain_len, chain_score, cumulative);
-                    cumulative += chain_len;
+                for (int j = 0; j < h_n_u[i]; j++) {
+                    cumulative += (int32_t)reads[i].u[j];
                 }
                 if (cumulative != new_n) {
-                    fprintf(stderr, "[DEBUG-U-ARRAY]   ERROR: cumulative=%d != new_n=%d!\n",
-                            cumulative, new_n);
+                    fprintf(stderr, "[ERROR] Read %d: u array mismatch, cumulative=%d != new_n=%d\n",
+                            i, cumulative, new_n);
                 }
             }
         }

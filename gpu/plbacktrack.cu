@@ -224,9 +224,16 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
         // w_x and w_y should already be sorted by calling code using CUB
 
         // Copy sorted anchors back - decompose 64-bit values into ax/ay/xrev/yrev
-        for (int i = 0, k = 0; i < n_u; ++i) {
+        // CRITICAL: k must be shared across all threads, so declare in shared memory or compute per-iteration
+        for (int i = 0; i < n_u; ++i) {
             int32_t j = (int32_t)w_y[i], n = (int32_t)u[j];
             if(tid == 0) u2[i] = u[j];
+
+            // Compute k for this iteration (sum of all previous chain lengths)
+            int k = 0;
+            for (int ii = 0; ii < i; ++ii) {
+                k += (int32_t)u[(int32_t)w_y[ii]];
+            }
 
             for(int x = tid; x < n; x += blockDim.x){
                 uint64_t b_x_val = b_x[(w_y[i]>>32)+x];
@@ -236,7 +243,7 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
                 ay[k+x] = (int32_t)b_y_val;  // Low 32 bits
                 yrev[k+x] = (int32_t)(b_y_val >> 32);  // High 32 bits
             }
-            k += n;
+            __syncthreads();
         }
         __syncthreads();
 

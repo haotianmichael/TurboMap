@@ -1554,11 +1554,36 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
     uint32_t hash;
     mm_reg1_t *regs0;
 
+    // Debug: Print read info before mm_gen_regs
+    if (read_idx < 5) {
+        fprintf(stderr, "[DEBUG-PREGENREGS] read_idx=%d: n_u=%d, read_->n=%d, qlen=%d\n",
+                read_idx, *n_regs0, read_->n, qlen_sum);
+    }
+
     hash  = qname && !(opt->flag & MM_F_NO_HASH_NAME)? __ac_X31_hash_string(qname) : 0;
     hash ^= __ac_Wang_hash(qlen_sum) + __ac_Wang_hash(opt->seed);
     hash  = __ac_Wang_hash(hash);
 
     regs0 = mm_gen_regs(km, hash, qlen_sum, *n_regs0, u, a, !!(opt->flag&MM_F_QSTRAND));
+
+    // Debug: Validate region indices after mm_gen_regs
+    if (read_idx < 5) {
+        for (int i = 0; i < *n_regs0 && i < 5; i++) {
+            if (regs0[i].as + regs0[i].cnt > read_->n) {
+                fprintf(stderr, "[ERROR-GENREGS] read_idx=%d, reg=%d: as=%d, cnt=%d, total=%d exceeds n=%d\n",
+                        read_idx, i, regs0[i].as, regs0[i].cnt, regs0[i].as + regs0[i].cnt, read_->n);
+            }
+            // Check first anchor in this region
+            if (regs0[i].cnt > 0 && regs0[i].as < read_->n) {
+                uint32_t qpos = (uint32_t)a[regs0[i].as].y;
+                if (qpos > qlen_sum) {
+                    fprintf(stderr, "[ERROR-GENREGS] read_idx=%d, reg=%d: a[%d].qpos=%u > qlen=%d\n",
+                            read_idx, i, regs0[i].as, qpos, qlen_sum);
+                }
+            }
+        }
+    }
+
     if (mi->n_alt) {
         mm_mark_alt(mi, *n_regs0, regs0);
         mm_hit_sort(km, n_regs0, regs0, opt->alt_drop);
@@ -1595,7 +1620,13 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
     }
 
     n_a = mm_squeeze_a(km, skele_n_regs, regs0, a);
-    
+
+    // Debug: Validate n_a matches read_->n
+    if (read_idx < 5 && n_a != read_->n) {
+        fprintf(stderr, "[ERROR-SQUEEZE] read_idx=%d: squeezed n_a=%d != read_->n=%d\n",
+                read_idx, n_a, read_->n);
+    }
+
     // Set up read context for GPU processing
     read_align_ctx_t *ctx = &gpu_batch->read_ctxs[read_idx];
     ctx->regs0 = regs0;

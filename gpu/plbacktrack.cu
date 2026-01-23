@@ -400,7 +400,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     // Debug: Verify output buffer data BEFORE reading into reads[]
     // Check if output buffer contains valid data at expected offsets
-    for (int i = 0; i < min(3, n_reads); i++) {
+    for (int i = 0; i < min(25, n_reads); i++) {
         if (h_n_u[i] > 0) {
             // Calculate expected new_n
             int new_n = 0;

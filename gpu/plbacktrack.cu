@@ -320,7 +320,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Debug: Check input anchor data from device memory
     if (n_reads > 0 && reads[0].n > 0) {
         int32_t h_check_input_ax[3], h_check_input_ay[3], h_check_input_xrev[3], h_check_input_yrev[3];
-        int check_n = min(3, reads[0].n);
+        int check_n = min(3, (int)reads[0].n);
         cudaMemcpy(h_check_input_ax, dev_mem->d_ax, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
         cudaMemcpy(h_check_input_ay, dev_mem->d_ay, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);
         cudaMemcpy(h_check_input_xrev, dev_mem->d_xrev, sizeof(int32_t) * check_n, cudaMemcpyDeviceToHost);

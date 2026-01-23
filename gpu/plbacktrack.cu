@@ -194,36 +194,6 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_
     }
 }
 
-// Helper kernel: Compact w arrays to contiguous memory for sorting
-__global__ void compact_w_arrays(int64_t* g_p, int64_t* g_v, int64_t* w_x_compact, int64_t* w_y_compact,
-                                  int* d_offset, int* d_n_u, int* d_offset_u, int n_reads) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    for (int i = tid; i < n_reads; i += blockDim.x * gridDim.x) {
-        int ofs = d_offset[i];  // anchor offset
-        int ofs_u = d_offset_u[i];  // chain offset (in compact array)
-        int n_u = d_n_u[i];
-        for (int j = 0; j < n_u; j++) {
-            w_x_compact[ofs_u + j] = g_p[ofs + j];
-            w_y_compact[ofs_u + j] = g_v[ofs + j];
-        }
-    }
-}
-
-// Helper kernel: Uncompact w arrays back to original positions
-__global__ void uncompact_w_arrays(int64_t* g_p, int64_t* g_v, int64_t* w_x_compact, int64_t* w_y_compact,
-                                    int* d_offset, int* d_n_u, int* d_offset_u, int n_reads) {
-    int tid = threadIdx.x + blockIdx.x * blockDim.x;
-    for (int i = tid; i < n_reads; i += blockDim.x * gridDim.x) {
-        int ofs = d_offset[i];  // anchor offset
-        int ofs_u = d_offset_u[i];  // chain offset (in compact array)
-        int n_u = d_n_u[i];
-        for (int j = 0; j < n_u; j++) {
-            g_p[ofs + j] = w_x_compact[ofs_u + j];
-            g_v[ofs + j] = w_y_compact[ofs_u + j];
-        }
-    }
-}
-
 // Kernel 3: Set chain anchor information
 // Note: Sorting is done separately using CUB
 __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay, int32_t* g_xrev, int32_t* g_yrev,
@@ -391,57 +361,13 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Backtracking statistics removed to reduce debug output
 
     // Step 4: Sort by target position using CUB
-    // Need to compute correct offsets for chain sorting (not anchor sorting)
-    int *h_n_u_temp = (int*)malloc(sizeof(int) * n_reads);
-    cudaMemcpy(h_n_u_temp, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-
-    // Calculate total number of chains and chain offsets
-    int *h_offset_u = (int*)malloc(sizeof(int) * n_reads);
-    int *h_ofs_end_u = (int*)malloc(sizeof(int) * n_reads);
-    int total_chains = 0;
-    for (int i = 0; i < n_reads; i++) {
-        h_offset_u[i] = total_chains;
-        total_chains += h_n_u_temp[i];
-        h_ofs_end_u[i] = total_chains;
-    }
-    free(h_n_u_temp);
-
-    // Upload chain offsets to GPU
-    int *d_offset_u, *d_ofs_end_u;
-    cudaMalloc(&d_offset_u, sizeof(int) * n_reads);
-    cudaMalloc(&d_ofs_end_u, sizeof(int) * n_reads);
-    cudaMemcpy(d_offset_u, h_offset_u, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ofs_end_u, h_ofs_end_u, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
-    free(h_offset_u);
-    free(h_ofs_end_u);
-
-    // Allocate compact arrays for w_x and w_y
-    int64_t *d_w_x_compact, *d_w_y_compact;
-    cudaMalloc(&d_w_x_compact, sizeof(int64_t) * total_chains);
-    cudaMalloc(&d_w_y_compact, sizeof(int64_t) * total_chains);
-
-    // Compact w arrays from sparse positions to contiguous memory
-    compact_w_arrays<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
-        d_p_abs, d_v, d_w_x_compact, d_w_y_compact, d_offset, d_n_u, d_offset_u, n_reads);
-    cudaStreamSynchronize(stream);
-
-    // Sort by target position - use chain counts, not anchor counts
+    // Note: Backtrack kernel already updated ofs_end to ofs+n_u for each read
+    // w_x and w_y data are in [offset[i], ofs_end[i]) for each read
+    // Use the already-updated ofs_end array directly for segmented sort
     cub::DeviceSegmentedRadixSort::SortPairs(
         d_temp_storage, temp_storage_bytes,
-        d_w_x_compact, d_w_x_compact, d_w_y_compact, d_w_y_compact,
-        total_chains, n_reads, d_offset_u, d_ofs_end_u);
-    cudaStreamSynchronize(stream);
-
-    // Uncompact sorted w arrays back to original positions
-    uncompact_w_arrays<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
-        d_p_abs, d_v, d_w_x_compact, d_w_y_compact, d_offset, d_n_u, d_offset_u, n_reads);
-    cudaStreamSynchronize(stream);
-
-    // Free temporary arrays
-    cudaFree(d_w_x_compact);
-    cudaFree(d_w_y_compact);
-    cudaFree(d_offset_u);
-    cudaFree(d_ofs_end_u);
+        d_p_abs, d_p_abs, d_v, d_v,
+        total_n, n_reads, d_offset, d_ofs_end);
 
     // Step 5: Set chain information (write to output buffers)
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(

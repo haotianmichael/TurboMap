@@ -61,11 +61,19 @@ mm_reg1_t *mm_gen_regs(void *km, uint32_t hash, int qlen, int n_u, uint64_t *u, 
 	z = (mm128_t*)kmalloc(km, n_u * 16);
 	for (i = k = 0; i < n_u; ++i) {
 		uint32_t h;
+		int32_t chain_len = (int32_t)u[i];
+
+		if (i < 3) {
+			fprintf(stderr, "[DEBUG-GENREGS] chain %d: k=%d, u[%d]=0x%lx (len=%d, score=%u)\n",
+					i, k, i, u[i], chain_len, (uint32_t)(u[i]>>32));
+		}
+
 		h = (uint32_t)hash64((hash64(a[k].x) + hash64(a[k].y)) ^ hash);
 		z[i].x = u[i] ^ h; // u[i] -- higher 32 bits: chain score; lower 32 bits: number of seeds in the chain
 		z[i].y = (uint64_t)k << 32 | (int32_t)u[i];
-		k += (int32_t)u[i];
+		k += chain_len;
 	}
+	fprintf(stderr, "[DEBUG-GENREGS] Total: n_u=%d, final k=%d\n", n_u, k);
 	radix_sort_128x(z, z + n_u);
 	for (i = 0; i < n_u>>1; ++i) // reverse, s.t. larger score first
 		tmp = z[i], z[i] = z[n_u-1-i], z[n_u-1-i] = tmp;
@@ -82,7 +90,13 @@ mm_reg1_t *mm_gen_regs(void *km, uint32_t hash, int qlen, int n_u, uint64_t *u, 
 		ri->as = z[i].y >> 32;
 		ri->div = -1.0f;
 		mm_reg_set_coor(ri, qlen, a, is_qstrand);
+
+		if (i < 3) {
+			fprintf(stderr, "[DEBUG-GENREGS] region %d: as=%d, cnt=%d, score=%d\n",
+					i, ri->as, ri->cnt, ri->score);
+		}
 	}
+	fprintf(stderr, "[DEBUG-GENREGS] Created %d regions\n", n_u);
 	kfree(km, z);
 	return r;
 }
@@ -316,6 +330,14 @@ int mm_squeeze_a(void *km, int n_regs, mm_reg1_t *regs, mm128_t *a)
 	for (i = 0; i < n_regs; ++i)
 		aux[i] = (uint64_t)regs[i].as << 32 | i;
 	radix_sort_64(aux, aux + n_regs);
+
+	fprintf(stderr, "[DEBUG-SQUEEZE] n_regs=%d, processing regions:\n", n_regs);
+	for (i = 0; i < n_regs && i < 5; ++i) {
+		mm_reg1_t *r = &regs[(int32_t)aux[i]];
+		fprintf(stderr, "[DEBUG-SQUEEZE]   region %d (orig %d): as=%d, cnt=%d\n",
+				i, (int32_t)aux[i], r->as, r->cnt);
+	}
+
 	for (i = 0; i < n_regs; ++i) {
 		mm_reg1_t *r = &regs[(int32_t)aux[i]];
 		if (r->as != as) {
@@ -324,6 +346,7 @@ int mm_squeeze_a(void *km, int n_regs, mm_reg1_t *regs, mm128_t *a)
 		}
 		as += r->cnt;
 	}
+	fprintf(stderr, "[DEBUG-SQUEEZE] Result: as=%d (squeezed anchor count)\n", as);
 	kfree(km, aux);
 	return as;
 }

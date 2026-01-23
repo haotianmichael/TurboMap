@@ -480,6 +480,12 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             KMALLOC(km, reads[i].u, h_n_u[i]);
             cudaMemcpy(reads[i].u, &d_u[h_offset[i]], sizeof(uint64_t) * h_n_u[i], cudaMemcpyDeviceToHost);
 
+            // Debug: Validate u array
+            if (i < 3) {
+                fprintf(stderr, "[DEBUG] Read %d: n_u=%d, u[0]=%lu (chain_len=%d)\n",
+                        i, h_n_u[i], reads[i].u[0], (int32_t)reads[i].u[0]);
+            }
+
             // Calculate new anchor count (sum of chain lengths)
             int new_n = 0;
             for (int j = 0; j < h_n_u[i]; j++) {
@@ -529,6 +535,14 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                     fprintf(stderr, "[ERROR] Read %d: u array mismatch, cumulative=%d != new_n=%d\n",
                             i, cumulative, new_n);
                 }
+            }
+        } else {
+            // No chains found for this read
+            reads[i].u = NULL;
+            reads[i].n = 0;
+            reads[i].a = NULL;
+            if (i < 3) {
+                fprintf(stderr, "[DEBUG] Read %d: No chains (n_u=0), set u/a to NULL\n", i);
             }
         }
     }

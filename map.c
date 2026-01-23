@@ -446,8 +446,13 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
 
     if (opt->bw_long > opt->bw &&
         (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
-        n_segs == 1 && *n_regs0 > 1) {  // re-chain/long-join for long sequences
-        int32_t st = (int32_t)(*a)[0].y, en = (int32_t)(*a)[(int32_t)(*u)[0] - 1].y;
+        n_segs == 1 && *n_regs0 > 1 && *u != NULL && *a != NULL) {  // re-chain/long-join for long sequences
+        // Additional safety check
+        if ((int32_t)(*u)[0] <= 0) {
+            fprintf(stderr, "[WARNING] post_chaining_helper: Invalid chain length (*u)[0]=%d for n_regs0=%d\n",
+                    (int32_t)(*u)[0], *n_regs0);
+        } else {
+            int32_t st = (int32_t)(*a)[0].y, en = (int32_t)(*a)[(int32_t)(*u)[0] - 1].y;
 		if (*qlen_sum - (en - st) > opt->rmq_rescue_size || en - st > *qlen_sum * opt->rmq_rescue_ratio) {
 			int32_t i;
 			for (i = 0, *n_a = 0; i < *n_regs0; ++i) *n_a += (int32_t)(*u)[i];
@@ -456,6 +461,7 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
 			*a = mg_lchain_rmq(opt->max_gap, opt->rmq_inner_dist, opt->bw_long, opt->max_chain_skip, opt->rmq_size_cap, opt->min_cnt, opt->min_chain_score,
 							  misc.chn_pen_gap, misc.chn_pen_skip, *n_a, *a, n_regs0, u, km);
 		}
+        }
     }
     else if (opt->max_occ > opt->mid_occ && *rep_len > 0 &&
              !(opt->flag & MM_F_RMQ)) {  // re-chain, mostly for short reads

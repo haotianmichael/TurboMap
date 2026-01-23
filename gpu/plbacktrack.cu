@@ -440,16 +440,21 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                 new_n += (int32_t)reads[i].u[j];
             }
 
+            // Allocate new array for compacted anchors (like compact_a does)
+            mm128_t *old_a = reads[i].a;
+            mm128_t *new_a;
+            KMALLOC(km, new_a, new_n);
+
             // Reconstruct complete mm128_t from ax/xrev (x field) and ay/yrev (y field)
-            // mm_set_chain writes to input offset position, so we use h_offset[i]
+            // Copy to new array to avoid stale data in old oversized array
             int max_qpos_found = -1;
             for (int j = 0; j < new_n; j++) {
                 int idx = h_offset[i] + j;
-                reads[i].a[j].x = ((uint64_t)h_xrev[idx] << 32) | (uint32_t)h_ax[idx];
-                reads[i].a[j].y = ((uint64_t)h_yrev[idx] << 32) | (uint32_t)h_ay[idx];
+                new_a[j].x = ((uint64_t)h_xrev[idx] << 32) | (uint32_t)h_ax[idx];
+                new_a[j].y = ((uint64_t)h_yrev[idx] << 32) | (uint32_t)h_ay[idx];
 
                 // Validate qpos
-                uint32_t qpos = (uint32_t)reads[i].a[j].y;
+                uint32_t qpos = (uint32_t)new_a[j].y;
                 if (qpos > max_qpos_found) max_qpos_found = qpos;
             }
 
@@ -460,11 +465,15 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                 fprintf(stderr, "[DEBUG]   Input n_a=%d, offset=%d\n", h_n_a[i], h_offset[i]);
                 // Print first few anchors
                 for (int j = 0; j < min(3, new_n); j++) {
-                    uint32_t qp = (uint32_t)reads[i].a[j].y;
-                    uint32_t qs = (uint32_t)(reads[i].a[j].y >> 32) & 0xff;
+                    uint32_t qp = (uint32_t)new_a[j].y;
+                    uint32_t qs = (uint32_t)(new_a[j].y >> 32) & 0xff;
                     fprintf(stderr, "[DEBUG]   Anchor %d: qpos=%u, qspan=%u\n", j, qp, qs);
                 }
             }
+
+            // Free old oversized array and update pointer to new right-sized array
+            kfree(km, old_a);
+            reads[i].a = new_a;
 
             // Update anchor count
             reads[i].n = new_n;

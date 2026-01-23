@@ -470,10 +470,29 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             }
 
             // Reconstruct complete mm128_t from ax/xrev (x field) and ay/yrev (y field)
+            // mm_set_chain writes to input offset position, so we use h_offset[i]
+            int max_qpos_found = -1;
             for (int j = 0; j < new_n; j++) {
                 int idx = h_offset[i] + j;
                 reads[i].a[j].x = ((uint64_t)h_xrev[idx] << 32) | (uint32_t)h_ax[idx];
                 reads[i].a[j].y = ((uint64_t)h_yrev[idx] << 32) | (uint32_t)h_ay[idx];
+
+                // Validate qpos
+                uint32_t qpos = (uint32_t)reads[i].a[j].y;
+                if (qpos > max_qpos_found) max_qpos_found = qpos;
+            }
+
+            // Debug: Check if any qpos exceeds expected range
+            if (i < 3 && max_qpos_found > 200000) {  // Suspicious if > 200k
+                fprintf(stderr, "[DEBUG] WARNING: Read %d has suspicious max qpos=%u, new_n=%d, n_u=%d\n",
+                        i, max_qpos_found, new_n, h_n_u[i]);
+                fprintf(stderr, "[DEBUG]   Input n_a=%d, offset=%d\n", h_n_a[i], h_offset[i]);
+                // Print first few anchors
+                for (int j = 0; j < min(3, new_n); j++) {
+                    uint32_t qp = (uint32_t)reads[i].a[j].y;
+                    uint32_t qs = (uint32_t)(reads[i].a[j].y >> 32) & 0xff;
+                    fprintf(stderr, "[DEBUG]   Anchor %d: qpos=%u, qspan=%u\n", j, qp, qs);
+                }
             }
 
             // Update anchor count

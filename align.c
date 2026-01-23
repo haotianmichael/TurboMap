@@ -1133,10 +1133,24 @@ static void mm_align_pair_batched(gpu_align_batch_t *gpu_batch,
 }
 
 void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
-                             const mm_mapopt_t *opt, const mm_idx_t *mi, 
+                             const mm_mapopt_t *opt, const mm_idx_t *mi,
                              int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
                              int n_a, mm128_t *a, int read_idx, int reg_idx)
 {
+    // Debug: Validate anchor data at region boundaries
+    if (read_idx < 25 && reg_idx < 5) {
+        uint32_t qpos_first = (uint32_t)a[r->as].y;
+        uint32_t qpos_last = (r->cnt > 0) ? (uint32_t)a[r->as + r->cnt - 1].y : 0;
+        if (qpos_first > qlen || qpos_last > qlen) {
+            fprintf(stderr, "[DEBUG-ALIGN] read_idx=%d, reg_idx=%d, qlen=%d, n_a=%d\n",
+                    read_idx, reg_idx, qlen, n_a);
+            fprintf(stderr, "[DEBUG-ALIGN]   Region: r->as=%d, r->cnt=%d\n", r->as, r->cnt);
+            fprintf(stderr, "[DEBUG-ALIGN]   First anchor qpos=%u, Last anchor qpos=%u\n",
+                    qpos_first, qpos_last);
+            fprintf(stderr, "[DEBUG-ALIGN]   INVALID: qpos exceeds qlen!\n");
+        }
+    }
+
     int is_sr = !!(opt->flag & MM_F_SR), is_splice = !!(opt->flag & MM_F_SPLICE);
     int32_t rid = a[r->as].x<<1>>33, rev = a[r->as].x>>63, as1, cnt1;
     uint8_t *tseq, *qseq, *junc;

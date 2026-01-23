@@ -488,7 +488,22 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             // Update anchor count
             reads[i].n = new_n;
 
-            // Read 0 reconstruction info removed to reduce debug output
+            // Debug: Verify u array and cumulative anchor counts
+            if (i < 5) {
+                int cumulative = 0;
+                fprintf(stderr, "[DEBUG-U-ARRAY] Read %d: n_u=%d, new_n=%d\n", i, h_n_u[i], new_n);
+                for (int j = 0; j < min(10, h_n_u[i]); j++) {
+                    int chain_len = (int32_t)reads[i].u[j];
+                    int chain_score = reads[i].u[j] >> 32;
+                    fprintf(stderr, "[DEBUG-U-ARRAY]   u[%d]: len=%d, score=%d, cumulative_as=%d\n",
+                            j, chain_len, chain_score, cumulative);
+                    cumulative += chain_len;
+                }
+                if (cumulative != new_n) {
+                    fprintf(stderr, "[DEBUG-U-ARRAY]   ERROR: cumulative=%d != new_n=%d!\n",
+                            cumulative, new_n);
+                }
+            }
         }
     }
 

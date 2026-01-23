@@ -25,6 +25,7 @@ typedef struct {
     int32_t *ay;  // (int32_t) a[].y
     int8_t* sid;  // a[].y >> 40 & 0xff
     int32_t *xrev; // a[].x >> 32
+    int32_t *yrev; // a[].y >> 32 (contains q_span and seg_id)
     // outputs
     int32_t *f;   // score
     uint16_t *p;  // predecessor
@@ -68,6 +69,7 @@ typedef struct {
     int32_t *d_ay;
     int8_t *d_sid;  // a[].y >> 40 & 0xff
     int32_t *d_xrev; // a[].x >> 32
+    int32_t *d_yrev; // a[].y >> 32 (contains q_span and seg_id)
     int32_t *d_range;
     int32_t *d_f;   // score
     uint16_t *d_p;  // predecessor

@@ -472,6 +472,20 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                 new_n += (int32_t)reads[i].u[j];
             }
 
+            // Debug: Check if new_n matches expected count
+            if (i < 3) {
+                fprintf(stderr, "[DEBUG-NEWN] Read %d: new_n=%d (from u array sum)\n", i, new_n);
+                // Also check what we'll actually copy
+                int actual_copy_count = 0;
+                for (int j = 0; j < new_n && (h_offset[i] + j) < total_n; j++) {
+                    actual_copy_count++;
+                }
+                if (actual_copy_count != new_n) {
+                    fprintf(stderr, "[ERROR-NEWN] Read %d: will only copy %d anchors (new_n=%d, h_offset=%d, total_n=%d)\n",
+                            i, actual_copy_count, new_n, h_offset[i], total_n);
+                }
+            }
+
             // Allocate new array for compacted anchors (like compact_a does)
             mm128_t *old_a = reads[i].a;
             mm128_t *new_a;

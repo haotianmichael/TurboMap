@@ -68,6 +68,11 @@ mm_reg1_t *mm_gen_regs(void *km, uint32_t hash, int qlen, int n_u, uint64_t *u, 
 					i, k, i, u[i], chain_len, (uint32_t)(u[i]>>32));
 		}
 
+		if (chain_len <= 0 || chain_len > 100000) {
+			fprintf(stderr, "[ERROR-GENREGS] chain %d: invalid chain_len=%d, u[%d]=0x%lx\n",
+					i, chain_len, i, u[i]);
+		}
+
 		h = (uint32_t)hash64((hash64(a[k].x) + hash64(a[k].y)) ^ hash);
 		z[i].x = u[i] ^ h; // u[i] -- higher 32 bits: chain score; lower 32 bits: number of seeds in the chain
 		z[i].y = (uint64_t)k << 32 | (int32_t)u[i];

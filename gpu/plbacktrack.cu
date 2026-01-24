@@ -509,10 +509,16 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaStreamSynchronize(stream);
 
     // Read a few output values AFTER kernel to verify they changed
-    int32_t test_after[5];
-    cudaMemcpy(test_after, d_ay_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
-    fprintf(stderr, "[DEBUG-AFTER-KERNEL] First 5 ay_out values after mm_set_chain: %d %d %d %d %d\n",
-            test_after[0], test_after[1], test_after[2], test_after[3], test_after[4]);
+    // Check both offset 0 and first_read_offset to debug potential offset issues
+    int32_t test_after_0[5];
+    int32_t test_after_offset[5];
+    cudaMemcpy(test_after_0, d_ay_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
+    cudaMemcpy(test_after_offset, d_ay_out + first_read_offset, sizeof(int32_t) * min(5, h_n_a[0]), cudaMemcpyDeviceToHost);
+    fprintf(stderr, "[DEBUG-AFTER-KERNEL] ay_out at offset 0: %d %d %d %d %d\n",
+            test_after_0[0], test_after_0[1], test_after_0[2], test_after_0[3], test_after_0[4]);
+    fprintf(stderr, "[DEBUG-AFTER-KERNEL] ay_out at offset %d: %d %d %d %d %d\n",
+            first_read_offset, test_after_offset[0], test_after_offset[1], test_after_offset[2],
+            test_after_offset[3], test_after_offset[4]);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[ERROR] mm_set_chain kernel failed: %s\n", cudaGetErrorString(err));

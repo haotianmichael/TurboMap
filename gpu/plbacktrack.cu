@@ -726,7 +726,6 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Cleanup
     free(h_offset);
     free(h_n_a);
-    free(h_n_u);
 
     // CRITICAL: Synchronize stream before freeing device buffers
     // to ensure all GPU operations have completed

@@ -190,12 +190,8 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_
                 w_y[i] = (uint64_t)k<<32|i;
                 k += (int32_t)u[i];
             }
-
-            // CRITICAL: Sort w arrays by target position (w_x = b_x[k] = target position)
-            // This must be done before mm_set_chain kernel can process the data
-            // Use thrust::device for device-side sorting within kernel
-            thrust::sort_by_key(thrust::device, w_x, w_x + n_u, w_y);
-
+            // NOTE: Sorting will be done OUTSIDE this kernel from host code
+            // Cannot call thrust::sort from device code (kernel)
             ofs_end[job_idx] = ofs + n_u;
         }
         __syncthreads();
@@ -480,10 +476,26 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     free(h_n_u_temp);
     free(h_u_temp);
 
-    // Step 4: Sort by target position
-    // NOTE: Sorting is now done INSIDE the backtrack kernel using thrust::sort_by_key
-    // This eliminates the need for external CUB DeviceSegmentedRadixSort
-    // The w_x/w_y arrays are already sorted when we reach here
+    // Step 4: Sort w arrays by target position
+    // CRITICAL: w arrays have n_u[i] elements per read, NOT n_a[i]
+    // Cannot use d_offset directly because it's in terms of ANCHORS
+    // Need to sort each read's w segment individually using thrust::sort
+    // Get n_u values to know how many elements to sort per read
+    int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
+    cudaMemcpy(h_n_u, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+
+    // Sort each read's w_x/w_y segment
+    // w arrays start at offset[i] for each read
+    for (int i = 0; i < n_reads; i++) {
+        int n_u_val = h_n_u[i];
+        if (n_u_val > 1) {
+            int64_t *w_x_start = d_p_abs + h_offset[i];
+            int64_t *w_y_start = d_v + h_offset[i];
+            thrust::sort_by_key(thrust::cuda::par.on(stream),
+                                w_x_start, w_x_start + n_u_val, w_y_start);
+        }
+    }
+    free(h_n_u);
 
     cudaStreamSynchronize(stream);
 

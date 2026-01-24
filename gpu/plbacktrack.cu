@@ -391,6 +391,16 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
+    // Debug: Check how many anchors passed the filter (n_z)
+    int *h_ofs_end_after_filter = (int*)malloc(sizeof(int) * n_reads);
+    cudaMemcpy(h_ofs_end_after_filter, d_ofs_end, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    if (n_reads > 0) {
+        int n_z_first = h_ofs_end_after_filter[0] - h_offset[0];
+        fprintf(stderr, "[DEBUG-FILTER] First read: n_a=%d, n_z=%d (filtered anchors)\n",
+                h_n_a[0], n_z_first);
+    }
+    free(h_ofs_end_after_filter);
+
     // Step 2: Sort z arrays by score using CUB (per-read segmented sort)
     size_t temp_storage_bytes = 0;
 
@@ -419,7 +429,21 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // Backtracking statistics removed to reduce debug output
+    // Debug: Check backtrack results and calculate new_n
+    int *h_n_u_temp = (int*)malloc(sizeof(int) * n_reads);
+    uint64_t *h_u_temp = (uint64_t*)malloc(sizeof(uint64_t) * total_n);
+    cudaMemcpy(h_n_u_temp, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    if (n_reads > 0) {
+        cudaMemcpy(h_u_temp, d_u + h_offset[0], sizeof(uint64_t) * h_n_u_temp[0], cudaMemcpyDeviceToHost);
+        int new_n_first = 0;
+        for (int j = 0; j < h_n_u_temp[0]; j++) {
+            new_n_first += (int32_t)h_u_temp[j];
+        }
+        fprintf(stderr, "[DEBUG-BACKTRACK-NEWN] First read: n_u=%d, new_n=%d (sum of chain lengths)\n",
+                h_n_u_temp[0], new_n_first);
+    }
+    free(h_n_u_temp);
+    free(h_u_temp);
 
     // Step 4: Sort by target position using CUB
     // Note: Backtrack kernel already updated ofs_end to ofs+n_u for each read

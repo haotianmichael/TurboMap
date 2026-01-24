@@ -354,10 +354,12 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMalloc(&d_yrev_out, sizeof(int32_t) * total_n);
 
     // Initialize output buffers to zero to avoid reading garbage data
-    cudaMemset(d_ax_out, 0, sizeof(int32_t) * total_n);
-    cudaMemset(d_ay_out, 0, sizeof(int32_t) * total_n);
-    cudaMemset(d_xrev_out, 0, sizeof(int32_t) * total_n);
-    cudaMemset(d_yrev_out, 0, sizeof(int32_t) * total_n);
+    // CRITICAL: Use the same stream as kernels to ensure proper ordering
+    cudaMemsetAsync(d_ax_out, 0, sizeof(int32_t) * total_n, stream);
+    cudaMemsetAsync(d_ay_out, 0, sizeof(int32_t) * total_n, stream);
+    cudaMemsetAsync(d_xrev_out, 0, sizeof(int32_t) * total_n, stream);
+    cudaMemsetAsync(d_yrev_out, 0, sizeof(int32_t) * total_n, stream);
+    cudaStreamSynchronize(stream);  // Ensure initialization completes before proceeding
 
     cudaMalloc(&d_n_a, sizeof(int) * n_reads);
     cudaMalloc(&d_offset, sizeof(int) * n_reads);
@@ -676,6 +678,10 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     free(h_offset);
     free(h_n_a);
     free(h_n_u);
+
+    // CRITICAL: Synchronize stream before freeing device buffers
+    // to ensure all GPU operations have completed
+    cudaStreamSynchronize(stream);
 
     // Free device buffers
     cudaFree(d_zx);

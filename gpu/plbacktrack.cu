@@ -425,14 +425,29 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // Validate input to mm_set_chain - check g_zx and g_zy before kernel runs
-    int64_t *h_test_zx = (int64_t*)malloc(sizeof(int64_t) * 100);
-    int64_t *h_test_zy = (int64_t*)malloc(sizeof(int64_t) * 100);
-    cudaMemcpy(h_test_zx, d_zx, sizeof(int64_t) * 100, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_test_zy, d_zy, sizeof(int64_t) * 100, cudaMemcpyDeviceToHost);
+    // Get n_u and ofs_end for diagnostics
+    int *h_n_u_check = (int*)malloc(sizeof(int) * n_reads);
+    int *h_ofs_end_check = (int*)malloc(sizeof(int) * n_reads);
+    cudaMemcpy(h_n_u_check, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ofs_end_check, d_ofs_end, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
 
-    fprintf(stderr, "[DEBUG-GPU-INPUT] First 10 input b_x/b_y values before mm_set_chain:\n");
-    for (int i = 0; i < 10; i++) {
+    // Validate input to mm_set_chain - check g_zx and g_zy before kernel runs
+    // Use first read's offset to check the correct data
+    int first_read_offset = h_offset[0];
+    int num_to_check_input = min(100, h_n_a[0]);
+
+    fprintf(stderr, "[DEBUG-GPU-LAYOUT] First read: offset=%d, n_a=%d, n_u=%d, ofs_end=%d\n",
+            first_read_offset, h_n_a[0], h_n_u_check[0], h_ofs_end_check[0]);
+
+    int64_t *h_test_zx = (int64_t*)malloc(sizeof(int64_t) * num_to_check_input);
+    int64_t *h_test_zy = (int64_t*)malloc(sizeof(int64_t) * num_to_check_input);
+
+    // Read from the correct offset for first read
+    cudaMemcpy(h_test_zx, d_zx + first_read_offset, sizeof(int64_t) * num_to_check_input, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_test_zy, d_zy + first_read_offset, sizeof(int64_t) * num_to_check_input, cudaMemcpyDeviceToHost);
+
+    fprintf(stderr, "[DEBUG-GPU-INPUT] First read (offset=%d): First 10 input b_x/b_y values before mm_set_chain:\n", first_read_offset);
+    for (int i = 0; i < min(10, num_to_check_input); i++) {
         uint32_t b_y_low = (uint32_t)h_test_zy[i];
         uint32_t b_y_high = (uint32_t)(h_test_zy[i] >> 32);
         uint32_t qpos = b_y_low;
@@ -442,6 +457,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     }
     free(h_test_zx);
     free(h_test_zy);
+    free(h_n_u_check);
+    free(h_ofs_end_check);
 
     // Step 5: Set chain information (write to output buffers)
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
@@ -456,16 +473,22 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Force flush GPU printf buffer
     cudaDeviceSynchronize();
 
-    // Validate output buffers - check first few reads
-    int32_t *h_test_ay = (int32_t*)malloc(sizeof(int32_t) * 100);
-    int32_t *h_test_yrev = (int32_t*)malloc(sizeof(int32_t) * 100);
-    int32_t *h_test_ax = (int32_t*)malloc(sizeof(int32_t) * 100);
-    cudaMemcpy(h_test_ay, d_ay_out, sizeof(int32_t) * 100, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_test_yrev, d_yrev_out, sizeof(int32_t) * 100, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_test_ax, d_ax_out, sizeof(int32_t) * 100, cudaMemcpyDeviceToHost);
+    // Validate output buffers - check first read's output
+    // Use h_offset[0] to get the correct position for the first read
+    int first_read_offset = h_offset[0];
+    int num_to_check = min(100, h_n_a[0]);  // Don't read beyond first read's anchors
 
-    fprintf(stderr, "[DEBUG-GPU-OUTPUT] First 10 output anchors from GPU:\n");
-    for (int i = 0; i < 10; i++) {
+    int32_t *h_test_ay = (int32_t*)malloc(sizeof(int32_t) * num_to_check);
+    int32_t *h_test_yrev = (int32_t*)malloc(sizeof(int32_t) * num_to_check);
+    int32_t *h_test_ax = (int32_t*)malloc(sizeof(int32_t) * num_to_check);
+
+    // Read from the correct offset for first read
+    cudaMemcpy(h_test_ay, d_ay_out + first_read_offset, sizeof(int32_t) * num_to_check, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_test_yrev, d_yrev_out + first_read_offset, sizeof(int32_t) * num_to_check, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_test_ax, d_ax_out + first_read_offset, sizeof(int32_t) * num_to_check, cudaMemcpyDeviceToHost);
+
+    fprintf(stderr, "[DEBUG-GPU-OUTPUT] First read (offset=%d): First 10 output anchors from GPU:\n", first_read_offset);
+    for (int i = 0; i < min(10, num_to_check); i++) {
         uint64_t y_val = ((uint64_t)(uint32_t)h_test_yrev[i] << 32) | (uint32_t)h_test_ay[i];
         uint32_t qpos = (uint32_t)h_test_ay[i];
         uint32_t qspan = (uint32_t)h_test_yrev[i];

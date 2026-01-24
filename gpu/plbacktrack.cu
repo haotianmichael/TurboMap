@@ -495,7 +495,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                                 w_x_start, w_x_start + n_u_val, w_y_start);
         }
     }
-    free(h_n_u);
+    // Note: h_n_u will be freed later after copying results back to host
 
     cudaStreamSynchronize(stream);
 
@@ -597,8 +597,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // This matches the CPU version in lchain.c
 
     // Copy results back to host
-    int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
-    cudaMemcpy(h_n_u, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    // Note: h_n_u was already allocated and copied during sorting step above
 
     // Allocate temporary host buffers for compacted anchors
     int32_t *h_ax = (int32_t*)malloc(sizeof(int32_t) * total_n);
@@ -722,6 +721,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     free(h_ay);
     free(h_xrev);
     free(h_yrev);
+    free(h_n_u);  // Free h_n_u allocated during sorting step
 
     // Cleanup
     free(h_offset);

@@ -494,6 +494,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     free(h_ofs_end_check);
 
     // Read a few output values BEFORE kernel to verify they're zeros
+    // CRITICAL: cudaMemcpy doesn't wait for custom streams, must sync first
+    cudaStreamSynchronize(stream);
     int32_t test_before[5];
     cudaMemcpy(test_before, d_ay_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
     fprintf(stderr, "[DEBUG-BEFORE-KERNEL] First 5 ay_out values before mm_set_chain: %d %d %d %d %d\n",

@@ -193,8 +193,8 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_
 
             // CRITICAL: Sort w arrays by target position (w_x = b_x[k] = target position)
             // This must be done before mm_set_chain kernel can process the data
-            // Use thrust::seq for device-side sorting within kernel
-            thrust::sort_by_key(thrust::seq, w_x, w_x + n_u, w_y);
+            // Use thrust::device for device-side sorting within kernel
+            thrust::sort_by_key(thrust::device, w_x, w_x + n_u, w_y);
 
             ofs_end[job_idx] = ofs + n_u;
         }

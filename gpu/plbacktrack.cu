@@ -423,6 +423,26 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         d_p_abs, d_p_abs, d_v, d_v,
         total_n, n_reads, d_offset, d_ofs_end);
 
+    cudaStreamSynchronize(stream);
+
+    // Validate input to mm_set_chain - check g_zx and g_zy before kernel runs
+    int64_t *h_test_zx = (int64_t*)malloc(sizeof(int64_t) * 100);
+    int64_t *h_test_zy = (int64_t*)malloc(sizeof(int64_t) * 100);
+    cudaMemcpy(h_test_zx, d_zx, sizeof(int64_t) * 100, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_test_zy, d_zy, sizeof(int64_t) * 100, cudaMemcpyDeviceToHost);
+
+    fprintf(stderr, "[DEBUG-GPU-INPUT] First 10 input b_x/b_y values before mm_set_chain:\n");
+    for (int i = 0; i < 10; i++) {
+        uint32_t b_y_low = (uint32_t)h_test_zy[i];
+        uint32_t b_y_high = (uint32_t)(h_test_zy[i] >> 32);
+        uint32_t qpos = b_y_low;
+        uint32_t qspan = b_y_high & 0xff;
+        fprintf(stderr, "[DEBUG-GPU-INPUT]   b[%d]: b_x=0x%lx, b_y=0x%lx (qpos=%u, qspan=%u)\n",
+                i, h_test_zx[i], h_test_zy[i], qpos, qspan);
+    }
+    free(h_test_zx);
+    free(h_test_zy);
+
     // Step 5: Set chain information (write to output buffers)
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, n_reads, d_ax_out, d_ay_out, d_xrev_out, d_yrev_out, d_offset, d_ofs_end,
@@ -436,7 +456,25 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Force flush GPU printf buffer
     cudaDeviceSynchronize();
 
-    // Output buffer check removed to reduce debug output
+    // Validate output buffers - check first few reads
+    int32_t *h_test_ay = (int32_t*)malloc(sizeof(int32_t) * 100);
+    int32_t *h_test_yrev = (int32_t*)malloc(sizeof(int32_t) * 100);
+    int32_t *h_test_ax = (int32_t*)malloc(sizeof(int32_t) * 100);
+    cudaMemcpy(h_test_ay, d_ay_out, sizeof(int32_t) * 100, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_test_yrev, d_yrev_out, sizeof(int32_t) * 100, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_test_ax, d_ax_out, sizeof(int32_t) * 100, cudaMemcpyDeviceToHost);
+
+    fprintf(stderr, "[DEBUG-GPU-OUTPUT] First 10 output anchors from GPU:\n");
+    for (int i = 0; i < 10; i++) {
+        uint64_t y_val = ((uint64_t)(uint32_t)h_test_yrev[i] << 32) | (uint32_t)h_test_ay[i];
+        uint32_t qpos = (uint32_t)h_test_ay[i];
+        uint32_t qspan = (uint32_t)h_test_yrev[i];
+        fprintf(stderr, "[DEBUG-GPU-OUTPUT]   anchor[%d]: ax=%d, ay=%d, yrev=%d (qpos=%u, qspan=%u, y=0x%lx)\n",
+                i, h_test_ax[i], h_test_ay[i], h_test_yrev[i], qpos, qspan, y_val);
+    }
+    free(h_test_ay);
+    free(h_test_yrev);
+    free(h_test_ax);
 
     // Note: Steps 6-8 (gen_regs) are not needed here
     // The CPU side will generate regions from the u array

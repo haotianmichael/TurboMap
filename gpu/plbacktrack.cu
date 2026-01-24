@@ -430,19 +430,21 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     size_t temp_storage_bytes = 0;
 
     // Determine temporary storage requirements
+    // CRITICAL: Use custom stream to ensure proper ordering with other GPU operations
     cub::DeviceSegmentedRadixSort::SortPairsDescending(
         d_temp_storage, temp_storage_bytes,
         d_zx, d_zx, d_zy, d_zy,
-        total_n, n_reads, d_offset, d_ofs_end);
+        total_n, n_reads, d_offset, d_ofs_end, 0, sizeof(int64_t) * 8, stream);
 
     // Allocate temporary storage
     cudaMalloc(&d_temp_storage, temp_storage_bytes);
 
     // Sort descending by score
+    // CRITICAL: Use custom stream to ensure proper ordering with other GPU operations
     cub::DeviceSegmentedRadixSort::SortPairsDescending(
         d_temp_storage, temp_storage_bytes,
         d_zx, d_zx, d_zy, d_zy,
-        total_n, n_reads, d_offset, d_ofs_end);
+        total_n, n_reads, d_offset, d_ofs_end, 0, sizeof(int64_t) * 8, stream);
 
     cudaStreamSynchronize(stream);
 
@@ -474,10 +476,11 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Note: Backtrack kernel already updated ofs_end to ofs+n_u for each read
     // w_x and w_y data are in [offset[i], ofs_end[i]) for each read
     // Use the already-updated ofs_end array directly for segmented sort
+    // CRITICAL: Use custom stream to ensure proper ordering with backtrack kernel
     cub::DeviceSegmentedRadixSort::SortPairs(
         d_temp_storage, temp_storage_bytes,
         d_p_abs, d_p_abs, d_v, d_v,
-        total_n, n_reads, d_offset, d_ofs_end);
+        total_n, n_reads, d_offset, d_ofs_end, 0, sizeof(int64_t) * 8, stream);
 
     cudaStreamSynchronize(stream);
 

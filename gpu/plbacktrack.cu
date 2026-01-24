@@ -380,6 +380,26 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMemcpy(d_offset, h_offset, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
     cudaMemcpy(d_n_a, h_n_a, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
 
+    // CRITICAL VALIDATION: Check if input anchors already have qpos > qlen corruption
+    // This will tell us if the problem is in chain kernel or backtrack kernel
+    if (n_reads > 0 && reads[0].n > 0) {
+        int first_read_qlen = mm->seq[reads[0].id].len;
+        int check_count = min(reads[0].n, 1000);
+        int32_t *h_input_ay_check = (int32_t*)malloc(sizeof(int32_t) * check_count);
+        cudaMemcpy(h_input_ay_check, dev_mem->d_ay + h_offset[0], sizeof(int32_t) * check_count, cudaMemcpyDeviceToHost);
+
+        int invalid_input_count = 0;
+        uint32_t max_input_qpos = 0;
+        for (int j = 0; j < check_count; j++) {
+            uint32_t qpos = (uint32_t)h_input_ay_check[j];
+            if (qpos > max_input_qpos) max_input_qpos = qpos;
+            if (qpos > first_read_qlen) invalid_input_count++;
+        }
+        fprintf(stderr, "[DEBUG-INPUT-ANCHORS] First read: qlen=%d, checked %d input anchors, max_qpos=%u, invalid_count=%d\n",
+                first_read_qlen, check_count, max_input_qpos, invalid_input_count);
+        free(h_input_ay_check);
+    }
+
     // Input validation removed to reduce debug output
 
     // Expand uint16_t predecessors to int64_t (keep relative distance semantics)

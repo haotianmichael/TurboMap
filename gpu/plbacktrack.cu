@@ -352,6 +352,13 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMalloc(&d_ay_out, sizeof(int32_t) * total_n);
     cudaMalloc(&d_xrev_out, sizeof(int32_t) * total_n);
     cudaMalloc(&d_yrev_out, sizeof(int32_t) * total_n);
+
+    // Initialize output buffers to zero to avoid reading garbage data
+    cudaMemset(d_ax_out, 0, sizeof(int32_t) * total_n);
+    cudaMemset(d_ay_out, 0, sizeof(int32_t) * total_n);
+    cudaMemset(d_xrev_out, 0, sizeof(int32_t) * total_n);
+    cudaMemset(d_yrev_out, 0, sizeof(int32_t) * total_n);
+
     cudaMalloc(&d_n_a, sizeof(int) * n_reads);
     cudaMalloc(&d_offset, sizeof(int) * n_reads);
     cudaMalloc(&d_ofs_end, sizeof(int) * n_reads);
@@ -460,12 +467,24 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     free(h_n_u_check);
     free(h_ofs_end_check);
 
+    // Read a few output values BEFORE kernel to verify they're zeros
+    int32_t test_before[5];
+    cudaMemcpy(test_before, d_ay_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
+    fprintf(stderr, "[DEBUG-BEFORE-KERNEL] First 5 ay_out values before mm_set_chain: %d %d %d %d %d\n",
+            test_before[0], test_before[1], test_before[2], test_before[3], test_before[4]);
+
     // Step 5: Set chain information (write to output buffers)
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, n_reads, d_ax_out, d_ay_out, d_xrev_out, d_yrev_out, d_offset, d_ofs_end,
         dev_mem->d_f, d_p_abs, d_u, d_zx, d_zy, d_t, d_v);
 
     cudaStreamSynchronize(stream);
+
+    // Read a few output values AFTER kernel to verify they changed
+    int32_t test_after[5];
+    cudaMemcpy(test_after, d_ay_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
+    fprintf(stderr, "[DEBUG-AFTER-KERNEL] First 5 ay_out values after mm_set_chain: %d %d %d %d %d\n",
+            test_after[0], test_after[1], test_after[2], test_after[3], test_after[4]);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "[ERROR] mm_set_chain kernel failed: %s\n", cudaGetErrorString(err));

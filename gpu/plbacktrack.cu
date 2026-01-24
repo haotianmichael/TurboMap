@@ -559,7 +559,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
             // Debug: Check if new_n matches expected count
             if (i < 3) {
-                fprintf(stderr, "[DEBUG-NEWN] Read %d: new_n=%d (from u array sum)\n", i, new_n);
+                fprintf(stderr, "[DEBUG-NEWN] Read %d: new_n=%d (from u array sum), h_offset=%d, h_n_a=%d\n",
+                        i, new_n, h_offset[i], h_n_a[i]);
                 // Also check what we'll actually copy
                 int actual_copy_count = 0;
                 for (int j = 0; j < new_n && (h_offset[i] + j) < total_n; j++) {

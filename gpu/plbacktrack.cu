@@ -429,6 +429,12 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         dev_mem->d_f, d_p_abs, d_u, d_zx, d_zy, d_t, d_v);
 
     cudaStreamSynchronize(stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[ERROR] mm_set_chain kernel failed: %s\n", cudaGetErrorString(err));
+    }
+    // Force flush GPU printf buffer
+    cudaDeviceSynchronize();
 
     // Output buffer check removed to reduce debug output
 
@@ -493,8 +499,8 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
             // Reconstruct complete mm128_t from ax/xrev (x field) and ay/yrev (y field)
             // Copy to new array to avoid stale data in old oversized array
-            int max_qpos_found = -1;
-            int min_qpos_found = INT_MAX;
+            uint32_t max_qpos_found = 0;  // FIX: Use uint32_t instead of int
+            uint32_t min_qpos_found = UINT32_MAX;
             int invalid_count = 0;
             for (int j = 0; j < new_n; j++) {
                 int idx = h_offset[i] + j;

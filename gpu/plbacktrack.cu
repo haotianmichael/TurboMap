@@ -499,6 +499,26 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
+    // CRITICAL VALIDATION: Check if w arrays were actually sorted
+    if (n_reads > 0 && h_n_u[0] > 0) {
+        int n_u_first = h_n_u[0];
+        int check_w_count = min(10, n_u_first);
+        int64_t *h_w_x = (int64_t*)malloc(sizeof(int64_t) * check_w_count);
+        int64_t *h_w_y = (int64_t*)malloc(sizeof(int64_t) * check_w_count);
+        cudaMemcpy(h_w_x, d_p_abs + h_offset[0], sizeof(int64_t) * check_w_count, cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_w_y, d_v + h_offset[0], sizeof(int64_t) * check_w_count, cudaMemcpyDeviceToHost);
+
+        fprintf(stderr, "[DEBUG-W-SORTED] First read: n_u=%d, first %d w values after sorting:\n", n_u_first, check_w_count);
+        for (int i = 0; i < check_w_count; i++) {
+            int32_t j = (int32_t)h_w_y[i];
+            uint32_t b_offset = (uint32_t)(h_w_y[i] >> 32);
+            fprintf(stderr, "[DEBUG-W-SORTED]   w[%d]: w_x=0x%lx, w_y=0x%lx (j=%d, b_offset=%u)\n",
+                    i, h_w_x[i], h_w_y[i], j, b_offset);
+        }
+        free(h_w_x);
+        free(h_w_y);
+    }
+
     // Get n_u and ofs_end for diagnostics
     int *h_n_u_check = (int*)malloc(sizeof(int) * n_reads);
     int *h_ofs_end_check = (int*)malloc(sizeof(int) * n_reads);

@@ -199,7 +199,7 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_
 __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay, int32_t* g_xrev, int32_t* g_yrev,
                              int* offset, int* ofs_end, int32_t* g_sc, int64_t *g_p,
                              uint64_t* g_u, int64_t* g_zx, int64_t* g_zy,
-                             int32_t* g_t, int64_t* g_v)
+                             int32_t* g_t, int64_t* g_v, int* g_n_v)
 {
     int tid = threadIdx.x;
     int bid = blockIdx.x;
@@ -220,6 +220,7 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
         int32_t* xrev = &g_xrev[ofs];
         int32_t* yrev = &g_yrev[ofs];
         int n_a = g_na[job_idx];
+        int n_v = g_n_v[job_idx];  // CRITICAL: Number of anchors in b[] array
 
         // w_x and w_y should already be sorted by calling code using CUB
 
@@ -266,10 +267,12 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
             for(int x = tid; x < n; x += blockDim.x){
                 uint32_t b_idx = b_offset + x;
 
-                // Bounds check
-                if (b_idx >= n_a) {
+                // CRITICAL bounds check: b[] array has n_v elements, not n_a!
+                // n_v is the number of anchors after backtracking
+                // If b_idx >= n_v, we'd be reading uninitialized/garbage data!
+                if (b_idx >= n_v) {
                     if (job_idx < 2 && i < 3 && x == 0) {
-                        printf("[GPU-SETCHAIN-ERROR] Out of bounds: b_idx=%u >= n_a=%d\n", b_idx, n_a);
+                        printf("[GPU-SETCHAIN-ERROR] Out of bounds: b_idx=%u >= n_v=%d (n_a=%d)\n", b_idx, n_v, n_a);
                     }
                     continue;
                 }
@@ -524,7 +527,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Step 5: Set chain information (write to output buffers)
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, n_reads, d_ax_out, d_ay_out, d_xrev_out, d_yrev_out, d_offset, d_ofs_end,
-        dev_mem->d_f, d_p_abs, d_u, d_zx, d_zy, d_t, d_v);
+        dev_mem->d_f, d_p_abs, d_u, d_zx, d_zy, d_t, d_v, d_n_v);
 
     cudaStreamSynchronize(stream);
 

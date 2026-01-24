@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <assert.h>
 #include <cub/cub.cuh>
+#include <thrust/sort.h>
+#include <thrust/execution_policy.h>
 #include "plbacktrack.cuh"
 #include "hipify.cuh"
 #include "mmpriv.h"
@@ -188,6 +190,12 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_
                 w_y[i] = (uint64_t)k<<32|i;
                 k += (int32_t)u[i];
             }
+
+            // CRITICAL: Sort w arrays by target position (w_x = b_x[k] = target position)
+            // This must be done before mm_set_chain kernel can process the data
+            // Use thrust::seq for device-side sorting within kernel
+            thrust::sort_by_key(thrust::seq, w_x, w_x + n_u, w_y);
+
             ofs_end[job_idx] = ofs + n_u;
         }
         __syncthreads();
@@ -472,15 +480,10 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     free(h_n_u_temp);
     free(h_u_temp);
 
-    // Step 4: Sort by target position using CUB
-    // Note: Backtrack kernel already updated ofs_end to ofs+n_u for each read
-    // w_x and w_y data are in [offset[i], ofs_end[i]) for each read
-    // Use the already-updated ofs_end array directly for segmented sort
-    // CRITICAL: Use custom stream to ensure proper ordering with backtrack kernel
-    cub::DeviceSegmentedRadixSort::SortPairs(
-        d_temp_storage, temp_storage_bytes,
-        d_p_abs, d_p_abs, d_v, d_v,
-        total_n, n_reads, d_offset, d_ofs_end, 0, sizeof(int64_t) * 8, stream);
+    // Step 4: Sort by target position
+    // NOTE: Sorting is now done INSIDE the backtrack kernel using thrust::sort_by_key
+    // This eliminates the need for external CUB DeviceSegmentedRadixSort
+    // The w_x/w_y arrays are already sorted when we reach here
 
     cudaStreamSynchronize(stream);
 

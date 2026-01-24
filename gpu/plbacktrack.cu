@@ -474,8 +474,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaDeviceSynchronize();
 
     // Validate output buffers - check first read's output
-    // Use h_offset[0] to get the correct position for the first read
-    int first_read_offset = h_offset[0];
+    // Reuse first_read_offset from earlier validation
     int num_to_check = min(100, h_n_a[0]);  // Don't read beyond first read's anchors
 
     int32_t *h_test_ay = (int32_t*)malloc(sizeof(int32_t) * num_to_check);

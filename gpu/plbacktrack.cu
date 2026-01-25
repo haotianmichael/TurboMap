@@ -476,13 +476,9 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             // Free old oversized array and update pointer to new right-sized array
             kfree(km, old_a);
             reads[i].a = new_a;
-
-            // Update anchor count
-            reads[i].n = new_n;
         } else {
             // No chains found for this read
             reads[i].u = NULL;
-            reads[i].n = 0;
             reads[i].a = NULL;
         }
     }

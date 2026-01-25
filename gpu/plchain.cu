@@ -228,14 +228,35 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id,
             total_n_long_segs += 
                 long_segs[long_seg_idx].end_idx - long_segs[long_seg_idx].start_idx;
         }
-        
+
+        // CRITICAL FIX: Restore correct micro-batch anchors before GPU backtracking
+        // Problem: During forward pass, each micro-batch overwrites dev_mem->d_ax/d_ay
+        // After all micro-batches complete, dev_mem contains ONLY the last micro-batch's anchors
+        // Solution: Copy this micro-batch's anchors from host_mem back to dev_mem before backtracking
+        hostMemPtr *curr_host_mem = &stream_setup.streams[stream_id].host_mems[uid];
+        deviceMemPtr *dev_mem = &stream_setup.streams[stream_id].dev_mem;
+        cudaStream_t curr_stream = stream_setup.streams[stream_id].cudastream;
+
+        cudaMemcpyAsync(dev_mem->d_ax, curr_host_mem->ax,
+                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
+                        curr_stream);
+        cudaMemcpyAsync(dev_mem->d_ay, curr_host_mem->ay,
+                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
+                        curr_stream);
+        cudaMemcpyAsync(dev_mem->d_xrev, curr_host_mem->xrev,
+                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
+                        curr_stream);
+        cudaMemcpyAsync(dev_mem->d_yrev, curr_host_mem->yrev,
+                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
+                        curr_stream);
+        cudaStreamSynchronize(curr_stream);  // Ensure anchors are copied before backtracking
+
         // Use GPU backtracking instead of CPU
-        plbacktrack_gpu(&stream_setup.streams[stream_id].host_mems[uid],
-                       &stream_setup.streams[stream_id].dev_mem,
+        plbacktrack_gpu(curr_host_mem, dev_mem,
                        stream_setup.streams[stream_id].reads + n_reads, misc, km,
-                       stream_setup.streams[stream_id].cudastream);
-        
-        n_reads += stream_setup.streams[stream_id].host_mems[uid].size;
+                       curr_stream);
+
+        n_reads += curr_host_mem->size;
     }
     
     return n_reads;

@@ -228,32 +228,12 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
 
         // w_x and w_y should already be sorted by calling code using CUB
 
-        // Debug: Print first few w values for first job
-        if (job_idx < 2 && tid == 0 && n_u > 0) {
-            printf("[GPU-SETCHAIN] job %d: n_u=%d, n_a=%d\n", job_idx, n_u, n_a);
-            for (int dbg = 0; dbg < min(3, n_u); dbg++) {
-                printf("[GPU-SETCHAIN]   w[%d]: w_x=0x%lx, w_y=0x%lx (j=%d, k_offset=%u)\n",
-                       dbg, w_x[dbg], w_y[dbg], (int32_t)w_y[dbg], (uint32_t)(w_y[dbg]>>32));
-                int32_t j_dbg = (int32_t)w_y[dbg];
-                if (j_dbg >= 0 && j_dbg < n_u) {
-                    printf("[GPU-SETCHAIN]     u[%d]=0x%lx (chain_len=%d)\n",
-                           j_dbg, u[j_dbg], (int32_t)u[j_dbg]);
-                }
-            }
-        }
-        __syncthreads();
-
         // Copy sorted anchors back - decompose 64-bit values into ax/ay/xrev/yrev
         // CRITICAL: k must be shared across all threads, so declare in shared memory or compute per-iteration
         for (int i = 0; i < n_u; ++i) {
             int32_t j = (int32_t)w_y[i], n = (int32_t)u[j];
             if(tid == 0) u2[i] = u[j];
 
-            // Validate indices
-            if (tid == 0 && (j < 0 || j >= n_u || n <= 0 || n > 100000)) {
-                printf("[GPU-SETCHAIN-ERROR] job %d, i=%d: invalid j=%d or n=%d (n_u=%d)\n",
-                       job_idx, i, j, n, n_u);
-            }
 
             // Compute k for this iteration (sum of all previous chain lengths)
             int k = 0;
@@ -261,12 +241,7 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
                 k += (int32_t)u[(int32_t)w_y[ii]];
             }
 
-            // Validate k and b array indices
             uint32_t b_offset = (uint32_t)(w_y[i]>>32);
-            if (tid == 0 && job_idx < 2 && i < 3) {
-                printf("[GPU-SETCHAIN]   Processing chain %d: j=%d, n=%d, k=%d, b_offset=%u\n",
-                       i, j, n, k, b_offset);
-            }
 
             for(int x = tid; x < n; x += blockDim.x){
                 uint32_t b_idx = b_offset + x;
@@ -275,9 +250,6 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
                 // n_v is the number of anchors after backtracking
                 // If b_idx >= n_v, we'd be reading uninitialized/garbage data!
                 if (b_idx >= n_v) {
-                    if (job_idx < 2 && i < 3 && x == 0) {
-                        printf("[GPU-SETCHAIN-ERROR] Out of bounds: b_idx=%u >= n_v=%d (n_a=%d)\n", b_idx, n_v, n_a);
-                    }
                     continue;
                 }
 
@@ -286,9 +258,6 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
 
                 int out_idx = k + x;
                 if (out_idx >= n_a) {
-                    if (job_idx < 2 && i < 3 && x == 0) {
-                        printf("[GPU-SETCHAIN-ERROR] Output out of bounds: out_idx=%d >= n_a=%d\n", out_idx, n_a);
-                    }
                     continue;
                 }
 
@@ -387,27 +356,6 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     cudaMemcpy(d_offset, h_offset, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
     cudaMemcpy(d_n_a, h_n_a, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
 
-    // CRITICAL VALIDATION: Check if input anchors already have suspiciously large qpos values
-    // This will tell us if the problem is in chain kernel or backtrack kernel
-    // Note: Most reads are < 200kb, so qpos > 200000 is suspicious
-    if (n_reads > 0 && reads[0].n > 0) {
-        int check_count = (reads[0].n < 1000) ? reads[0].n : 1000;
-        int32_t *h_input_ay_check = (int32_t*)malloc(sizeof(int32_t) * check_count);
-        cudaMemcpy(h_input_ay_check, dev_mem->d_ay + h_offset[0], sizeof(int32_t) * check_count, cudaMemcpyDeviceToHost);
-
-        int suspicious_count = 0;
-        uint32_t max_input_qpos = 0;
-        for (int j = 0; j < check_count; j++) {
-            uint32_t qpos = (uint32_t)h_input_ay_check[j];
-            if (qpos > max_input_qpos) max_input_qpos = qpos;
-            if (qpos > 200000) suspicious_count++;
-        }
-        fprintf(stderr, "[DEBUG-INPUT-ANCHORS] First read: checked %d input anchors, max_qpos=%u, suspicious_count(>200k)=%d\n",
-                check_count, max_input_qpos, suspicious_count);
-        free(h_input_ay_check);
-    }
-
-    // Input validation removed to reduce debug output
 
     // Expand uint16_t predecessors to int64_t (keep relative distance semantics)
     expand_p_to_int64<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
@@ -419,16 +367,6 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         d_ofs_end, d_t, d_num_elements, d_n_v, n_reads);
 
     cudaStreamSynchronize(stream);
-
-    // Debug: Check how many anchors passed the filter (n_z)
-    int *h_ofs_end_after_filter = (int*)malloc(sizeof(int) * n_reads);
-    cudaMemcpy(h_ofs_end_after_filter, d_ofs_end, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-    if (n_reads > 0) {
-        int n_z_first = h_ofs_end_after_filter[0] - h_offset[0];
-        fprintf(stderr, "[DEBUG-FILTER] First read: n_a=%d, n_z=%d (filtered anchors)\n",
-                h_n_a[0], n_z_first);
-    }
-    free(h_ofs_end_after_filter);
 
     // Step 2: Sort z arrays by score using CUB (per-read segmented sort)
     size_t temp_storage_bytes = 0;
@@ -460,22 +398,6 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // Debug: Check backtrack results and calculate new_n
-    int *h_n_u_temp = (int*)malloc(sizeof(int) * n_reads);
-    uint64_t *h_u_temp = (uint64_t*)malloc(sizeof(uint64_t) * total_n);
-    cudaMemcpy(h_n_u_temp, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-    if (n_reads > 0) {
-        cudaMemcpy(h_u_temp, d_u + h_offset[0], sizeof(uint64_t) * h_n_u_temp[0], cudaMemcpyDeviceToHost);
-        int new_n_first = 0;
-        for (int j = 0; j < h_n_u_temp[0]; j++) {
-            new_n_first += (int32_t)h_u_temp[j];
-        }
-        fprintf(stderr, "[DEBUG-BACKTRACK-NEWN] First read: n_u=%d, new_n=%d (sum of chain lengths)\n",
-                h_n_u_temp[0], new_n_first);
-    }
-    free(h_n_u_temp);
-    free(h_u_temp);
-
     // Step 4: Sort w arrays by target position
     // CRITICAL: w arrays have n_u[i] elements per read, NOT n_a[i]
     // Cannot use d_offset directly because it's in terms of ANCHORS
@@ -499,118 +421,12 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // CRITICAL VALIDATION: Check if w arrays were actually sorted
-    if (n_reads > 0 && h_n_u[0] > 0) {
-        int n_u_first = h_n_u[0];
-        int check_w_count = min(10, n_u_first);
-        int64_t *h_w_x = (int64_t*)malloc(sizeof(int64_t) * check_w_count);
-        int64_t *h_w_y = (int64_t*)malloc(sizeof(int64_t) * check_w_count);
-        cudaMemcpy(h_w_x, d_p_abs + h_offset[0], sizeof(int64_t) * check_w_count, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_w_y, d_v + h_offset[0], sizeof(int64_t) * check_w_count, cudaMemcpyDeviceToHost);
-
-        fprintf(stderr, "[DEBUG-W-SORTED] First read: n_u=%d, first %d w values after sorting:\n", n_u_first, check_w_count);
-        for (int i = 0; i < check_w_count; i++) {
-            int32_t j = (int32_t)h_w_y[i];
-            uint32_t b_offset = (uint32_t)(h_w_y[i] >> 32);
-            fprintf(stderr, "[DEBUG-W-SORTED]   w[%d]: w_x=0x%lx, w_y=0x%lx (j=%d, b_offset=%u)\n",
-                    i, h_w_x[i], h_w_y[i], j, b_offset);
-        }
-        free(h_w_x);
-        free(h_w_y);
-    }
-
-    // Get n_u and ofs_end for diagnostics
-    int *h_n_u_check = (int*)malloc(sizeof(int) * n_reads);
-    int *h_ofs_end_check = (int*)malloc(sizeof(int) * n_reads);
-    cudaMemcpy(h_n_u_check, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ofs_end_check, d_ofs_end, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-
-    // Validate input to mm_set_chain - check g_zx and g_zy before kernel runs
-    // Use first read's offset to check the correct data
-    int first_read_offset = h_offset[0];
-    int num_to_check_input = min(100, h_n_a[0]);
-
-    fprintf(stderr, "[DEBUG-GPU-LAYOUT] First read: offset=%d, n_a=%d, n_u=%d, ofs_end=%d\n",
-            first_read_offset, h_n_a[0], h_n_u_check[0], h_ofs_end_check[0]);
-
-    int64_t *h_test_zx = (int64_t*)malloc(sizeof(int64_t) * num_to_check_input);
-    int64_t *h_test_zy = (int64_t*)malloc(sizeof(int64_t) * num_to_check_input);
-
-    // Read from the correct offset for first read
-    cudaMemcpy(h_test_zx, d_zx + first_read_offset, sizeof(int64_t) * num_to_check_input, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_test_zy, d_zy + first_read_offset, sizeof(int64_t) * num_to_check_input, cudaMemcpyDeviceToHost);
-
-    fprintf(stderr, "[DEBUG-GPU-INPUT] First read (offset=%d): First 10 input b_x/b_y values before mm_set_chain:\n", first_read_offset);
-    for (int i = 0; i < min(10, num_to_check_input); i++) {
-        uint32_t b_y_low = (uint32_t)h_test_zy[i];
-        uint32_t b_y_high = (uint32_t)(h_test_zy[i] >> 32);
-        uint32_t qpos = b_y_low;
-        uint32_t qspan = b_y_high & 0xff;
-        fprintf(stderr, "[DEBUG-GPU-INPUT]   b[%d]: b_x=0x%lx, b_y=0x%lx (qpos=%u, qspan=%u)\n",
-                i, h_test_zx[i], h_test_zy[i], qpos, qspan);
-    }
-    free(h_test_zx);
-    free(h_test_zy);
-    free(h_n_u_check);
-    free(h_ofs_end_check);
-
-    // Read a few output values BEFORE kernel to verify they're zeros
-    // CRITICAL: cudaMemcpy doesn't wait for custom streams, must sync first
-    cudaStreamSynchronize(stream);
-    int32_t test_before[5];
-    cudaMemcpy(test_before, d_ay_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
-    fprintf(stderr, "[DEBUG-BEFORE-KERNEL] First 5 ay_out values before mm_set_chain: %d %d %d %d %d\n",
-            test_before[0], test_before[1], test_before[2], test_before[3], test_before[4]);
-
     // Step 5: Set chain information (write to output buffers)
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, n_reads, d_ax_out, d_ay_out, d_xrev_out, d_yrev_out, d_offset, d_ofs_end,
         dev_mem->d_f, d_p_abs, d_u, d_zx, d_zy, d_t, d_v, d_n_v);
 
     cudaStreamSynchronize(stream);
-
-    // Read a few output values AFTER kernel to verify they changed
-    // Check both offset 0 and first_read_offset to debug potential offset issues
-    int32_t test_after_0[5];
-    int32_t test_after_offset[5];
-    cudaMemcpy(test_after_0, d_ay_out, sizeof(int32_t) * 5, cudaMemcpyDeviceToHost);
-    cudaMemcpy(test_after_offset, d_ay_out + first_read_offset, sizeof(int32_t) * min(5, h_n_a[0]), cudaMemcpyDeviceToHost);
-    fprintf(stderr, "[DEBUG-AFTER-KERNEL] ay_out at offset 0: %d %d %d %d %d\n",
-            test_after_0[0], test_after_0[1], test_after_0[2], test_after_0[3], test_after_0[4]);
-    fprintf(stderr, "[DEBUG-AFTER-KERNEL] ay_out at offset %d: %d %d %d %d %d\n",
-            first_read_offset, test_after_offset[0], test_after_offset[1], test_after_offset[2],
-            test_after_offset[3], test_after_offset[4]);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "[ERROR] mm_set_chain kernel failed: %s\n", cudaGetErrorString(err));
-    }
-    // Force flush GPU printf buffer
-    cudaDeviceSynchronize();
-
-    // Validate output buffers - check first read's output
-    // Reuse first_read_offset from earlier validation
-    int num_to_check = min(100, h_n_a[0]);  // Don't read beyond first read's anchors
-
-    int32_t *h_test_ay = (int32_t*)malloc(sizeof(int32_t) * num_to_check);
-    int32_t *h_test_yrev = (int32_t*)malloc(sizeof(int32_t) * num_to_check);
-    int32_t *h_test_ax = (int32_t*)malloc(sizeof(int32_t) * num_to_check);
-
-    // Read from the correct offset for first read
-    cudaMemcpy(h_test_ay, d_ay_out + first_read_offset, sizeof(int32_t) * num_to_check, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_test_yrev, d_yrev_out + first_read_offset, sizeof(int32_t) * num_to_check, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_test_ax, d_ax_out + first_read_offset, sizeof(int32_t) * num_to_check, cudaMemcpyDeviceToHost);
-
-    fprintf(stderr, "[DEBUG-GPU-OUTPUT] First read (offset=%d): First 10 output anchors from GPU:\n", first_read_offset);
-    for (int i = 0; i < min(10, num_to_check); i++) {
-        uint64_t y_val = ((uint64_t)(uint32_t)h_test_yrev[i] << 32) | (uint32_t)h_test_ay[i];
-        uint32_t qpos = (uint32_t)h_test_ay[i];
-        uint32_t qspan = (uint32_t)h_test_yrev[i];
-        fprintf(stderr, "[DEBUG-GPU-OUTPUT]   anchor[%d]: ax=%d, ay=%d, yrev=%d (qpos=%u, qspan=%u, y=0x%lx)\n",
-                i, h_test_ax[i], h_test_ay[i], h_test_yrev[i], qpos, qspan, y_val);
-    }
-    free(h_test_ay);
-    free(h_test_yrev);
-    free(h_test_ax);
 
     // Note: Steps 6-8 (gen_regs) are not needed here
     // The CPU side will generate regions from the u array
@@ -639,31 +455,10 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             KMALLOC(km, reads[i].u, h_n_u[i]);
             cudaMemcpy(reads[i].u, &d_u[h_offset[i]], sizeof(uint64_t) * h_n_u[i], cudaMemcpyDeviceToHost);
 
-            // Debug: Validate u array
-            if (i < 3) {
-                fprintf(stderr, "[DEBUG] Read %d: n_u=%d, u[0]=%lu (chain_len=%d)\n",
-                        i, h_n_u[i], reads[i].u[0], (int32_t)reads[i].u[0]);
-            }
-
             // Calculate new anchor count (sum of chain lengths)
             int new_n = 0;
             for (int j = 0; j < h_n_u[i]; j++) {
                 new_n += (int32_t)reads[i].u[j];
-            }
-
-            // Debug: Check if new_n matches expected count
-            if (i < 3) {
-                fprintf(stderr, "[DEBUG-NEWN] Read %d: new_n=%d (from u array sum), h_offset=%d, h_n_a=%d\n",
-                        i, new_n, h_offset[i], h_n_a[i]);
-                // Also check what we'll actually copy
-                int actual_copy_count = 0;
-                for (int j = 0; j < new_n && (h_offset[i] + j) < total_n; j++) {
-                    actual_copy_count++;
-                }
-                if (actual_copy_count != new_n) {
-                    fprintf(stderr, "[ERROR-NEWN] Read %d: will only copy %d anchors (new_n=%d, h_offset=%d, total_n=%d)\n",
-                            i, actual_copy_count, new_n, h_offset[i], total_n);
-                }
             }
 
             // Allocate new array for compacted anchors (like compact_a does)
@@ -672,38 +467,10 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
             KMALLOC(km, new_a, new_n);
 
             // Reconstruct complete mm128_t from ax/xrev (x field) and ay/yrev (y field)
-            // Copy to new array to avoid stale data in old oversized array
-            uint32_t max_qpos_found = 0;  // FIX: Use uint32_t instead of int
-            uint32_t min_qpos_found = UINT32_MAX;
-            int invalid_count = 0;
             for (int j = 0; j < new_n; j++) {
                 int idx = h_offset[i] + j;
                 new_a[j].x = ((uint64_t)h_xrev[idx] << 32) | (uint32_t)h_ax[idx];
                 new_a[j].y = ((uint64_t)h_yrev[idx] << 32) | (uint32_t)h_ay[idx];
-
-                // Validate qpos and q_span
-                uint32_t qpos = (uint32_t)new_a[j].y;
-                uint32_t q_span = (uint32_t)(new_a[j].y >> 32) & 0xff;
-
-                if (qpos > max_qpos_found) max_qpos_found = qpos;
-                if (qpos < min_qpos_found) min_qpos_found = qpos;
-
-                // Check for obviously invalid values
-                if (qpos > 1000000 || q_span > 255 || q_span == 0) {
-                    if (i < 3 && invalid_count < 5) {
-                        fprintf(stderr, "[DEBUG-ANCHOR] Read %d, anchor %d: ax=%d, ay=%d, xrev=%d, yrev=%d\n",
-                                i, j, h_ax[idx], h_ay[idx], h_xrev[idx], h_yrev[idx]);
-                        fprintf(stderr, "[DEBUG-ANCHOR]   Reconstructed: x=0x%lx, y=0x%lx (qpos=%u, q_span=%u)\n",
-                                new_a[j].x, new_a[j].y, qpos, q_span);
-                    }
-                    invalid_count++;
-                }
-            }
-
-            // Print diagnostics for first few reads or suspicious data
-            if (i < 5 || invalid_count > 0) {
-                fprintf(stderr, "[DEBUG-BACKTRACK] Read %d: n_u=%d, new_n=%d, qpos range [%d, %d], invalid=%d\n",
-                        i, h_n_u[i], new_n, min_qpos_found, max_qpos_found, invalid_count);
             }
 
             // Free old oversized array and update pointer to new right-sized array
@@ -712,26 +479,11 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
             // Update anchor count
             reads[i].n = new_n;
-
-            // Verify u array cumulative count
-            if (i < 5) {
-                int cumulative = 0;
-                for (int j = 0; j < h_n_u[i]; j++) {
-                    cumulative += (int32_t)reads[i].u[j];
-                }
-                if (cumulative != new_n) {
-                    fprintf(stderr, "[ERROR] Read %d: u array mismatch, cumulative=%d != new_n=%d\n",
-                            i, cumulative, new_n);
-                }
-            }
         } else {
             // No chains found for this read
             reads[i].u = NULL;
             reads[i].n = 0;
             reads[i].a = NULL;
-            if (i < 3) {
-                fprintf(stderr, "[DEBUG] Read %d: No chains (n_u=0), set u/a to NULL\n", i);
-            }
         }
     }
 

@@ -284,7 +284,16 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id,
         cudaMemcpyAsync(dev_mem->d_yrev, curr_host_mem->yrev,
                         sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
                         curr_stream);
-        cudaStreamSynchronize(curr_stream);  // Ensure anchors are copied before backtracking
+        // CRITICAL FIX: Also copy score (f) and predecessor (p) arrays
+        // These contain the chaining results from forward pass + long segments
+        // Without this, GPU backtracking uses stale/incorrect data
+        cudaMemcpyAsync(dev_mem->d_f, curr_host_mem->f,
+                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
+                        curr_stream);
+        cudaMemcpyAsync(dev_mem->d_p, curr_host_mem->p,
+                        sizeof(uint16_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
+                        curr_stream);
+        cudaStreamSynchronize(curr_stream);  // Ensure all data is copied before backtracking
 
         // Use GPU backtracking instead of CPU
         plbacktrack_gpu(curr_host_mem, dev_mem,

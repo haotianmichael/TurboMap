@@ -1,7 +1,7 @@
-[M::main::7.556*1.00] loaded/built the index for 455 target sequence(s)
-[M::mm_mapopt_update::10.729*1.00] mid_occ = 728
+[M::main::7.638*1.00] loaded/built the index for 455 target sequence(s)
+[M::mm_mapopt_update::10.019*1.00] mid_occ = 728
 [M::mm_idx_stat] kmer size: 15; skip: 10; is_hpc: 0; #seq: 455
-[M::mm_idx_stat::12.002*1.00] distinct minimizers: 100202295 (37.96% are singletons); average occurrences: 5.732; average spacing: 5.587; total length: 3209286105
+[M::mm_idx_stat::11.304*1.00] distinct minimizers: 100202295 (37.96% are singletons); average occurrences: 5.732; average spacing: 5.587; total length: 3209286105
 [Info] max anchors per stream: 50000000, max range grid 51526 max_num_cut 147657 long_seg_buffer_size 100000000
 [Info] Host Malloc Pinned Memory Size 0.89 GB
 [Info] Host Malloc Pinned Memory Size 0.89 GB
@@ -21,347 +21,91 @@
 [Info::init_stream_gpu] Compile time config: 
 		 USE CUDA
 		 MAX MICRO BATCH       	8
-[Info] plchain_cal_score_async (gpu/plchain.cu:405) Launching Batch: n_read 321, total anchors 200577882 (mem usage: 401.16%)
-[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#0 batch_n 49753448, read_start 0, read_end 81 usage 99.51 %
-[DEBUG](MICROBATCH# 0) total segs: 97135, short:96861 mid: 209 
-[DEBUG] aggreagated num of long segs 65, 0-65 belongs to this minibatch
-[DEBUG] workload (sc pairs) in long segs: 4219300916
-[DEBUG] Total workload (sc pairs) in batch: 4481932717. 94.14% work are in long segs.
-[DEBUG] Short Seg kernel #0 throughput: 450.17 Mpairs/s
-[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#1 batch_n 49525460, read_start 81, read_end 160 usage 99.05 %
-[DEBUG](MICROBATCH# 1) total segs: 96694, short:96250 mid: 280 
-[DEBUG] aggreagated num of long segs 164, 65-164 belongs to this minibatch
-[DEBUG] workload (sc pairs) in long segs: 5704797737
-[DEBUG] Total workload (sc pairs) in batch: 6097957139. 93.55% work are in long segs.
-[DEBUG] Short Seg kernel #1 throughput: 848.86 Mpairs/s
-[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#2 batch_n 49993390, read_start 160, read_end 246 usage 99.99 %
-[DEBUG](MICROBATCH# 2) total segs: 97596, short:97212 mid: 169 
-[DEBUG] aggreagated num of long segs 215, 164-215 belongs to this minibatch
-[DEBUG] workload (sc pairs) in long segs: 275213765
-[DEBUG] Total workload (sc pairs) in batch: 506478242. 54.34% work are in long segs.
-[DEBUG] Short Seg kernel #2 throughput: 593.90 Mpairs/s
-[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#3 batch_n 49730649, read_start 246, read_end 319 usage 99.46 %
-[DEBUG](MICROBATCH# 3) total segs: 97095, short:96364 mid: 374 
-[DEBUG] aggreagated num of long segs 357, 215-357 belongs to this minibatch
-[DEBUG] workload (sc pairs) in long segs: 15921560789
-[DEBUG] Total workload (sc pairs) in batch: 16390450230. 97.14% work are in long segs.
-[DEBUG] Short Seg kernel #3 throughput: 802.88 Mpairs/s
-[WARNING] Unable to fit reads 319 - 320 into a microbatch. Fall back to cpu chaining
+[Info] plchain_cal_score_async (gpu/plchain.cu:405) Launching Batch: n_read 946, total anchors 200317381 (mem usage: 400.63%)
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#0 batch_n 49830028, read_start 0, read_end 235 usage 99.66 %
+[DEBUG](MICROBATCH# 0) total segs: 97211, short:96618 mid: 501 
+[DEBUG] aggreagated num of long segs 92, 0-92 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 3920011656
+[DEBUG] Total workload (sc pairs) in batch: 4497296282. 87.16% work are in long segs.
+[DEBUG] Short Seg kernel #0 throughput: 719.97 Mpairs/s
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#1 batch_n 49902382, read_start 235, read_end 471 usage 99.80 %
+[DEBUG](MICROBATCH# 1) total segs: 97345, short:96756 mid: 433 
+[DEBUG] aggreagated num of long segs 156, 92-156 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 3175534214
+[DEBUG] Total workload (sc pairs) in batch: 3642840593. 87.17% work are in long segs.
+[DEBUG] Short Seg kernel #1 throughput: 907.71 Mpairs/s
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#2 batch_n 49857515, read_start 471, read_end 708 usage 99.72 %
+[DEBUG](MICROBATCH# 2) total segs: 97263, short:96586 mid: 462 
+[DEBUG] aggreagated num of long segs 215, 156-215 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 3131592914
+[DEBUG] Total workload (sc pairs) in batch: 3638825778. 86.06% work are in long segs.
+[DEBUG] Short Seg kernel #2 throughput: 730.87 Mpairs/s
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#3 batch_n 49922810, read_start 708, read_end 943 usage 99.85 %
+[DEBUG](MICROBATCH# 3) total segs: 97394, short:96530 mid: 519 
+[DEBUG] aggreagated num of long segs 345, 215-345 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 2449512627
+[DEBUG] Total workload (sc pairs) in batch: 3164157131. 77.41% work are in long segs.
+[DEBUG] Short Seg kernel #3 throughput: 1244.33 Mpairs/s
+[WARNING] Unable to fit reads 943 - 945 into a microbatch. Fall back to cpu chaining
 [Debug] plscore_async_long_forward_dp (gpu/plscore.cu:582) Long Grid Dim = 144
 
 [P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[328945]: rel=0 -> abs=-1 (expected=-1)
-  p[328946]: rel=0 -> abs=-1 (expected=-1)
-  p[328947]: rel=0 -> abs=-1 (expected=-1)
-  p[328948]: rel=0 -> abs=-1 (expected=-1)
-  p[328949]: rel=0 -> abs=-1 (expected=-1)
-  p[328950]: rel=0 -> abs=-1 (expected=-1)
-  p[328951]: rel=0 -> abs=-1 (expected=-1)
-  p[328952]: rel=0 -> abs=-1 (expected=-1)
-  p[328953]: rel=0 -> abs=-1 (expected=-1)
-  p[328954]: rel=0 -> abs=-1 (expected=-1)
-  p[328955]: rel=0 -> abs=-1 (expected=-1)
-  p[328956]: rel=0 -> abs=-1 (expected=-1)
-  p[328957]: rel=0 -> abs=-1 (expected=-1)
-  p[328958]: rel=0 -> abs=-1 (expected=-1)
-  p[328959]: rel=1 -> abs=328958 (expected=328958)
-  p[328960]: rel=0 -> abs=-1 (expected=-1)
-  p[328961]: rel=0 -> abs=-1 (expected=-1)
-  p[328962]: rel=0 -> abs=-1 (expected=-1)
-  p[328963]: rel=0 -> abs=-1 (expected=-1)
-  p[328964]: rel=0 -> abs=-1 (expected=-1)
+  p[85511]: rel=0 -> abs=-1 (expected=-1)
+  p[85512]: rel=1 -> abs=85511 (expected=85511)
+  p[85513]: rel=0 -> abs=-1 (expected=-1)
+  p[85514]: rel=0 -> abs=-1 (expected=-1)
+  p[85515]: rel=0 -> abs=-1 (expected=-1)
+  p[85516]: rel=0 -> abs=-1 (expected=-1)
+  p[85517]: rel=0 -> abs=-1 (expected=-1)
+  p[85518]: rel=0 -> abs=-1 (expected=-1)
+  p[85519]: rel=0 -> abs=-1 (expected=-1)
+  p[85520]: rel=0 -> abs=-1 (expected=-1)
+  p[85521]: rel=0 -> abs=-1 (expected=-1)
+  p[85522]: rel=0 -> abs=-1 (expected=-1)
+  p[85523]: rel=0 -> abs=-1 (expected=-1)
+  p[85524]: rel=0 -> abs=-1 (expected=-1)
+  p[85525]: rel=0 -> abs=-1 (expected=-1)
+  p[85526]: rel=1 -> abs=85525 (expected=85525)
+  p[85527]: rel=0 -> abs=-1 (expected=-1)
+  p[85528]: rel=1 -> abs=85527 (expected=85527)
+  p[85529]: rel=0 -> abs=-1 (expected=-1)
+  p[85530]: rel=0 -> abs=-1 (expected=-1)
 
 [CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 328965
-  First 10 scores: 15 15 15 15 23 25 15 15 15 15 
-  Max score in first 100: 25
-  Anchors passing min_sc(40): 14998
+  Total anchors: 85531
+  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
+  Max score in first 100: 31
+  Anchors passing min_sc(40): 1693
 
-[Z-ARRAY-DEBUG] First read after sorting (n_z=14998):
+[Z-ARRAY-DEBUG] First read after sorting (n_z=1693):
   Top 10 (highest scores):
-    z[0]: score=66973, anchor_idx=104256
-    z[1]: score=66970, anchor_idx=104255
-    z[2]: score=66964, anchor_idx=104254
-    z[3]: score=66963, anchor_idx=104253
-    z[4]: score=66955, anchor_idx=104252
-    z[5]: score=66941, anchor_idx=104251
-    z[6]: score=66927, anchor_idx=104250
-    z[7]: score=66920, anchor_idx=104249
-    z[8]: score=66920, anchor_idx=104249
-    z[9]: score=66905, anchor_idx=104248
+    z[0]: score=40, anchor_idx=469
+    z[1]: score=40, anchor_idx=674
+    z[2]: score=40, anchor_idx=1219
+    z[3]: score=40, anchor_idx=1365
+    z[4]: score=40, anchor_idx=3968
+    z[5]: score=40, anchor_idx=5107
+    z[6]: score=40, anchor_idx=6091
+    z[7]: score=40, anchor_idx=6867
+    z[8]: score=40, anchor_idx=8258
+    z[9]: score=40, anchor_idx=10006
   Bottom 10 (lowest scores):
-    z[14988]: score=40, anchor_idx=303906
-    z[14989]: score=40, anchor_idx=305815
-    z[14990]: score=40, anchor_idx=305873
-    z[14991]: score=40, anchor_idx=306212
-    z[14992]: score=40, anchor_idx=307563
-    z[14993]: score=40, anchor_idx=323386
-    z[14994]: score=40, anchor_idx=324057
-    z[14995]: score=40, anchor_idx=324716
-    z[14996]: score=40, anchor_idx=326821
-    z[14997]: score=40, anchor_idx=328170
-[GPU-DEBUG] First read: n=328965, n_z=14998, n_u=1495, n_v=8747
+    z[1683]: score=7428, anchor_idx=84422
+    z[1684]: score=7435, anchor_idx=84423
+    z[1685]: score=7450, anchor_idx=84424
+    z[1686]: score=7454, anchor_idx=84425
+    z[1687]: score=7468, anchor_idx=84426
+    z[1688]: score=7469, anchor_idx=84427
+    z[1689]: score=7484, anchor_idx=84428
+    z[1690]: score=7498, anchor_idx=84429
+    z[1691]: score=7512, anchor_idx=84430
+    z[1692]: score=7527, anchor_idx=84431
+[GPU-DEBUG] First read: n=85531, n_z=1693, n_u=390, n_v=2809
 [GPU-DEBUG] First 3 u values:
-  u[0]: score=40, len=4
-  u[1]: score=40, len=5
-  u[2]: score=40, len=3
+  u[0]: score=7527, len=814
+  u[1]: score=128, len=14
+  u[2]: score=105, len=11
 
 [HOST-BACKTRACK-DEBUG] Simulating first chain's backtrack:
-  Starting from k=14997 (last in sorted z), z_y[k]=328170, z_x[k]=40
+  Starting from k=1692 (last in sorted z), z_y[k]=64424553946, z_x[k]=-9223372032505020635
   Backtrack path (following p[] chain):
-    anchor[328170]: f=40, p=328169
-    anchor[328169]: f=26, p=328168
-    anchor[328168]: f=19, p=328167
-    anchor[328167]: f=15, p=-1
-  Total steps followed: 4
-
-=== CPU vs GPU Backtracking Comparison ===
-[CPU-DEBUG] First read: n=328965, n_u=3, n_v=16
-[CPU-DEBUG] First 3 u values:
-  u[0]: score=52, len=5
-  u[1]: score=47, len=5
-  u[2]: score=43, len=6
-
-[COMPARE] n_u: GPU=1495, CPU=3 ✗ MISMATCH
-=== End Comparison ===
-
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[699927]: rel=0 -> abs=-1 (expected=-1)
-  p[699928]: rel=1 -> abs=699927 (expected=699927)
-  p[699929]: rel=1 -> abs=699928 (expected=699928)
-  p[699930]: rel=0 -> abs=-1 (expected=-1)
-  p[699931]: rel=0 -> abs=-1 (expected=-1)
-  p[699932]: rel=0 -> abs=-1 (expected=-1)
-  p[699933]: rel=0 -> abs=-1 (expected=-1)
-  p[699934]: rel=0 -> abs=-1 (expected=-1)
-  p[699935]: rel=0 -> abs=-1 (expected=-1)
-  p[699936]: rel=1 -> abs=699935 (expected=699935)
-  p[699937]: rel=0 -> abs=-1 (expected=-1)
-  p[699938]: rel=0 -> abs=-1 (expected=-1)
-  p[699939]: rel=0 -> abs=-1 (expected=-1)
-  p[699940]: rel=0 -> abs=-1 (expected=-1)
-  p[699941]: rel=0 -> abs=-1 (expected=-1)
-  p[699942]: rel=1 -> abs=699941 (expected=699941)
-  p[699943]: rel=0 -> abs=-1 (expected=-1)
-  p[699944]: rel=0 -> abs=-1 (expected=-1)
-  p[699945]: rel=0 -> abs=-1 (expected=-1)
-  p[699946]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 699947
-  First 10 scores: 15 15 15 15 23 25 15 15 15 15 
-  Max score in first 100: 25
-  Anchors passing min_sc(40): 24246
-
-[Z-ARRAY-DEBUG] First read after sorting (n_z=24246):
-  Top 10 (highest scores):
-    z[0]: score=68375, anchor_idx=104449
-    z[1]: score=68372, anchor_idx=104448
-    z[2]: score=68356, anchor_idx=104446
-    z[3]: score=68366, anchor_idx=104447
-    z[4]: score=68372, anchor_idx=104448
-    z[5]: score=68375, anchor_idx=104449
-    z[6]: score=68366, anchor_idx=104447
-    z[7]: score=68366, anchor_idx=104447
-    z[8]: score=68356, anchor_idx=104446
-    z[9]: score=68356, anchor_idx=104446
-  Bottom 10 (lowest scores):
-    z[24236]: score=40, anchor_idx=695711
-    z[24237]: score=40, anchor_idx=695893
-    z[24238]: score=40, anchor_idx=696531
-    z[24239]: score=40, anchor_idx=697913
-    z[24240]: score=40, anchor_idx=698504
-    z[24241]: score=63, anchor_idx=685097
-    z[24242]: score=40, anchor_idx=685246
-    z[24243]: score=46, anchor_idx=685247
-    z[24244]: score=47, anchor_idx=685248
-    z[24245]: score=62, anchor_idx=685249
-[GPU-DEBUG] First read: n=699947, n_z=24246, n_u=2796, n_v=13190
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=62, len=8
-  u[1]: score=63, len=5
-  u[2]: score=40, len=3
-
-[HOST-BACKTRACK-DEBUG] Simulating first chain's backtrack:
-  Starting from k=24245 (last in sorted z), z_y[k]=685249, z_x[k]=62
-  Backtrack path (following p[] chain):
-    anchor[685249]: f=62, p=685248
-    anchor[685248]: f=47, p=685247
-    anchor[685247]: f=46, p=685246
-    anchor[685246]: f=40, p=685245
-    anchor[685245]: f=35, p=685244
-    anchor[685244]: f=28, p=685243
-    anchor[685243]: f=26, p=685242
-    anchor[685242]: f=15, p=-1
-  Total steps followed: 8
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[515269]: rel=0 -> abs=-1 (expected=-1)
-  p[515270]: rel=1 -> abs=515269 (expected=515269)
-  p[515271]: rel=1 -> abs=515270 (expected=515270)
-  p[515272]: rel=0 -> abs=-1 (expected=-1)
-  p[515273]: rel=0 -> abs=-1 (expected=-1)
-  p[515274]: rel=0 -> abs=-1 (expected=-1)
-  p[515275]: rel=0 -> abs=-1 (expected=-1)
-  p[515276]: rel=0 -> abs=-1 (expected=-1)
-  p[515277]: rel=0 -> abs=-1 (expected=-1)
-  p[515278]: rel=0 -> abs=-1 (expected=-1)
-  p[515279]: rel=1 -> abs=515278 (expected=515278)
-  p[515280]: rel=0 -> abs=-1 (expected=-1)
-  p[515281]: rel=2 -> abs=515279 (expected=515279)
-  p[515282]: rel=0 -> abs=-1 (expected=-1)
-  p[515283]: rel=0 -> abs=-1 (expected=-1)
-  p[515284]: rel=0 -> abs=-1 (expected=-1)
-  p[515285]: rel=0 -> abs=-1 (expected=-1)
-  p[515286]: rel=0 -> abs=-1 (expected=-1)
-  p[515287]: rel=0 -> abs=-1 (expected=-1)
-  p[515288]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 515289
-  First 10 scores: 15 15 15 15 23 25 15 15 15 15 
-  Max score in first 100: 25
-  Anchors passing min_sc(40): 18502
-
-[Z-ARRAY-DEBUG] First read after sorting (n_z=18502):
-  Top 10 (highest scores):
-    z[0]: score=68375, anchor_idx=104449
-    z[1]: score=68372, anchor_idx=104448
-    z[2]: score=68366, anchor_idx=104447
-    z[3]: score=68356, anchor_idx=104446
-    z[4]: score=68356, anchor_idx=104446
-    z[5]: score=68347, anchor_idx=104445
-    z[6]: score=68342, anchor_idx=104444
-    z[7]: score=68340, anchor_idx=104443
-    z[8]: score=68339, anchor_idx=104442
-    z[9]: score=68329, anchor_idx=104441
-  Bottom 10 (lowest scores):
-    z[18492]: score=40, anchor_idx=487109
-    z[18493]: score=40, anchor_idx=488052
-    z[18494]: score=40, anchor_idx=488603
-    z[18495]: score=40, anchor_idx=488779
-    z[18496]: score=40, anchor_idx=489183
-    z[18497]: score=40, anchor_idx=504592
-    z[18498]: score=40, anchor_idx=506106
-    z[18499]: score=40, anchor_idx=511654
-    z[18500]: score=40, anchor_idx=513729
-    z[18501]: score=40, anchor_idx=514649
-[GPU-DEBUG] First read: n=515289, n_z=18502, n_u=2366, n_v=11834
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=40, len=4
-  u[1]: score=40, len=4
-  u[2]: score=40, len=3
-
-[HOST-BACKTRACK-DEBUG] Simulating first chain's backtrack:
-  Starting from k=18501 (last in sorted z), z_y[k]=514649, z_x[k]=40
-  Backtrack path (following p[] chain):
-    anchor[514649]: f=40, p=514648
-    anchor[514648]: f=36, p=514647
-    anchor[514647]: f=23, p=514646
-    anchor[514646]: f=15, p=-1
-  Total steps followed: 4
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[495617]: rel=0 -> abs=-1 (expected=-1)
-  p[495618]: rel=1 -> abs=495617 (expected=495617)
-  p[495619]: rel=0 -> abs=-1 (expected=-1)
-  p[495620]: rel=1 -> abs=495619 (expected=495619)
-  p[495621]: rel=0 -> abs=-1 (expected=-1)
-  p[495622]: rel=0 -> abs=-1 (expected=-1)
-  p[495623]: rel=0 -> abs=-1 (expected=-1)
-  p[495624]: rel=1 -> abs=495623 (expected=495623)
-  p[495625]: rel=1 -> abs=495624 (expected=495624)
-  p[495626]: rel=0 -> abs=-1 (expected=-1)
-  p[495627]: rel=0 -> abs=-1 (expected=-1)
-  p[495628]: rel=0 -> abs=-1 (expected=-1)
-  p[495629]: rel=2 -> abs=495627 (expected=495627)
-  p[495630]: rel=1 -> abs=495629 (expected=495629)
-  p[495631]: rel=0 -> abs=-1 (expected=-1)
-  p[495632]: rel=0 -> abs=-1 (expected=-1)
-  p[495633]: rel=0 -> abs=-1 (expected=-1)
-  p[495634]: rel=0 -> abs=-1 (expected=-1)
-  p[495635]: rel=0 -> abs=-1 (expected=-1)
-  p[495636]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 495637
-  First 10 scores: 15 15 15 15 23 25 15 15 15 15 
-  Max score in first 100: 25
-  Anchors passing min_sc(40): 17826
-
-[Z-ARRAY-DEBUG] First read after sorting (n_z=17826):
-  Top 10 (highest scores):
-    z[0]: score=68375, anchor_idx=104449
-    z[1]: score=68372, anchor_idx=104448
-    z[2]: score=68366, anchor_idx=104447
-    z[3]: score=68356, anchor_idx=104446
-    z[4]: score=68366, anchor_idx=104447
-    z[5]: score=68372, anchor_idx=104448
-    z[6]: score=68375, anchor_idx=104449
-    z[7]: score=68356, anchor_idx=104446
-    z[8]: score=68356, anchor_idx=104446
-    z[9]: score=68347, anchor_idx=104445
-  Bottom 10 (lowest scores):
-    z[17816]: score=47, anchor_idx=315376
-    z[17817]: score=43, anchor_idx=315389
-    z[17818]: score=49, anchor_idx=315616
-    z[17819]: score=44, anchor_idx=315660
-    z[17820]: score=59, anchor_idx=315661
-    z[17821]: score=43, anchor_idx=315741
-    z[17822]: score=46, anchor_idx=315742
-    z[17823]: score=43, anchor_idx=316126
-    z[17824]: score=48, anchor_idx=316186
-    z[17825]: score=55, anchor_idx=316187
-[GPU-DEBUG] First read: n=495637, n_z=17826, n_u=2092, n_v=10822
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=55, len=5
-  u[1]: score=43, len=3
-  u[2]: score=46, len=5
-
-[HOST-BACKTRACK-DEBUG] Simulating first chain's backtrack:
-  Starting from k=17825 (last in sorted z), z_y[k]=316187, z_x[k]=55
-  Backtrack path (following p[] chain):
-    anchor[316187]: f=55, p=316186
-    anchor[316186]: f=48, p=316185
-    anchor[316185]: f=34, p=316184
-    anchor[316184]: f=30, p=316183
-    anchor[316183]: f=15, p=-1
-  Total steps followed: 5
-[Info] plchain_cal_score_async (gpu/plchain.cu:405) Launching Batch: n_read 309, total anchors 200061136 (mem usage: 400.12%)
-[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#0 batch_n 49553016, read_start 0, read_end 76 usage 99.11 %
-[DEBUG](MICROBATCH# 0) total segs: 96746, short:96382 mid: 267 
-[DEBUG] aggreagated num of long segs 97, 0-97 belongs to this minibatch
-[DEBUG] workload (sc pairs) in long segs: 4779505491
-[DEBUG] Total workload (sc pairs) in batch: 5417308142. 88.23% work are in long segs.
-[DEBUG] Short Seg kernel #0 throughput: 836.51 Mpairs/s
-[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#1 batch_n 48723053, read_start 76, read_end 151 usage 97.45 %
-[DEBUG](MICROBATCH# 1) total segs: 95123, short:94823 mid: 135 
-[DEBUG] aggreagated num of long segs 165, 97-165 belongs to this minibatch
-[DEBUG] workload (sc pairs) in long segs: 2290935474
-[DEBUG] Total workload (sc pairs) in batch: 2568941472. 89.18% work are in long segs.
-[DEBUG] Short Seg kernel #1 throughput: 621.25 Mpairs/s
-[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#2 batch_n 49560834, read_start 151, read_end 223 usage 99.12 %
-[DEBUG](MICROBATCH# 2) total segs: 96762, short:96238 mid: 299 
-[DEBUG] aggreagated num of long segs 225, 165-225 belongs to this minibatch
-[DEBUG] workload (sc pairs) in long segs: 19441135687
-[DEBUG] Total workload (sc pairs) in batch: 19714928551. 98.61% work are in long segs.
-[DEBUG] Short Seg kernel #2 throughput: 774.51 Mpairs/s
-[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#3 batch_n 49815595, read_start 223, read_end 305 usage 99.63 %
-[DEBUG](MICROBATCH# 3) total segs: 97259, short:96654 mid: 342 
-[DEBUG] aggreagated num of long segs 263, 225-263 belongs to this minibatch
-[DEBUG] workload (sc pairs) in long segs: 6670621802
-[DEBUG] Total workload (sc pairs) in batch: 6944668261. 96.05% work are in long segs.
-[DEBUG] Short Seg kernel #3 throughput: 667.28 Mpairs/s
-[WARNING] Unable to fit reads 305 - 308 into a microbatch. Fall back to cpu chaining
-[Debug] plscore_async_long_forward_dp (gpu/plscore.cu:582) Long Grid Dim = 144
-[WARNING] Run CPU kernel for read 319
-[WARNING] Run CPU kernel for read 320
-[Info::gpu_align_batch_execute] Two-tier processing: 17688 short tasks (max_len≤1000bp) + 12213 long tasks (max_len>1000bp)
-[Info::gpu_align_batch_execute]   Short: 3 batches × 7000 tasks/batch
-[Info::gpu_align_batch_execute]   Long:  96 batches × 128 tasks/batch
-[Info::gpu_align_batch_execute] === Processing Short Tasks (phase 1/2) ===
-[Short Tasks] [===========>                  ]  39% (7000/17688 in phase, 7000/29901 total, batch 1/99)[Short Tasks] [=======================>      ]  79% (14000/17688 in phase, 14000/29901 total, batch 2/99)[Short Tasks] [==============================] 100% (17688/17688 in phase, 17688/29901 total, batch 3/99)
-[Info::gpu_align_batch_execute] === Short Tasks completed: 17688 tasks processed ===
-[Info::gpu_align_batch_execute] === Processing Long Tasks (phase 2/2) ===
-[Long Tasks] [>                             ]   1% (128/12213 in phase, 17816/29901 total, batch 4/99)[Long Tasks] [>                             ]   2% (256/12213 in phase, 17944/29901 total, batch 5/99)[Long Tasks] [>                             ]   3% (384/12213 in phase, 18072/29901 total, batch 6/99)[Long Tasks] [=>                            ]   4% (512/12213 in phase, 18200/29901 total, batch 7/99)

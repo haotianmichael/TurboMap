@@ -148,9 +148,31 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_
                     int64_t n_v0 = n_v, end_i;
                     int32_t sc;
                     end_i = mg_chain_bk_end(max_drop, z_x, z_y, f, p, t, k);
+
+                    // DEBUG: Print first chain's backtrack path
+                    if (n_u == 0 && job_idx == 0) {
+                        printf("[GPU-BT-DEBUG] First chain backtrack:\n");
+                        printf("  k=%d, z_y[k]=%lld (start), z_x[k]=%lld (score), end_i=%lld\n",
+                               k, z_y[k], z_x[k], end_i);
+                        printf("  Backtrack path: ");
+                        int step = 0;
+                        for (int64_t i = z_y[k]; i != end_i && step < 10; i = p[i], step++) {
+                            printf("%lld(f=%d,p=%lld) -> ", i, f[i], p[i]);
+                        }
+                        printf("END\n");
+                    }
+
                     for (int64_t i = z_y[k]; i != end_i; i = p[i])  // p[i] is absolute index
                         v[n_v++] = i, t[i] = 1;
                     sc = end_i < 0? (int32_t)z_x[k] : (int32_t)z_x[k] - f[end_i];
+
+                    if (n_u == 0 && job_idx == 0) {
+                        printf("  Chain length: %lld, score: %d\n", n_v - n_v0, sc);
+                        if (end_i >= 0) {
+                            printf("  end_i=%lld, f[end_i]=%d\n", end_i, f[end_i]);
+                        }
+                    }
+
                     if (sc >= min_sc && n_v > n_v0 && n_v - n_v0 >= min_cnt)
                         u[n_u++] = (uint64_t)sc << 32 | (n_v - n_v0);
                     else n_v = n_v0;
@@ -365,6 +387,25 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Expand uint16_t predecessors to int64_t (keep relative distance semantics)
     expand_p_to_int64<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         dev_mem->d_p, d_p_abs, d_offset, d_n_a, n_reads);
+
+    cudaStreamSynchronize(stream);
+
+    // DEBUG: Check p[] array conversion for first read
+    if (n_reads > 0 && h_n_a[0] > 0) {
+        uint16_t *h_p_rel = (uint16_t*)malloc(sizeof(uint16_t) * h_n_a[0]);
+        int64_t *h_p_abs = (int64_t*)malloc(sizeof(int64_t) * h_n_a[0]);
+        cudaMemcpy(h_p_rel, dev_mem->d_p, sizeof(uint16_t) * h_n_a[0], cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_p_abs, d_p_abs, sizeof(int64_t) * h_n_a[0], cudaMemcpyDeviceToHost);
+
+        fprintf(stderr, "\n[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):\n");
+        int start = h_n_a[0] > 20 ? h_n_a[0] - 20 : 0;
+        for (int i = start; i < h_n_a[0]; i++) {
+            fprintf(stderr, "  p[%d]: rel=%d -> abs=%lld (expected=%d)\n",
+                    i, h_p_rel[i], h_p_abs[i], h_p_rel[i] == 0 ? -1 : (int)(i - h_p_rel[i]));
+        }
+        free(h_p_rel);
+        free(h_p_abs);
+    }
 
     // Step 1: Filter anchors by score
     mm_filter_anchors<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(

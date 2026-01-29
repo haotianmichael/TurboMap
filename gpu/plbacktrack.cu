@@ -373,6 +373,34 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
+    // CRITICAL DEBUG: Check if f[] scores match between GPU and CPU
+    if (n_reads > 0) {
+        int32_t *h_f = (int32_t*)malloc(sizeof(int32_t) * h_n_a[0]);
+        cudaMemcpy(h_f, dev_mem->d_f, sizeof(int32_t) * h_n_a[0], cudaMemcpyDeviceToHost);
+
+        fprintf(stderr, "\n[CRITICAL-DEBUG] First read's f[] (chain scores):\n");
+        fprintf(stderr, "  Total anchors: %d\n", h_n_a[0]);
+        fprintf(stderr, "  First 10 scores: ");
+        for (int i = 0; i < 10 && i < h_n_a[0]; i++) {
+            fprintf(stderr, "%d ", h_f[i]);
+        }
+        fprintf(stderr, "\n  Max score in first 100: ");
+        int max_score = 0;
+        for (int i = 0; i < 100 && i < h_n_a[0]; i++) {
+            if (h_f[i] > max_score) max_score = h_f[i];
+        }
+        fprintf(stderr, "%d\n", max_score);
+
+        // Count how many pass min_sc threshold
+        int count_pass = 0;
+        for (int i = 0; i < h_n_a[0]; i++) {
+            if (h_f[i] >= min_sc) count_pass++;
+        }
+        fprintf(stderr, "  Anchors passing min_sc(%d): %d\n", min_sc, count_pass);
+
+        free(h_f);
+    }
+
     // Step 2: Sort z arrays by score using CUB (per-read segmented sort)
     size_t temp_storage_bytes = 0;
 

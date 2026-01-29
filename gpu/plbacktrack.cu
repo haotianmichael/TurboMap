@@ -402,13 +402,40 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
+    // Debug: Print first read's results
+    int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
+    int *h_n_v = (int*)malloc(sizeof(int) * n_reads);
+    int *h_n_z = (int*)malloc(sizeof(int) * n_reads);
+    cudaMemcpy(h_n_u, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_n_v, d_n_v, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_n_z, d_num_elements, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+
+    if (n_reads > 0) {
+        fprintf(stderr, "[GPU-DEBUG] First read: n=%d, n_z=%d, n_u=%d, n_v=%d\n",
+                h_n_a[0], h_n_z[0], h_n_u[0], h_n_v[0]);
+
+        // Print first few u values
+        if (h_n_u[0] > 0) {
+            uint64_t *h_u = (uint64_t*)malloc(sizeof(uint64_t) * h_n_u[0]);
+            cudaMemcpy(h_u, d_u, sizeof(uint64_t) * h_n_u[0], cudaMemcpyDeviceToHost);
+            fprintf(stderr, "[GPU-DEBUG] First 3 u values:\n");
+            for (int i = 0; i < 3 && i < h_n_u[0]; i++) {
+                int32_t score = h_u[i] >> 32;
+                int32_t len = (int32_t)h_u[i];
+                fprintf(stderr, "  u[%d]: score=%d, len=%d\n", i, score, len);
+            }
+            free(h_u);
+        }
+    }
+    free(h_n_z);
+    free(h_n_v);
+
     // Step 4: Sort w arrays by target position
     // CRITICAL: w arrays have n_u[i] elements per read, NOT n_a[i]
     // Cannot use d_offset directly because it's in terms of ANCHORS
     // Need to sort each read's w segment individually using thrust::sort
     // Get n_u values to know how many elements to sort per read
-    int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
-    cudaMemcpy(h_n_u, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    // Note: h_n_u already allocated above for debug
 
     // Sort each read's w_x/w_y segment
     // w arrays start at offset[i] for each read

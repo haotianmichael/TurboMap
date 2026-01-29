@@ -129,6 +129,20 @@ void plchain_backtracking(hostMemPtr *host_mem, deviceMemPtr *dev_mem, chain_rea
         u = mg_chain_backtrack(km, reads[i].n, f, p, v, t, misc.min_cnt, misc.min_score, max_drop, &n_u, &n_v);
         reads[i].u = u;
         reads[i].n_u = n_u;
+
+        // Debug: Print first read's results
+        if (i == 0) {
+            fprintf(stderr, "[CPU-DEBUG] First read: n=%d, n_u=%d, n_v=%d\n",
+                    reads[i].n, n_u, n_v);
+            if (n_u > 0) {
+                fprintf(stderr, "[CPU-DEBUG] First 3 u values:\n");
+                for (int j = 0; j < 3 && j < n_u; j++) {
+                    int32_t score = u[j] >> 32;
+                    int32_t len = (int32_t)u[j];
+                    fprintf(stderr, "  u[%d]: score=%d, len=%d\n", j, score, len);
+                }
+            }
+        }
         kfree(km, p);
         // here f is not managed by km memory pool
         kfree(km, t);

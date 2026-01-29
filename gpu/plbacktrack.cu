@@ -464,6 +464,35 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
+    // DEBUG: Check z[] arrays after sorting for first read
+    if (n_reads > 0) {
+        int *h_num_elements = (int*)malloc(sizeof(int) * n_reads);
+        cudaMemcpy(h_num_elements, d_num_elements, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+        int n_z = h_num_elements[0];
+
+        if (n_z > 0) {
+            int64_t *h_zx = (int64_t*)malloc(sizeof(int64_t) * n_z);
+            int64_t *h_zy = (int64_t*)malloc(sizeof(int64_t) * n_z);
+            cudaMemcpy(h_zx, d_zx, sizeof(int64_t) * n_z, cudaMemcpyDeviceToHost);
+            cudaMemcpy(h_zy, d_zy, sizeof(int64_t) * n_z, cudaMemcpyDeviceToHost);
+
+            fprintf(stderr, "\n[Z-ARRAY-DEBUG] First read after sorting (n_z=%d):\n", n_z);
+            fprintf(stderr, "  Top 10 (highest scores):\n");
+            for (int i = 0; i < 10 && i < n_z; i++) {
+                fprintf(stderr, "    z[%d]: score=%lld, anchor_idx=%lld\n", i, h_zx[i], h_zy[i]);
+            }
+            fprintf(stderr, "  Bottom 10 (lowest scores):\n");
+            int start = n_z > 10 ? n_z - 10 : 0;
+            for (int i = start; i < n_z; i++) {
+                fprintf(stderr, "    z[%d]: score=%lld, anchor_idx=%lld\n", i, h_zx[i], h_zy[i]);
+            }
+
+            free(h_zx);
+            free(h_zy);
+        }
+        free(h_num_elements);
+    }
+
     // Step 3: Backtrack
     mm_chain_backtrack_parallel<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, dev_mem->d_ax, dev_mem->d_ay, dev_mem->d_xrev, dev_mem->d_yrev, dev_mem->d_f, d_p_abs, d_u,
@@ -471,6 +500,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         n_reads, d_n_v, d_n_u, d_num_elements, d_ofs_end);
 
     cudaStreamSynchronize(stream);
+    cudaDeviceSynchronize();  // Flush printf from kernel
 
     // Debug: Print first read's results
     int *h_n_u = (int*)malloc(sizeof(int) * n_reads);

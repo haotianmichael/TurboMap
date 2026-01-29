@@ -48,14 +48,14 @@ __device__ static int64_t mg_chain_bk_end(int32_t max_drop, const int64_t *z_x,
     do {
         int32_t s;
         t[i] = 2;
-        end_i = i = (p[i] > 0)? i - p[i] : p[i];
+        end_i = i = p[i];  // p[i] is absolute index
         s = i < 0? (int32_t)z_x[k] : (int32_t)z_x[k] - f[i];
         if (s > max_s)
             max_s = s, max_i = i;
         else if (max_s - s > max_drop)
             break;
     } while (i >= 0 && t[i] == 0);
-    for (i = z_y[k]; i >= 0 && i != end_i && p[i] > 0; i = i - p[i])
+    for (i = z_y[k]; i >= 0 && i != end_i; i = p[i])  // p[i] is absolute index
         t[i] = 0;
     return max_i;
 }
@@ -142,12 +142,13 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_
         if (tid == 0) {
             // Backtrack to populate u[]
             // Note: z arrays should already be sorted by calling code using CUB
+            // Note: p[] array contains absolute indices (converted by expand_p_to_int64)
             for (int k = n_z - 1; k >= 0; --k) {
                 if (t[z_y[k]] == 0) {
                     int64_t n_v0 = n_v, end_i;
                     int32_t sc;
                     end_i = mg_chain_bk_end(max_drop, z_x, z_y, f, p, t, k);
-                    for (int64_t i = z_y[k]; i != end_i; i = (p[i]<0)? p[i] : i - p[i])
+                    for (int64_t i = z_y[k]; i != end_i; i = p[i])  // p[i] is absolute index
                         v[n_v++] = i, t[i] = 1;
                     sc = end_i < 0? (int32_t)z_x[k] : (int32_t)z_x[k] - f[end_i];
                     if (sc >= min_sc && n_v > n_v0 && n_v - n_v0 >= min_cnt)
@@ -282,7 +283,7 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
 // This matches the CPU version behavior in lchain.c where mg_chain_backtrack
 // returns the compacted anchor array and u metadata, then the CPU generates regs
 
-// Helper to expand uint16_t predecessor to int64_t (keep relative distance semantics)
+// Helper to expand uint16_t predecessor to int64_t (convert to absolute index)
 __global__ void expand_p_to_int64(uint16_t* p_rel, int64_t* p_expanded, int* offset, int* n_a, int n_task)
 {
     int id = threadIdx.x + blockIdx.x * blockDim.x;
@@ -290,8 +291,11 @@ __global__ void expand_p_to_int64(uint16_t* p_rel, int64_t* p_expanded, int* off
         int ofs = offset[job_idx];
         int n = n_a[job_idx];
         for (int i = 0; i < n; ++i) {
-            // Keep relative distance: 0 means no predecessor (-1), others stay as-is
-            p_expanded[ofs + i] = (p_rel[ofs + i] == 0) ? -1 : (int64_t)p_rel[ofs + i];
+            // Convert relative distance to absolute index (like CPU version p_rel2idx)
+            if (p_rel[ofs + i] == 0)
+                p_expanded[ofs + i] = -1;
+            else
+                p_expanded[ofs + i] = i - p_rel[ofs + i];  // Absolute index
         }
     }
 }

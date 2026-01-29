@@ -40,53 +40,19 @@ uint64_t *mg_chain_backtrack(void *km, int64_t n, const int32_t *f, const int64_
 		if (f[i] >= min_sc) z[k].x = f[i], z[k++].y = i;
 	radix_sort_128x(z, z + n_z);
 
-	// Debug: print first read's data
-	static int debug_count = 0;
-	int debug_print = (debug_count == 0 && n_z > 0);
-	if (debug_print) {
-		fprintf(stderr, "[CPU-BK] Read: n=%ld, n_z=%ld, min_sc=%d, min_cnt=%d, max_drop=%d\n",
-		        n, n_z, min_sc, min_cnt, max_drop);
-		fprintf(stderr, "[CPU-BK] First 5 z entries (sorted desc by score):\n");
-		for (int i = 0; i < 5 && i < n_z; i++) {
-			fprintf(stderr, "  z[%d]: x=%lx (score), y=%lx (anchor_idx), p[y]=%ld, f[y]=%d\n",
-			        i, z[i].x, z[i].y, p[z[i].y], f[z[i].y]);
-		}
-		debug_count++;
-	}
-
 	memset(t, 0, n * 4);
 	for (k = n_z - 1, n_v = n_u = 0; k >= 0; --k) { // precompute n_u
 		if (t[z[k].y] == 0) {
 			int64_t n_v0 = n_v, end_i;
 			int32_t sc;
 			end_i = mg_chain_bk_end(max_drop, z, f, p, t, k);
-
-			if (debug_print && n_u < 3) {
-				fprintf(stderr, "[CPU-BK] Chain %d: k=%ld, z[k].y=%lx, z[k].x=%lx, end_i=%ld\n",
-				        n_u, k, z[k].y, z[k].x, end_i);
-			}
-
-			for (i = z[k].y; i != end_i; i = p[i]) {
-				if (debug_print && n_u < 3 && n_v - n_v0 < 5) {
-					fprintf(stderr, "  Following chain: i=%ld, p[i]=%ld\n", i, p[i]);
-				}
+			for (i = z[k].y; i != end_i; i = p[i])
 				++n_v, t[i] = 1;
-			}
 			sc = i < 0? z[k].x : (int32_t)z[k].x - f[i];
-
-			if (debug_print && n_u < 3) {
-				fprintf(stderr, "  Chain length=%ld, sc=%d, valid=%d\n",
-				        n_v - n_v0, sc, (sc >= min_sc && n_v > n_v0 && n_v - n_v0 >= min_cnt));
-			}
-
 			if (sc >= min_sc && n_v > n_v0 && n_v - n_v0 >= min_cnt)
 				++n_u;
 			else n_v = n_v0;
 		}
-	}
-
-	if (debug_print) {
-		fprintf(stderr, "[CPU-BK] Final (pass 1): n_u=%d, n_v=%ld\n", n_u, n_v);
 	}
 	KMALLOC(km, u, n_u);
 	memset(t, 0, n * 4);

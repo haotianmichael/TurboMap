@@ -48,14 +48,14 @@ __device__ static int64_t mg_chain_bk_end(int32_t max_drop, const int64_t *z_x,
     do {
         int32_t s;
         t[i] = 2;
-        end_i = i = p[i];  // p[i] is absolute index
+        end_i = i = (p[i] > 0)? i - p[i] : p[i];  // p[i] is relative distance
         s = i < 0? (int32_t)z_x[k] : (int32_t)z_x[k] - f[i];
         if (s > max_s)
             max_s = s, max_i = i;
         else if (max_s - s > max_drop)
             break;
     } while (i >= 0 && t[i] == 0);
-    for (i = z_y[k]; i >= 0 && i != end_i; i = p[i])  // p[i] is absolute index
+    for (i = z_y[k]; i >= 0 && i != end_i && p[i] > 0; i = i - p[i])  // p[i] is relative distance
         t[i] = 0;
     return max_i;
 }
@@ -142,51 +142,19 @@ __global__ void mm_chain_backtrack_parallel(int* n_a, int32_t* g_ax, int32_t* g_
         if (tid == 0) {
             // Backtrack to populate u[]
             // Note: z arrays should already be sorted by calling code using CUB
-            // Note: p[] array contains absolute indices (converted by expand_p_to_int64)
-            // Debug: print first read's data
-            int debug_print = (job_idx == 0 && n_z > 0);
-            if (debug_print) {
-                printf("[GPU-BK] Read %d: n=%d, n_z=%d, min_sc=%d, min_cnt=%d, max_drop=%d\n",
-                       job_idx, n, n_z, min_sc, min_cnt, max_drop);
-                printf("[GPU-BK] First 5 z entries (sorted desc by score):\n");
-                for (int i = 0; i < 5 && i < n_z; i++) {
-                    printf("  z[%d]: x=%ld (score), y=%ld (anchor_idx), p[y]=%ld, f[y]=%d\n",
-                           i, z_x[i], z_y[i], p[z_y[i]], f[z_y[i]]);
-                }
-            }
-
+            // Note: p[] array contains relative distances (not absolute indices)
             for (int k = n_z - 1; k >= 0; --k) {
                 if (t[z_y[k]] == 0) {
                     int64_t n_v0 = n_v, end_i;
                     int32_t sc;
                     end_i = mg_chain_bk_end(max_drop, z_x, z_y, f, p, t, k);
-
-                    if (debug_print && n_u < 3) {
-                        printf("[GPU-BK] Chain %d: k=%d, z_y[k]=%ld, z_x[k]=%ld, end_i=%ld\n",
-                               n_u, k, z_y[k], z_x[k], end_i);
-                    }
-
-                    for (int64_t i = z_y[k]; i != end_i; i = p[i]) {  // p[i] is absolute index
-                        if (debug_print && n_u < 3 && n_v - n_v0 < 5) {
-                            printf("  Following chain: i=%ld, p[i]=%ld\n", i, p[i]);
-                        }
+                    for (int64_t i = z_y[k]; i != end_i; i = (p[i]<0)? p[i] : i - p[i])  // p[i] is relative distance
                         v[n_v++] = i, t[i] = 1;
-                    }
                     sc = end_i < 0? (int32_t)z_x[k] : (int32_t)z_x[k] - f[end_i];
-
-                    if (debug_print && n_u < 3) {
-                        printf("  Chain length=%ld, sc=%d, valid=%d\n",
-                               n_v - n_v0, sc, (sc >= min_sc && n_v > n_v0 && n_v - n_v0 >= min_cnt));
-                    }
-
                     if (sc >= min_sc && n_v > n_v0 && n_v - n_v0 >= min_cnt)
                         u[n_u++] = (uint64_t)sc << 32 | (n_v - n_v0);
                     else n_v = n_v0;
                 }
-            }
-
-            if (debug_print) {
-                printf("[GPU-BK] Final: n_u=%d, n_v=%d\n", n_u, n_v);
             }
 
             g_n_v[job_idx] = n_v;
@@ -315,7 +283,7 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
 // This matches the CPU version behavior in lchain.c where mg_chain_backtrack
 // returns the compacted anchor array and u metadata, then the CPU generates regs
 
-// Helper to expand uint16_t predecessor to int64_t (convert to absolute index)
+// Helper to expand uint16_t predecessor to int64_t (keep as relative distance)
 __global__ void expand_p_to_int64(uint16_t* p_rel, int64_t* p_expanded, int* offset, int* n_a, int n_task)
 {
     int id = threadIdx.x + blockIdx.x * blockDim.x;
@@ -323,11 +291,11 @@ __global__ void expand_p_to_int64(uint16_t* p_rel, int64_t* p_expanded, int* off
         int ofs = offset[job_idx];
         int n = n_a[job_idx];
         for (int i = 0; i < n; ++i) {
-            // Convert relative distance to absolute index (like CPU version p_rel2idx)
+            // Keep as relative distance, just expand type from uint16_t to int64_t
             if (p_rel[ofs + i] == 0)
                 p_expanded[ofs + i] = -1;
             else
-                p_expanded[ofs + i] = i - p_rel[ofs + i];  // Absolute index
+                p_expanded[ofs + i] = (int64_t)p_rel[ofs + i];  // Relative distance
         }
     }
 }

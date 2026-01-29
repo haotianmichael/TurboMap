@@ -1,7 +1,7 @@
-[M::main::7.412*1.01] loaded/built the index for 455 target sequence(s)
-[M::mm_mapopt_update::9.680*1.01] mid_occ = 728
+[M::main::7.556*1.00] loaded/built the index for 455 target sequence(s)
+[M::mm_mapopt_update::10.729*1.00] mid_occ = 728
 [M::mm_idx_stat] kmer size: 15; skip: 10; is_hpc: 0; #seq: 455
-[M::mm_idx_stat::10.945*1.01] distinct minimizers: 100202295 (37.96% are singletons); average occurrences: 5.732; average spacing: 5.587; total length: 3209286105
+[M::mm_idx_stat::12.002*1.00] distinct minimizers: 100202295 (37.96% are singletons); average occurrences: 5.732; average spacing: 5.587; total length: 3209286105
 [Info] max anchors per stream: 50000000, max range grid 51526 max_num_cut 147657 long_seg_buffer_size 100000000
 [Info] Host Malloc Pinned Memory Size 0.89 GB
 [Info] Host Malloc Pinned Memory Size 0.89 GB
@@ -10,24 +10,49 @@
 [Info] Host Malloc Pinned Memory Size 0.56 GB (long seg)
 [Info] GPU MEMORY ALLOCATION BREAKDOWN ========== Configuration: anchor_per_batch=50000000, range_grid_size=51526, num_cut=147657, buffer_size_long=100000000
  [Chain] Total anchor buffers: 1287.46 MB
- [Chain] Total Cut buffers: 3.17 MB
+ [Chain] Total Cut buffers: 4.03 MB
  [Chain] Total long seg buffers: 1811.98 MB (1.77 GB)
  [Align] DP buffers: 8097.15 MB
  [Align] Total BackTrack buffers: 9.96 GB
- [Chain] Total:        3102.61 MB (3.03 GB)
+ [Chain] Total:        3103.47 MB (3.03 GB)
  [Align] Total:       18299.91 MB (17.87 GB)
-[Info] TuboMap Total GPU Memory: 21402.52 MB (20.90 GB)
+[Info] TuboMap Total GPU Memory: 21403.38 MB (20.90 GB)
 [Info::init_stream_gpu] gpu initialized for chaining with config gpu/gpu_config.json
 [Info::init_stream_gpu] Compile time config: 
 		 USE CUDA
 		 MAX MICRO BATCH       	8
-[Info] plchain_cal_score_async (gpu/plchain.cu:405) Launching Batch: n_read 319, total anchors 200693569 (mem usage: 401.39%)
-[WARNING] Unable to fit reads 316 - 318 into a microbatch. Fall back to cpu chaining
+[Info] plchain_cal_score_async (gpu/plchain.cu:405) Launching Batch: n_read 321, total anchors 200577882 (mem usage: 401.16%)
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#0 batch_n 49753448, read_start 0, read_end 81 usage 99.51 %
+[DEBUG](MICROBATCH# 0) total segs: 97135, short:96861 mid: 209 
+[DEBUG] aggreagated num of long segs 65, 0-65 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 4219300916
+[DEBUG] Total workload (sc pairs) in batch: 4481932717. 94.14% work are in long segs.
+[DEBUG] Short Seg kernel #0 throughput: 450.17 Mpairs/s
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#1 batch_n 49525460, read_start 81, read_end 160 usage 99.05 %
+[DEBUG](MICROBATCH# 1) total segs: 96694, short:96250 mid: 280 
+[DEBUG] aggreagated num of long segs 164, 65-164 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 5704797737
+[DEBUG] Total workload (sc pairs) in batch: 6097957139. 93.55% work are in long segs.
+[DEBUG] Short Seg kernel #1 throughput: 848.86 Mpairs/s
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#2 batch_n 49993390, read_start 160, read_end 246 usage 99.99 %
+[DEBUG](MICROBATCH# 2) total segs: 97596, short:97212 mid: 169 
+[DEBUG] aggreagated num of long segs 215, 164-215 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 275213765
+[DEBUG] Total workload (sc pairs) in batch: 506478242. 54.34% work are in long segs.
+[DEBUG] Short Seg kernel #2 throughput: 593.90 Mpairs/s
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#3 batch_n 49730649, read_start 246, read_end 319 usage 99.46 %
+[DEBUG](MICROBATCH# 3) total segs: 97095, short:96364 mid: 374 
+[DEBUG] aggreagated num of long segs 357, 215-357 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 15921560789
+[DEBUG] Total workload (sc pairs) in batch: 16390450230. 97.14% work are in long segs.
+[DEBUG] Short Seg kernel #3 throughput: 802.88 Mpairs/s
+[WARNING] Unable to fit reads 319 - 320 into a microbatch. Fall back to cpu chaining
+[Debug] plscore_async_long_forward_dp (gpu/plscore.cu:582) Long Grid Dim = 144
 
 [P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[328945]: rel=1 -> abs=328944 (expected=328944)
-  p[328946]: rel=1 -> abs=328945 (expected=328945)
-  p[328947]: rel=1 -> abs=328946 (expected=328946)
+  p[328945]: rel=0 -> abs=-1 (expected=-1)
+  p[328946]: rel=0 -> abs=-1 (expected=-1)
+  p[328947]: rel=0 -> abs=-1 (expected=-1)
   p[328948]: rel=0 -> abs=-1 (expected=-1)
   p[328949]: rel=0 -> abs=-1 (expected=-1)
   p[328950]: rel=0 -> abs=-1 (expected=-1)
@@ -35,11 +60,11 @@
   p[328952]: rel=0 -> abs=-1 (expected=-1)
   p[328953]: rel=0 -> abs=-1 (expected=-1)
   p[328954]: rel=0 -> abs=-1 (expected=-1)
-  p[328955]: rel=1 -> abs=328954 (expected=328954)
+  p[328955]: rel=0 -> abs=-1 (expected=-1)
   p[328956]: rel=0 -> abs=-1 (expected=-1)
   p[328957]: rel=0 -> abs=-1 (expected=-1)
   p[328958]: rel=0 -> abs=-1 (expected=-1)
-  p[328959]: rel=0 -> abs=-1 (expected=-1)
+  p[328959]: rel=1 -> abs=328958 (expected=328958)
   p[328960]: rel=0 -> abs=-1 (expected=-1)
   p[328961]: rel=0 -> abs=-1 (expected=-1)
   p[328962]: rel=0 -> abs=-1 (expected=-1)
@@ -48,14 +73,47 @@
 
 [CRITICAL-DEBUG] First read's f[] (chain scores):
   Total anchors: 328965
-  First 10 scores: 15 15 15 17 15 15 15 15 15 15 
-  Max score in first 100: 29
-  Anchors passing min_sc(40): 38853
-[GPU-DEBUG] First read: n=328965, n_z=38853, n_u=1403, n_v=6902
+  First 10 scores: 15 15 15 15 23 25 15 15 15 15 
+  Max score in first 100: 25
+  Anchors passing min_sc(40): 14998
+
+[Z-ARRAY-DEBUG] First read after sorting (n_z=14998):
+  Top 10 (highest scores):
+    z[0]: score=66973, anchor_idx=104256
+    z[1]: score=66970, anchor_idx=104255
+    z[2]: score=66964, anchor_idx=104254
+    z[3]: score=66963, anchor_idx=104253
+    z[4]: score=66955, anchor_idx=104252
+    z[5]: score=66941, anchor_idx=104251
+    z[6]: score=66927, anchor_idx=104250
+    z[7]: score=66920, anchor_idx=104249
+    z[8]: score=66920, anchor_idx=104249
+    z[9]: score=66905, anchor_idx=104248
+  Bottom 10 (lowest scores):
+    z[14988]: score=40, anchor_idx=303906
+    z[14989]: score=40, anchor_idx=305815
+    z[14990]: score=40, anchor_idx=305873
+    z[14991]: score=40, anchor_idx=306212
+    z[14992]: score=40, anchor_idx=307563
+    z[14993]: score=40, anchor_idx=323386
+    z[14994]: score=40, anchor_idx=324057
+    z[14995]: score=40, anchor_idx=324716
+    z[14996]: score=40, anchor_idx=326821
+    z[14997]: score=40, anchor_idx=328170
+[GPU-DEBUG] First read: n=328965, n_z=14998, n_u=1495, n_v=8747
 [GPU-DEBUG] First 3 u values:
-  u[0]: score=40, len=3
-  u[1]: score=40, len=3
-  u[2]: score=40, len=4
+  u[0]: score=40, len=4
+  u[1]: score=40, len=5
+  u[2]: score=40, len=3
+
+[HOST-BACKTRACK-DEBUG] Simulating first chain's backtrack:
+  Starting from k=14997 (last in sorted z), z_y[k]=328170, z_x[k]=40
+  Backtrack path (following p[] chain):
+    anchor[328170]: f=40, p=328169
+    anchor[328169]: f=26, p=328168
+    anchor[328168]: f=19, p=328167
+    anchor[328167]: f=15, p=-1
+  Total steps followed: 4
 
 === CPU vs GPU Backtracking Comparison ===
 [CPU-DEBUG] First read: n=328965, n_u=3, n_v=16
@@ -64,491 +122,246 @@
   u[1]: score=47, len=5
   u[2]: score=43, len=6
 
-[COMPARE] n_u: GPU=1403, CPU=3 ✗ MISMATCH
+[COMPARE] n_u: GPU=1495, CPU=3 ✗ MISMATCH
 === End Comparison ===
 
 
 [P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[561835]: rel=0 -> abs=-1 (expected=-1)
-  p[561836]: rel=0 -> abs=-1 (expected=-1)
-  p[561837]: rel=0 -> abs=-1 (expected=-1)
-  p[561838]: rel=0 -> abs=-1 (expected=-1)
-  p[561839]: rel=0 -> abs=-1 (expected=-1)
-  p[561840]: rel=0 -> abs=-1 (expected=-1)
-  p[561841]: rel=0 -> abs=-1 (expected=-1)
-  p[561842]: rel=0 -> abs=-1 (expected=-1)
-  p[561843]: rel=1 -> abs=561842 (expected=561842)
-  p[561844]: rel=0 -> abs=-1 (expected=-1)
-  p[561845]: rel=0 -> abs=-1 (expected=-1)
-  p[561846]: rel=0 -> abs=-1 (expected=-1)
-  p[561847]: rel=0 -> abs=-1 (expected=-1)
-  p[561848]: rel=0 -> abs=-1 (expected=-1)
-  p[561849]: rel=0 -> abs=-1 (expected=-1)
-  p[561850]: rel=0 -> abs=-1 (expected=-1)
-  p[561851]: rel=0 -> abs=-1 (expected=-1)
-  p[561852]: rel=0 -> abs=-1 (expected=-1)
-  p[561853]: rel=0 -> abs=-1 (expected=-1)
-  p[561854]: rel=0 -> abs=-1 (expected=-1)
+  p[699927]: rel=0 -> abs=-1 (expected=-1)
+  p[699928]: rel=1 -> abs=699927 (expected=699927)
+  p[699929]: rel=1 -> abs=699928 (expected=699928)
+  p[699930]: rel=0 -> abs=-1 (expected=-1)
+  p[699931]: rel=0 -> abs=-1 (expected=-1)
+  p[699932]: rel=0 -> abs=-1 (expected=-1)
+  p[699933]: rel=0 -> abs=-1 (expected=-1)
+  p[699934]: rel=0 -> abs=-1 (expected=-1)
+  p[699935]: rel=0 -> abs=-1 (expected=-1)
+  p[699936]: rel=1 -> abs=699935 (expected=699935)
+  p[699937]: rel=0 -> abs=-1 (expected=-1)
+  p[699938]: rel=0 -> abs=-1 (expected=-1)
+  p[699939]: rel=0 -> abs=-1 (expected=-1)
+  p[699940]: rel=0 -> abs=-1 (expected=-1)
+  p[699941]: rel=0 -> abs=-1 (expected=-1)
+  p[699942]: rel=1 -> abs=699941 (expected=699941)
+  p[699943]: rel=0 -> abs=-1 (expected=-1)
+  p[699944]: rel=0 -> abs=-1 (expected=-1)
+  p[699945]: rel=0 -> abs=-1 (expected=-1)
+  p[699946]: rel=0 -> abs=-1 (expected=-1)
 
 [CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 561855
-  First 10 scores: 15 15 15 17 15 15 15 15 15 15 
-  Max score in first 100: 29
-  Anchors passing min_sc(40): 63880
-[GPU-DEBUG] First read: n=561855, n_z=63880, n_u=2041, n_v=9554
+  Total anchors: 699947
+  First 10 scores: 15 15 15 15 23 25 15 15 15 15 
+  Max score in first 100: 25
+  Anchors passing min_sc(40): 24246
+
+[Z-ARRAY-DEBUG] First read after sorting (n_z=24246):
+  Top 10 (highest scores):
+    z[0]: score=68375, anchor_idx=104449
+    z[1]: score=68372, anchor_idx=104448
+    z[2]: score=68356, anchor_idx=104446
+    z[3]: score=68366, anchor_idx=104447
+    z[4]: score=68372, anchor_idx=104448
+    z[5]: score=68375, anchor_idx=104449
+    z[6]: score=68366, anchor_idx=104447
+    z[7]: score=68366, anchor_idx=104447
+    z[8]: score=68356, anchor_idx=104446
+    z[9]: score=68356, anchor_idx=104446
+  Bottom 10 (lowest scores):
+    z[24236]: score=40, anchor_idx=695711
+    z[24237]: score=40, anchor_idx=695893
+    z[24238]: score=40, anchor_idx=696531
+    z[24239]: score=40, anchor_idx=697913
+    z[24240]: score=40, anchor_idx=698504
+    z[24241]: score=63, anchor_idx=685097
+    z[24242]: score=40, anchor_idx=685246
+    z[24243]: score=46, anchor_idx=685247
+    z[24244]: score=47, anchor_idx=685248
+    z[24245]: score=62, anchor_idx=685249
+[GPU-DEBUG] First read: n=699947, n_z=24246, n_u=2796, n_v=13190
+[GPU-DEBUG] First 3 u values:
+  u[0]: score=62, len=8
+  u[1]: score=63, len=5
+  u[2]: score=40, len=3
+
+[HOST-BACKTRACK-DEBUG] Simulating first chain's backtrack:
+  Starting from k=24245 (last in sorted z), z_y[k]=685249, z_x[k]=62
+  Backtrack path (following p[] chain):
+    anchor[685249]: f=62, p=685248
+    anchor[685248]: f=47, p=685247
+    anchor[685247]: f=46, p=685246
+    anchor[685246]: f=40, p=685245
+    anchor[685245]: f=35, p=685244
+    anchor[685244]: f=28, p=685243
+    anchor[685243]: f=26, p=685242
+    anchor[685242]: f=15, p=-1
+  Total steps followed: 8
+
+[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
+  p[515269]: rel=0 -> abs=-1 (expected=-1)
+  p[515270]: rel=1 -> abs=515269 (expected=515269)
+  p[515271]: rel=1 -> abs=515270 (expected=515270)
+  p[515272]: rel=0 -> abs=-1 (expected=-1)
+  p[515273]: rel=0 -> abs=-1 (expected=-1)
+  p[515274]: rel=0 -> abs=-1 (expected=-1)
+  p[515275]: rel=0 -> abs=-1 (expected=-1)
+  p[515276]: rel=0 -> abs=-1 (expected=-1)
+  p[515277]: rel=0 -> abs=-1 (expected=-1)
+  p[515278]: rel=0 -> abs=-1 (expected=-1)
+  p[515279]: rel=1 -> abs=515278 (expected=515278)
+  p[515280]: rel=0 -> abs=-1 (expected=-1)
+  p[515281]: rel=2 -> abs=515279 (expected=515279)
+  p[515282]: rel=0 -> abs=-1 (expected=-1)
+  p[515283]: rel=0 -> abs=-1 (expected=-1)
+  p[515284]: rel=0 -> abs=-1 (expected=-1)
+  p[515285]: rel=0 -> abs=-1 (expected=-1)
+  p[515286]: rel=0 -> abs=-1 (expected=-1)
+  p[515287]: rel=0 -> abs=-1 (expected=-1)
+  p[515288]: rel=0 -> abs=-1 (expected=-1)
+
+[CRITICAL-DEBUG] First read's f[] (chain scores):
+  Total anchors: 515289
+  First 10 scores: 15 15 15 15 23 25 15 15 15 15 
+  Max score in first 100: 25
+  Anchors passing min_sc(40): 18502
+
+[Z-ARRAY-DEBUG] First read after sorting (n_z=18502):
+  Top 10 (highest scores):
+    z[0]: score=68375, anchor_idx=104449
+    z[1]: score=68372, anchor_idx=104448
+    z[2]: score=68366, anchor_idx=104447
+    z[3]: score=68356, anchor_idx=104446
+    z[4]: score=68356, anchor_idx=104446
+    z[5]: score=68347, anchor_idx=104445
+    z[6]: score=68342, anchor_idx=104444
+    z[7]: score=68340, anchor_idx=104443
+    z[8]: score=68339, anchor_idx=104442
+    z[9]: score=68329, anchor_idx=104441
+  Bottom 10 (lowest scores):
+    z[18492]: score=40, anchor_idx=487109
+    z[18493]: score=40, anchor_idx=488052
+    z[18494]: score=40, anchor_idx=488603
+    z[18495]: score=40, anchor_idx=488779
+    z[18496]: score=40, anchor_idx=489183
+    z[18497]: score=40, anchor_idx=504592
+    z[18498]: score=40, anchor_idx=506106
+    z[18499]: score=40, anchor_idx=511654
+    z[18500]: score=40, anchor_idx=513729
+    z[18501]: score=40, anchor_idx=514649
+[GPU-DEBUG] First read: n=515289, n_z=18502, n_u=2366, n_v=11834
 [GPU-DEBUG] First 3 u values:
   u[0]: score=40, len=4
   u[1]: score=40, len=4
-  u[2]: score=40, len=4
+  u[2]: score=40, len=3
+
+[HOST-BACKTRACK-DEBUG] Simulating first chain's backtrack:
+  Starting from k=18501 (last in sorted z), z_y[k]=514649, z_x[k]=40
+  Backtrack path (following p[] chain):
+    anchor[514649]: f=40, p=514648
+    anchor[514648]: f=36, p=514647
+    anchor[514647]: f=23, p=514646
+    anchor[514646]: f=15, p=-1
+  Total steps followed: 4
 
 [P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[816421]: rel=0 -> abs=-1 (expected=-1)
-  p[816422]: rel=0 -> abs=-1 (expected=-1)
-  p[816423]: rel=0 -> abs=-1 (expected=-1)
-  p[816424]: rel=1 -> abs=816423 (expected=816423)
-  p[816425]: rel=0 -> abs=-1 (expected=-1)
-  p[816426]: rel=0 -> abs=-1 (expected=-1)
-  p[816427]: rel=0 -> abs=-1 (expected=-1)
-  p[816428]: rel=0 -> abs=-1 (expected=-1)
-  p[816429]: rel=0 -> abs=-1 (expected=-1)
-  p[816430]: rel=1 -> abs=816429 (expected=816429)
-  p[816431]: rel=1 -> abs=816430 (expected=816430)
-  p[816432]: rel=1 -> abs=816431 (expected=816431)
-  p[816433]: rel=1 -> abs=816432 (expected=816432)
-  p[816434]: rel=1 -> abs=816433 (expected=816433)
-  p[816435]: rel=1 -> abs=816434 (expected=816434)
-  p[816436]: rel=1 -> abs=816435 (expected=816435)
-  p[816437]: rel=0 -> abs=-1 (expected=-1)
-  p[816438]: rel=0 -> abs=-1 (expected=-1)
-  p[816439]: rel=0 -> abs=-1 (expected=-1)
-  p[816440]: rel=1 -> abs=816439 (expected=816439)
+  p[495617]: rel=0 -> abs=-1 (expected=-1)
+  p[495618]: rel=1 -> abs=495617 (expected=495617)
+  p[495619]: rel=0 -> abs=-1 (expected=-1)
+  p[495620]: rel=1 -> abs=495619 (expected=495619)
+  p[495621]: rel=0 -> abs=-1 (expected=-1)
+  p[495622]: rel=0 -> abs=-1 (expected=-1)
+  p[495623]: rel=0 -> abs=-1 (expected=-1)
+  p[495624]: rel=1 -> abs=495623 (expected=495623)
+  p[495625]: rel=1 -> abs=495624 (expected=495624)
+  p[495626]: rel=0 -> abs=-1 (expected=-1)
+  p[495627]: rel=0 -> abs=-1 (expected=-1)
+  p[495628]: rel=0 -> abs=-1 (expected=-1)
+  p[495629]: rel=2 -> abs=495627 (expected=495627)
+  p[495630]: rel=1 -> abs=495629 (expected=495629)
+  p[495631]: rel=0 -> abs=-1 (expected=-1)
+  p[495632]: rel=0 -> abs=-1 (expected=-1)
+  p[495633]: rel=0 -> abs=-1 (expected=-1)
+  p[495634]: rel=0 -> abs=-1 (expected=-1)
+  p[495635]: rel=0 -> abs=-1 (expected=-1)
+  p[495636]: rel=0 -> abs=-1 (expected=-1)
 
 [CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 816441
-  First 10 scores: 15 15 15 17 15 15 15 15 15 15 
-  Max score in first 100: 29
-  Anchors passing min_sc(40): 90534
-[GPU-DEBUG] First read: n=816441, n_z=90534, n_u=3063, n_v=14373
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=58, len=6
-  u[1]: score=50, len=5
-  u[2]: score=43, len=3
+  Total anchors: 495637
+  First 10 scores: 15 15 15 15 23 25 15 15 15 15 
+  Max score in first 100: 25
+  Anchors passing min_sc(40): 17826
 
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[764068]: rel=0 -> abs=-1 (expected=-1)
-  p[764069]: rel=0 -> abs=-1 (expected=-1)
-  p[764070]: rel=0 -> abs=-1 (expected=-1)
-  p[764071]: rel=0 -> abs=-1 (expected=-1)
-  p[764072]: rel=0 -> abs=-1 (expected=-1)
-  p[764073]: rel=0 -> abs=-1 (expected=-1)
-  p[764074]: rel=0 -> abs=-1 (expected=-1)
-  p[764075]: rel=0 -> abs=-1 (expected=-1)
-  p[764076]: rel=0 -> abs=-1 (expected=-1)
-  p[764077]: rel=0 -> abs=-1 (expected=-1)
-  p[764078]: rel=0 -> abs=-1 (expected=-1)
-  p[764079]: rel=0 -> abs=-1 (expected=-1)
-  p[764080]: rel=1 -> abs=764079 (expected=764079)
-  p[764081]: rel=0 -> abs=-1 (expected=-1)
-  p[764082]: rel=0 -> abs=-1 (expected=-1)
-  p[764083]: rel=0 -> abs=-1 (expected=-1)
-  p[764084]: rel=0 -> abs=-1 (expected=-1)
-  p[764085]: rel=0 -> abs=-1 (expected=-1)
-  p[764086]: rel=0 -> abs=-1 (expected=-1)
-  p[764087]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 764088
-  First 10 scores: 15 15 15 17 15 15 15 15 15 15 
-  Max score in first 100: 29
-  Anchors passing min_sc(40): 89919
-[GPU-DEBUG] First read: n=764088, n_z=89919, n_u=2731, n_v=13003
+[Z-ARRAY-DEBUG] First read after sorting (n_z=17826):
+  Top 10 (highest scores):
+    z[0]: score=68375, anchor_idx=104449
+    z[1]: score=68372, anchor_idx=104448
+    z[2]: score=68366, anchor_idx=104447
+    z[3]: score=68356, anchor_idx=104446
+    z[4]: score=68366, anchor_idx=104447
+    z[5]: score=68372, anchor_idx=104448
+    z[6]: score=68375, anchor_idx=104449
+    z[7]: score=68356, anchor_idx=104446
+    z[8]: score=68356, anchor_idx=104446
+    z[9]: score=68347, anchor_idx=104445
+  Bottom 10 (lowest scores):
+    z[17816]: score=47, anchor_idx=315376
+    z[17817]: score=43, anchor_idx=315389
+    z[17818]: score=49, anchor_idx=315616
+    z[17819]: score=44, anchor_idx=315660
+    z[17820]: score=59, anchor_idx=315661
+    z[17821]: score=43, anchor_idx=315741
+    z[17822]: score=46, anchor_idx=315742
+    z[17823]: score=43, anchor_idx=316126
+    z[17824]: score=48, anchor_idx=316186
+    z[17825]: score=55, anchor_idx=316187
+[GPU-DEBUG] First read: n=495637, n_z=17826, n_u=2092, n_v=10822
 [GPU-DEBUG] First 3 u values:
-  u[0]: score=57, len=6
-  u[1]: score=53, len=16
-  u[2]: score=54, len=7
-[Info] plchain_cal_score_async (gpu/plchain.cu:405) Launching Batch: n_read 310, total anchors 200309896 (mem usage: 400.62%)
-[WARNING] Unable to fit reads 308 - 309 into a microbatch. Fall back to cpu chaining
-[WARNING] Run CPU kernel for read 316
-[WARNING] Run CPU kernel for read 317
-[WARNING] Run CPU kernel for read 318
-[Info::gpu_align_batch_execute] Two-tier processing: 16805 short tasks (max_len≤1000bp) + 12043 long tasks (max_len>1000bp)
+  u[0]: score=55, len=5
+  u[1]: score=43, len=3
+  u[2]: score=46, len=5
+
+[HOST-BACKTRACK-DEBUG] Simulating first chain's backtrack:
+  Starting from k=17825 (last in sorted z), z_y[k]=316187, z_x[k]=55
+  Backtrack path (following p[] chain):
+    anchor[316187]: f=55, p=316186
+    anchor[316186]: f=48, p=316185
+    anchor[316185]: f=34, p=316184
+    anchor[316184]: f=30, p=316183
+    anchor[316183]: f=15, p=-1
+  Total steps followed: 5
+[Info] plchain_cal_score_async (gpu/plchain.cu:405) Launching Batch: n_read 309, total anchors 200061136 (mem usage: 400.12%)
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#0 batch_n 49553016, read_start 0, read_end 76 usage 99.11 %
+[DEBUG](MICROBATCH# 0) total segs: 96746, short:96382 mid: 267 
+[DEBUG] aggreagated num of long segs 97, 0-97 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 4779505491
+[DEBUG] Total workload (sc pairs) in batch: 5417308142. 88.23% work are in long segs.
+[DEBUG] Short Seg kernel #0 throughput: 836.51 Mpairs/s
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#1 batch_n 48723053, read_start 76, read_end 151 usage 97.45 %
+[DEBUG](MICROBATCH# 1) total segs: 95123, short:94823 mid: 135 
+[DEBUG] aggreagated num of long segs 165, 97-165 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 2290935474
+[DEBUG] Total workload (sc pairs) in batch: 2568941472. 89.18% work are in long segs.
+[DEBUG] Short Seg kernel #1 throughput: 621.25 Mpairs/s
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#2 batch_n 49560834, read_start 151, read_end 223 usage 99.12 %
+[DEBUG](MICROBATCH# 2) total segs: 96762, short:96238 mid: 299 
+[DEBUG] aggreagated num of long segs 225, 165-225 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 19441135687
+[DEBUG] Total workload (sc pairs) in batch: 19714928551. 98.61% work are in long segs.
+[DEBUG] Short Seg kernel #2 throughput: 774.51 Mpairs/s
+[Debug] plchain_cal_score_async (gpu/plchain.cu:455) MICROBATCH#3 batch_n 49815595, read_start 223, read_end 305 usage 99.63 %
+[DEBUG](MICROBATCH# 3) total segs: 97259, short:96654 mid: 342 
+[DEBUG] aggreagated num of long segs 263, 225-263 belongs to this minibatch
+[DEBUG] workload (sc pairs) in long segs: 6670621802
+[DEBUG] Total workload (sc pairs) in batch: 6944668261. 96.05% work are in long segs.
+[DEBUG] Short Seg kernel #3 throughput: 667.28 Mpairs/s
+[WARNING] Unable to fit reads 305 - 308 into a microbatch. Fall back to cpu chaining
+[Debug] plscore_async_long_forward_dp (gpu/plscore.cu:582) Long Grid Dim = 144
+[WARNING] Run CPU kernel for read 319
+[WARNING] Run CPU kernel for read 320
+[Info::gpu_align_batch_execute] Two-tier processing: 17688 short tasks (max_len≤1000bp) + 12213 long tasks (max_len>1000bp)
 [Info::gpu_align_batch_execute]   Short: 3 batches × 7000 tasks/batch
-[Info::gpu_align_batch_execute]   Long:  95 batches × 128 tasks/batch
+[Info::gpu_align_batch_execute]   Long:  96 batches × 128 tasks/batch
 [Info::gpu_align_batch_execute] === Processing Short Tasks (phase 1/2) ===
-[Short Tasks] [============>                 ]  41% (7000/16805 in phase, 7000/28848 total, batch 1/98)[Short Tasks] [========================>     ]  83% (14000/16805 in phase, 14000/28848 total, batch 2/98)[Short Tasks] [==============================] 100% (16805/16805 in phase, 16805/28848 total, batch 3/98)
-[Info::gpu_align_batch_execute] === Short Tasks completed: 16805 tasks processed ===
+[Short Tasks] [===========>                  ]  39% (7000/17688 in phase, 7000/29901 total, batch 1/99)[Short Tasks] [=======================>      ]  79% (14000/17688 in phase, 14000/29901 total, batch 2/99)[Short Tasks] [==============================] 100% (17688/17688 in phase, 17688/29901 total, batch 3/99)
+[Info::gpu_align_batch_execute] === Short Tasks completed: 17688 tasks processed ===
 [Info::gpu_align_batch_execute] === Processing Long Tasks (phase 2/2) ===
-[Long Tasks] [>                             ]   1% (128/12043 in phase, 16933/28848 total, batch 4/98)[Long Tasks] [>                             ]   2% (256/12043 in phase, 17061/28848 total, batch 5/98)[Long Tasks] [>                             ]   3% (384/12043 in phase, 17189/28848 total, batch 6/98)[Long Tasks] [=>                            ]   4% (512/12043 in phase, 17317/28848 total, batch 7/98)[Long Tasks] [=>                            ]   5% (640/12043 in phase, 17445/28848 total, batch 8/98)[Long Tasks] [=>                            ]   6% (768/12043 in phase, 17573/28848 total, batch 9/98)[Long Tasks] [==>                           ]   7% (896/12043 in phase, 17701/28848 total, batch 10/98)[Long Tasks] [==>                           ]   8% (1024/12043 in phase, 17829/28848 total, batch 11/98)[Long Tasks] [==>                           ]   9% (1152/12043 in phase, 17957/28848 total, batch 12/98)[Long Tasks] [===>                          ]  10% (1280/12043 in phase, 18085/28848 total, batch 13/98)[Long Tasks] [===>                          ]  11% (1408/12043 in phase, 18213/28848 total, batch 14/98)[Long Tasks] [===>                          ]  12% (1536/12043 in phase, 18341/28848 total, batch 15/98)[Long Tasks] [===>                          ]  13% (1664/12043 in phase, 18469/28848 total, batch 16/98)[Long Tasks] [====>                         ]  14% (1792/12043 in phase, 18597/28848 total, batch 17/98)[Long Tasks] [====>                         ]  15% (1920/12043 in phase, 18725/28848 total, batch 18/98)[Long Tasks] [=====>                        ]  17% (2048/12043 in phase, 18853/28848 total, batch 19/98)[Long Tasks] [=====>                        ]  18% (2176/12043 in phase, 18981/28848 total, batch 20/98)[Long Tasks] [=====>                        ]  19% (2304/12043 in phase, 19109/28848 total, batch 21/98)[Long Tasks] [======>                       ]  20% (2432/12043 in phase, 19237/28848 total, batch 22/98)[Long Tasks] [======>                       ]  21% (2560/12043 in phase, 19365/28848 total, batch 23/98)[Long Tasks] [======>                       ]  22% (2688/12043 in phase, 19493/28848 total, batch 24/98)[Long Tasks] [======>                       ]  23% (2816/12043 in phase, 19621/28848 total, batch 25/98)[Long Tasks] [=======>                      ]  24% (2944/12043 in phase, 19749/28848 total, batch 26/98)[Long Tasks] [=======>                      ]  25% (3072/12043 in phase, 19877/28848 total, batch 27/98)[Long Tasks] [=======>                      ]  26% (3200/12043 in phase, 20005/28848 total, batch 28/98)[Long Tasks] [========>                     ]  27% (3328/12043 in phase, 20133/28848 total, batch 29/98)[Long Tasks] [========>                     ]  28% (3456/12043 in phase, 20261/28848 total, batch 30/98)[Long Tasks] [========>                     ]  29% (3584/12043 in phase, 20389/28848 total, batch 31/98)[Long Tasks] [=========>                    ]  30% (3712/12043 in phase, 20517/28848 total, batch 32/98)[Long Tasks] [=========>                    ]  31% (3840/12043 in phase, 20645/28848 total, batch 33/98)[Long Tasks] [=========>                    ]  32% (3968/12043 in phase, 20773/28848 total, batch 34/98)[Long Tasks] [==========>                   ]  34% (4096/12043 in phase, 20901/28848 total, batch 35/98)[Long Tasks] [==========>                   ]  35% (4224/12043 in phase, 21029/28848 total, batch 36/98)[Long Tasks] [==========>                   ]  36% (4352/12043 in phase, 21157/28848 total, batch 37/98)[Long Tasks] [===========>                  ]  37% (4480/12043 in phase, 21285/28848 total, batch 38/98)[Long Tasks] [===========>                  ]  38% (4608/12043 in phase, 21413/28848 total, batch 39/98)[Long Tasks] [===========>                  ]  39% (4736/12043 in phase, 21541/28848 total, batch 40/98)[Long Tasks] [============>                 ]  40% (4864/12043 in phase, 21669/28848 total, batch 41/98)[Long Tasks] [============>                 ]  41% (4992/12043 in phase, 21797/28848 total, batch 42/98)[Long Tasks] [============>                 ]  42% (5120/12043 in phase, 21925/28848 total, batch 43/98)[Long Tasks] [============>                 ]  43% (5248/12043 in phase, 22053/28848 total, batch 44/98)[Long Tasks] [=============>                ]  44% (5376/12043 in phase, 22181/28848 total, batch 45/98)[Long Tasks] [=============>                ]  45% (5504/12043 in phase, 22309/28848 total, batch 46/98)[Long Tasks] [=============>                ]  46% (5632/12043 in phase, 22437/28848 total, batch 47/98)[Long Tasks] [==============>               ]  47% (5760/12043 in phase, 22565/28848 total, batch 48/98)[Long Tasks] [==============>               ]  48% (5888/12043 in phase, 22693/28848 total, batch 49/98)[Long Tasks] [==============>               ]  49% (6016/12043 in phase, 22821/28848 total, batch 50/98)[Long Tasks] [===============>              ]  51% (6144/12043 in phase, 22949/28848 total, batch 51/98)[Long Tasks] [===============>              ]  52% (6272/12043 in phase, 23077/28848 total, batch 52/98)[Long Tasks] [===============>              ]  53% (6400/12043 in phase, 23205/28848 total, batch 53/98)[Long Tasks] [================>             ]  54% (6528/12043 in phase, 23333/28848 total, batch 54/98)[Long Tasks] [================>             ]  55% (6656/12043 in phase, 23461/28848 total, batch 55/98)[Long Tasks] [================>             ]  56% (6784/12043 in phase, 23589/28848 total, batch 56/98)[Long Tasks] [=================>            ]  57% (6912/12043 in phase, 23717/28848 total, batch 57/98)[Long Tasks] [=================>            ]  58% (7040/12043 in phase, 23845/28848 total, batch 58/98)[Long Tasks] [=================>            ]  59% (7168/12043 in phase, 23973/28848 total, batch 59/98)[Long Tasks] [==================>           ]  60% (7296/12043 in phase, 24101/28848 total, batch 60/98)[Long Tasks] [==================>           ]  61% (7424/12043 in phase, 24229/28848 total, batch 61/98)[Long Tasks] [==================>           ]  62% (7552/12043 in phase, 24357/28848 total, batch 62/98)[Long Tasks] [==================>           ]  63% (7680/12043 in phase, 24485/28848 total, batch 63/98)[Long Tasks] [===================>          ]  64% (7808/12043 in phase, 24613/28848 total, batch 64/98)[Long Tasks] [===================>          ]  65% (7936/12043 in phase, 24741/28848 total, batch 65/98)[Long Tasks] [===================>          ]  66% (8064/12043 in phase, 24869/28848 total, batch 66/98)[Long Tasks] [====================>         ]  68% (8192/12043 in phase, 24997/28848 total, batch 67/98)[Long Tasks] [====================>         ]  69% (8320/12043 in phase, 25125/28848 total, batch 68/98)[Long Tasks] [=====================>        ]  70% (8448/12043 in phase, 25253/28848 total, batch 69/98)[Long Tasks] [=====================>        ]  71% (8576/12043 in phase, 25381/28848 total, batch 70/98)[Long Tasks] [=====================>        ]  72% (8704/12043 in phase, 25509/28848 total, batch 71/98)[Long Tasks] [=====================>        ]  73% (8832/12043 in phase, 25637/28848 total, batch 72/98)[Long Tasks] [======================>       ]  74% (8960/12043 in phase, 25765/28848 total, batch 73/98)[Long Tasks] [======================>       ]  75% (9088/12043 in phase, 25893/28848 total, batch 74/98)[Long Tasks] [======================>       ]  76% (9216/12043 in phase, 26021/28848 total, batch 75/98)[Long Tasks] [=======================>      ]  77% (9344/12043 in phase, 26149/28848 total, batch 76/98)[Long Tasks] [=======================>      ]  78% (9472/12043 in phase, 26277/28848 total, batch 77/98)[Long Tasks] [=======================>      ]  79% (9600/12043 in phase, 26405/28848 total, batch 78/98)[Long Tasks] [========================>     ]  80% (9728/12043 in phase, 26533/28848 total, batch 79/98)[Long Tasks] [========================>     ]  81% (9856/12043 in phase, 26661/28848 total, batch 80/98)[Long Tasks] [========================>     ]  82% (9984/12043 in phase, 26789/28848 total, batch 81/98)[Long Tasks] [========================>     ]  83% (10112/12043 in phase, 26917/28848 total, batch 82/98)[Long Tasks] [=========================>    ]  85% (10240/12043 in phase, 27045/28848 total, batch 83/98)[Long Tasks] [=========================>    ]  86% (10368/12043 in phase, 27173/28848 total, batch 84/98)[Long Tasks] [==========================>   ]  87% (10496/12043 in phase, 27301/28848 total, batch 85/98)[Long Tasks] [==========================>   ]  88% (10624/12043 in phase, 27429/28848 total, batch 86/98)[Long Tasks] [==========================>   ]  89% (10752/12043 in phase, 27557/28848 total, batch 87/98)[Long Tasks] [===========================>  ]  90% (10880/12043 in phase, 27685/28848 total, batch 88/98)[Long Tasks] [===========================>  ]  91% (11008/12043 in phase, 27813/28848 total, batch 89/98)[Long Tasks] [===========================>  ]  92% (11136/12043 in phase, 27941/28848 total, batch 90/98)[Long Tasks] [===========================>  ]  93% (11264/12043 in phase, 28069/28848 total, batch 91/98)[Long Tasks] [============================> ]  94% (11392/12043 in phase, 28197/28848 total, batch 92/98)[Long Tasks] [============================> ]  95% (11520/12043 in phase, 28325/28848 total, batch 93/98)[Long Tasks] [============================> ]  96% (11648/12043 in phase, 28453/28848 total, batch 94/98)[Long Tasks] [=============================>]  97% (11776/12043 in phase, 28581/28848 total, batch 95/98)[Long Tasks] [=============================>]  98% (11904/12043 in phase, 28709/28848 total, batch 96/98)[Long Tasks] [=============================>]  99% (12032/12043 in phase, 28837/28848 total, batch 97/98)[Long Tasks] [==============================] 100% (12043/12043 in phase, 28848/28848 total, batch 98/98)
-[Info::gpu_align_batch_execute] === Long Tasks completed: 12043 tasks processed ===
-[Align Progress] [==============================] 100% (28848/28848 tasks, 98 batches) - DONE
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[538446]: rel=1 -> abs=538445 (expected=538445)
-  p[538447]: rel=1 -> abs=538446 (expected=538446)
-  p[538448]: rel=1 -> abs=538447 (expected=538447)
-  p[538449]: rel=1 -> abs=538448 (expected=538448)
-  p[538450]: rel=1 -> abs=538449 (expected=538449)
-  p[538451]: rel=0 -> abs=-1 (expected=-1)
-  p[538452]: rel=0 -> abs=-1 (expected=-1)
-  p[538453]: rel=0 -> abs=-1 (expected=-1)
-  p[538454]: rel=1 -> abs=538453 (expected=538453)
-  p[538455]: rel=0 -> abs=-1 (expected=-1)
-  p[538456]: rel=1 -> abs=538455 (expected=538455)
-  p[538457]: rel=1 -> abs=538456 (expected=538456)
-  p[538458]: rel=1 -> abs=538457 (expected=538457)
-  p[538459]: rel=1 -> abs=538458 (expected=538458)
-  p[538460]: rel=0 -> abs=-1 (expected=-1)
-  p[538461]: rel=0 -> abs=-1 (expected=-1)
-  p[538462]: rel=1 -> abs=538461 (expected=538461)
-  p[538463]: rel=1 -> abs=538462 (expected=538462)
-  p[538464]: rel=0 -> abs=-1 (expected=-1)
-  p[538465]: rel=1 -> abs=538464 (expected=538464)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 538466
-  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
-  Max score in first 100: 61
-  Anchors passing min_sc(40): 28636
-[GPU-DEBUG] First read: n=538466, n_z=28636, n_u=3808, n_v=19805
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=41, len=3
-  u[1]: score=44, len=3
-  u[2]: score=55, len=4
-
-=== CPU vs GPU Backtracking Comparison ===
-[CPU-DEBUG] First read: n=538466, n_u=2635, n_v=23406
-[CPU-DEBUG] First 3 u values:
-  u[0]: score=78969, len=11715
-  u[1]: score=133, len=11
-  u[2]: score=122, len=12
-
-[COMPARE] n_u: GPU=3808, CPU=2635 ✗ MISMATCH
-=== End Comparison ===
-
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[529776]: rel=1 -> abs=529775 (expected=529775)
-  p[529777]: rel=0 -> abs=-1 (expected=-1)
-  p[529778]: rel=0 -> abs=-1 (expected=-1)
-  p[529779]: rel=1 -> abs=529778 (expected=529778)
-  p[529780]: rel=1 -> abs=529779 (expected=529779)
-  p[529781]: rel=0 -> abs=-1 (expected=-1)
-  p[529782]: rel=0 -> abs=-1 (expected=-1)
-  p[529783]: rel=0 -> abs=-1 (expected=-1)
-  p[529784]: rel=0 -> abs=-1 (expected=-1)
-  p[529785]: rel=0 -> abs=-1 (expected=-1)
-  p[529786]: rel=0 -> abs=-1 (expected=-1)
-  p[529787]: rel=0 -> abs=-1 (expected=-1)
-  p[529788]: rel=0 -> abs=-1 (expected=-1)
-  p[529789]: rel=0 -> abs=-1 (expected=-1)
-  p[529790]: rel=0 -> abs=-1 (expected=-1)
-  p[529791]: rel=0 -> abs=-1 (expected=-1)
-  p[529792]: rel=0 -> abs=-1 (expected=-1)
-  p[529793]: rel=0 -> abs=-1 (expected=-1)
-  p[529794]: rel=0 -> abs=-1 (expected=-1)
-  p[529795]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 529796
-  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
-  Max score in first 100: 61
-  Anchors passing min_sc(40): 27971
-[GPU-DEBUG] First read: n=529796, n_z=27971, n_u=3842, n_v=19963
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=40, len=4
-  u[1]: score=40, len=4
-  u[2]: score=40, len=7
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[643110]: rel=1 -> abs=643109 (expected=643109)
-  p[643111]: rel=0 -> abs=-1 (expected=-1)
-  p[643112]: rel=0 -> abs=-1 (expected=-1)
-  p[643113]: rel=0 -> abs=-1 (expected=-1)
-  p[643114]: rel=0 -> abs=-1 (expected=-1)
-  p[643115]: rel=0 -> abs=-1 (expected=-1)
-  p[643116]: rel=0 -> abs=-1 (expected=-1)
-  p[643117]: rel=0 -> abs=-1 (expected=-1)
-  p[643118]: rel=0 -> abs=-1 (expected=-1)
-  p[643119]: rel=0 -> abs=-1 (expected=-1)
-  p[643120]: rel=0 -> abs=-1 (expected=-1)
-  p[643121]: rel=0 -> abs=-1 (expected=-1)
-  p[643122]: rel=0 -> abs=-1 (expected=-1)
-  p[643123]: rel=0 -> abs=-1 (expected=-1)
-  p[643124]: rel=0 -> abs=-1 (expected=-1)
-  p[643125]: rel=0 -> abs=-1 (expected=-1)
-  p[643126]: rel=0 -> abs=-1 (expected=-1)
-  p[643127]: rel=0 -> abs=-1 (expected=-1)
-  p[643128]: rel=0 -> abs=-1 (expected=-1)
-  p[643129]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 643130
-  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
-  Max score in first 100: 61
-  Anchors passing min_sc(40): 35262
-[GPU-DEBUG] First read: n=643130, n_z=35262, n_u=4540, n_v=22068
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=44, len=4
-  u[1]: score=63, len=9
-  u[2]: score=44, len=6
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[501297]: rel=0 -> abs=-1 (expected=-1)
-  p[501298]: rel=0 -> abs=-1 (expected=-1)
-  p[501299]: rel=0 -> abs=-1 (expected=-1)
-  p[501300]: rel=0 -> abs=-1 (expected=-1)
-  p[501301]: rel=0 -> abs=-1 (expected=-1)
-  p[501302]: rel=0 -> abs=-1 (expected=-1)
-  p[501303]: rel=0 -> abs=-1 (expected=-1)
-  p[501304]: rel=0 -> abs=-1 (expected=-1)
-  p[501305]: rel=1 -> abs=501304 (expected=501304)
-  p[501306]: rel=0 -> abs=-1 (expected=-1)
-  p[501307]: rel=0 -> abs=-1 (expected=-1)
-  p[501308]: rel=0 -> abs=-1 (expected=-1)
-  p[501309]: rel=0 -> abs=-1 (expected=-1)
-  p[501310]: rel=0 -> abs=-1 (expected=-1)
-  p[501311]: rel=0 -> abs=-1 (expected=-1)
-  p[501312]: rel=0 -> abs=-1 (expected=-1)
-  p[501313]: rel=0 -> abs=-1 (expected=-1)
-  p[501314]: rel=0 -> abs=-1 (expected=-1)
-  p[501315]: rel=0 -> abs=-1 (expected=-1)
-  p[501316]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 501317
-  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
-  Max score in first 100: 61
-  Anchors passing min_sc(40): 26877
-[GPU-DEBUG] First read: n=501317, n_z=26877, n_u=3898, n_v=21068
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=44, len=3
-  u[1]: score=52, len=4
-  u[2]: score=42, len=3
-[Info] plchain_cal_score_async (gpu/plchain.cu:405) Launching Batch: n_read 334, total anchors 200142438 (mem usage: 400.28%)
-[WARNING] Unable to fit reads 332 - 333 into a microbatch. Fall back to cpu chaining
-[WARNING] Run CPU kernel for read 308
-[WARNING] Run CPU kernel for read 309
-[Info::gpu_align_batch_execute] Two-tier processing: 21273 short tasks (max_len≤1000bp) + 11171 long tasks (max_len>1000bp)
-[Info::gpu_align_batch_execute]   Short: 4 batches × 7000 tasks/batch
-[Info::gpu_align_batch_execute]   Long:  88 batches × 128 tasks/batch
-[Info::gpu_align_batch_execute] === Processing Short Tasks (phase 1/2) ===
-[Short Tasks] [=========>                    ]  32% (7000/21273 in phase, 7000/32444 total, batch 1/92)[Short Tasks] [===================>          ]  65% (14000/21273 in phase, 14000/32444 total, batch 2/92)[Short Tasks] [=============================>]  98% (21000/21273 in phase, 21000/32444 total, batch 3/92)[Short Tasks] [==============================] 100% (21273/21273 in phase, 21273/32444 total, batch 4/92)
-[Info::gpu_align_batch_execute] === Short Tasks completed: 21273 tasks processed ===
-[Info::gpu_align_batch_execute] === Processing Long Tasks (phase 2/2) ===
-[Long Tasks] [>                             ]   1% (128/11171 in phase, 21401/32444 total, batch 5/92)[Long Tasks] [>                             ]   2% (256/11171 in phase, 21529/32444 total, batch 6/92)[Long Tasks] [>                             ]   3% (384/11171 in phase, 21657/32444 total, batch 7/92)[Long Tasks] [=>                            ]   4% (512/11171 in phase, 21785/32444 total, batch 8/92)[Long Tasks] [=>                            ]   5% (640/11171 in phase, 21913/32444 total, batch 9/92)[Long Tasks] [=>                            ]   6% (768/11171 in phase, 22041/32444 total, batch 10/92)[Long Tasks] [==>                           ]   8% (896/11171 in phase, 22169/32444 total, batch 11/92)[Long Tasks] [==>                           ]   9% (1024/11171 in phase, 22297/32444 total, batch 12/92)[Long Tasks] [===>                          ]  10% (1152/11171 in phase, 22425/32444 total, batch 13/92)[Long Tasks] [===>                          ]  11% (1280/11171 in phase, 22553/32444 total, batch 14/92)[Long Tasks] [===>                          ]  12% (1408/11171 in phase, 22681/32444 total, batch 15/92)[Long Tasks] [===>                          ]  13% (1536/11171 in phase, 22809/32444 total, batch 16/92)[Long Tasks] [====>                         ]  14% (1664/11171 in phase, 22937/32444 total, batch 17/92)[Long Tasks] [====>                         ]  16% (1792/11171 in phase, 23065/32444 total, batch 18/92)[Long Tasks] [=====>                        ]  17% (1920/11171 in phase, 23193/32444 total, batch 19/92)[Long Tasks] [=====>                        ]  18% (2048/11171 in phase, 23321/32444 total, batch 20/92)[Long Tasks] [=====>                        ]  19% (2176/11171 in phase, 23449/32444 total, batch 21/92)[Long Tasks] [======>                       ]  20% (2304/11171 in phase, 23577/32444 total, batch 22/92)[Long Tasks] [======>                       ]  21% (2432/11171 in phase, 23705/32444 total, batch 23/92)[Long Tasks] [======>                       ]  22% (2560/11171 in phase, 23833/32444 total, batch 24/92)[Long Tasks] [=======>                      ]  24% (2688/11171 in phase, 23961/32444 total, batch 25/92)[Long Tasks] [=======>                      ]  25% (2816/11171 in phase, 24089/32444 total, batch 26/92)[Long Tasks] [=======>                      ]  26% (2944/11171 in phase, 24217/32444 total, batch 27/92)[Long Tasks] [========>                     ]  27% (3072/11171 in phase, 24345/32444 total, batch 28/92)[Long Tasks] [========>                     ]  28% (3200/11171 in phase, 24473/32444 total, batch 29/92)[Long Tasks] [========>                     ]  29% (3328/11171 in phase, 24601/32444 total, batch 30/92)[Long Tasks] [=========>                    ]  30% (3456/11171 in phase, 24729/32444 total, batch 31/92)[Long Tasks] [=========>                    ]  32% (3584/11171 in phase, 24857/32444 total, batch 32/92)[Long Tasks] [=========>                    ]  33% (3712/11171 in phase, 24985/32444 total, batch 33/92)[Long Tasks] [==========>                   ]  34% (3840/11171 in phase, 25113/32444 total, batch 34/92)[Long Tasks] [==========>                   ]  35% (3968/11171 in phase, 25241/32444 total, batch 35/92)[Long Tasks] [==========>                   ]  36% (4096/11171 in phase, 25369/32444 total, batch 36/92)[Long Tasks] [===========>                  ]  37% (4224/11171 in phase, 25497/32444 total, batch 37/92)[Long Tasks] [===========>                  ]  38% (4352/11171 in phase, 25625/32444 total, batch 38/92)[Long Tasks] [============>                 ]  40% (4480/11171 in phase, 25753/32444 total, batch 39/92)[Long Tasks] [============>                 ]  41% (4608/11171 in phase, 25881/32444 total, batch 40/92)[Long Tasks] [============>                 ]  42% (4736/11171 in phase, 26009/32444 total, batch 41/92)[Long Tasks] [============>                 ]  43% (4864/11171 in phase, 26137/32444 total, batch 42/92)[Long Tasks] [=============>                ]  44% (4992/11171 in phase, 26265/32444 total, batch 43/92)[Long Tasks] [=============>                ]  45% (5120/11171 in phase, 26393/32444 total, batch 44/92)[Long Tasks] [=============>                ]  46% (5248/11171 in phase, 26521/32444 total, batch 45/92)[Long Tasks] [==============>               ]  48% (5376/11171 in phase, 26649/32444 total, batch 46/92)[Long Tasks] [==============>               ]  49% (5504/11171 in phase, 26777/32444 total, batch 47/92)[Long Tasks] [===============>              ]  50% (5632/11171 in phase, 26905/32444 total, batch 48/92)[Long Tasks] [===============>              ]  51% (5760/11171 in phase, 27033/32444 total, batch 49/92)[Long Tasks] [===============>              ]  52% (5888/11171 in phase, 27161/32444 total, batch 50/92)[Long Tasks] [===============>              ]  53% (6016/11171 in phase, 27289/32444 total, batch 51/92)[Long Tasks] [================>             ]  54% (6144/11171 in phase, 27417/32444 total, batch 52/92)[Long Tasks] [================>             ]  56% (6272/11171 in phase, 27545/32444 total, batch 53/92)[Long Tasks] [=================>            ]  57% (6400/11171 in phase, 27673/32444 total, batch 54/92)[Long Tasks] [=================>            ]  58% (6528/11171 in phase, 27801/32444 total, batch 55/92)[Long Tasks] [=================>            ]  59% (6656/11171 in phase, 27929/32444 total, batch 56/92)[Long Tasks] [==================>           ]  60% (6784/11171 in phase, 28057/32444 total, batch 57/92)[Long Tasks] [==================>           ]  61% (6912/11171 in phase, 28185/32444 total, batch 58/92)[Long Tasks] [==================>           ]  63% (7040/11171 in phase, 28313/32444 total, batch 59/92)[Long Tasks] [===================>          ]  64% (7168/11171 in phase, 28441/32444 total, batch 60/92)[Long Tasks] [===================>          ]  65% (7296/11171 in phase, 28569/32444 total, batch 61/92)[Long Tasks] [===================>          ]  66% (7424/11171 in phase, 28697/32444 total, batch 62/92)[Long Tasks] [====================>         ]  67% (7552/11171 in phase, 28825/32444 total, batch 63/92)[Long Tasks] [====================>         ]  68% (7680/11171 in phase, 28953/32444 total, batch 64/92)[Long Tasks] [====================>         ]  69% (7808/11171 in phase, 29081/32444 total, batch 65/92)[Long Tasks] [=====================>        ]  71% (7936/11171 in phase, 29209/32444 total, batch 66/92)[Long Tasks] [=====================>        ]  72% (8064/11171 in phase, 29337/32444 total, batch 67/92)[Long Tasks] [=====================>        ]  73% (8192/11171 in phase, 29465/32444 total, batch 68/92)[Long Tasks] [======================>       ]  74% (8320/11171 in phase, 29593/32444 total, batch 69/92)[Long Tasks] [======================>       ]  75% (8448/11171 in phase, 29721/32444 total, batch 70/92)[Long Tasks] [======================>       ]  76% (8576/11171 in phase, 29849/32444 total, batch 71/92)[Long Tasks] [=======================>      ]  77% (8704/11171 in phase, 29977/32444 total, batch 72/92)[Long Tasks] [=======================>      ]  79% (8832/11171 in phase, 30105/32444 total, batch 73/92)[Long Tasks] [========================>     ]  80% (8960/11171 in phase, 30233/32444 total, batch 74/92)[Long Tasks] [========================>     ]  81% (9088/11171 in phase, 30361/32444 total, batch 75/92)[Long Tasks] [========================>     ]  82% (9216/11171 in phase, 30489/32444 total, batch 76/92)[Long Tasks] [========================>     ]  83% (9344/11171 in phase, 30617/32444 total, batch 77/92)[Long Tasks] [=========================>    ]  84% (9472/11171 in phase, 30745/32444 total, batch 78/92)[Long Tasks] [=========================>    ]  85% (9600/11171 in phase, 30873/32444 total, batch 79/92)[Long Tasks] [==========================>   ]  87% (9728/11171 in phase, 31001/32444 total, batch 80/92)[Long Tasks] [==========================>   ]  88% (9856/11171 in phase, 31129/32444 total, batch 81/92)[Long Tasks] [==========================>   ]  89% (9984/11171 in phase, 31257/32444 total, batch 82/92)[Long Tasks] [===========================>  ]  90% (10112/11171 in phase, 31385/32444 total, batch 83/92)[Long Tasks] [===========================>  ]  91% (10240/11171 in phase, 31513/32444 total, batch 84/92)[Long Tasks] [===========================>  ]  92% (10368/11171 in phase, 31641/32444 total, batch 85/92)[Long Tasks] [===========================>  ]  93% (10496/11171 in phase, 31769/32444 total, batch 86/92)[Long Tasks] [============================> ]  95% (10624/11171 in phase, 31897/32444 total, batch 87/92)[Long Tasks] [============================> ]  96% (10752/11171 in phase, 32025/32444 total, batch 88/92)[Long Tasks] [=============================>]  97% (10880/11171 in phase, 32153/32444 total, batch 89/92)[Long Tasks] [=============================>]  98% (11008/11171 in phase, 32281/32444 total, batch 90/92)[Long Tasks] [=============================>]  99% (11136/11171 in phase, 32409/32444 total, batch 91/92)[Long Tasks] [==============================] 100% (11171/11171 in phase, 32444/32444 total, batch 92/92)
-[Info::gpu_align_batch_execute] === Long Tasks completed: 11171 tasks processed ===
-[Align Progress] [==============================] 100% (32444/32444 tasks, 92 batches) - DONE
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[491347]: rel=0 -> abs=-1 (expected=-1)
-  p[491348]: rel=0 -> abs=-1 (expected=-1)
-  p[491349]: rel=0 -> abs=-1 (expected=-1)
-  p[491350]: rel=0 -> abs=-1 (expected=-1)
-  p[491351]: rel=0 -> abs=-1 (expected=-1)
-  p[491352]: rel=0 -> abs=-1 (expected=-1)
-  p[491353]: rel=0 -> abs=-1 (expected=-1)
-  p[491354]: rel=0 -> abs=-1 (expected=-1)
-  p[491355]: rel=0 -> abs=-1 (expected=-1)
-  p[491356]: rel=0 -> abs=-1 (expected=-1)
-  p[491357]: rel=0 -> abs=-1 (expected=-1)
-  p[491358]: rel=2 -> abs=491356 (expected=491356)
-  p[491359]: rel=1 -> abs=491358 (expected=491358)
-  p[491360]: rel=0 -> abs=-1 (expected=-1)
-  p[491361]: rel=0 -> abs=-1 (expected=-1)
-  p[491362]: rel=0 -> abs=-1 (expected=-1)
-  p[491363]: rel=0 -> abs=-1 (expected=-1)
-  p[491364]: rel=0 -> abs=-1 (expected=-1)
-  p[491365]: rel=1 -> abs=491364 (expected=491364)
-  p[491366]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 491367
-  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
-  Max score in first 100: 15
-  Anchors passing min_sc(40): 12873
-[GPU-DEBUG] First read: n=491367, n_z=12873, n_u=2107, n_v=8620
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=40, len=4
-  u[1]: score=40, len=3
-  u[2]: score=40, len=3
-
-=== CPU vs GPU Backtracking Comparison ===
-[CPU-DEBUG] First read: n=491367, n_u=31, n_v=1071
-[CPU-DEBUG] First 3 u values:
-  u[0]: score=8988, len=959
-  u[1]: score=63, len=6
-  u[2]: score=53, len=5
-
-[COMPARE] n_u: GPU=2107, CPU=31 ✗ MISMATCH
-=== End Comparison ===
-
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[648202]: rel=0 -> abs=-1 (expected=-1)
-  p[648203]: rel=0 -> abs=-1 (expected=-1)
-  p[648204]: rel=0 -> abs=-1 (expected=-1)
-  p[648205]: rel=0 -> abs=-1 (expected=-1)
-  p[648206]: rel=0 -> abs=-1 (expected=-1)
-  p[648207]: rel=0 -> abs=-1 (expected=-1)
-  p[648208]: rel=0 -> abs=-1 (expected=-1)
-  p[648209]: rel=0 -> abs=-1 (expected=-1)
-  p[648210]: rel=0 -> abs=-1 (expected=-1)
-  p[648211]: rel=0 -> abs=-1 (expected=-1)
-  p[648212]: rel=1 -> abs=648211 (expected=648211)
-  p[648213]: rel=1 -> abs=648212 (expected=648212)
-  p[648214]: rel=1 -> abs=648213 (expected=648213)
-  p[648215]: rel=0 -> abs=-1 (expected=-1)
-  p[648216]: rel=0 -> abs=-1 (expected=-1)
-  p[648217]: rel=0 -> abs=-1 (expected=-1)
-  p[648218]: rel=1 -> abs=648217 (expected=648217)
-  p[648219]: rel=0 -> abs=-1 (expected=-1)
-  p[648220]: rel=0 -> abs=-1 (expected=-1)
-  p[648221]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 648222
-  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
-  Max score in first 100: 15
-  Anchors passing min_sc(40): 16669
-[GPU-DEBUG] First read: n=648222, n_z=16669, n_u=2632, n_v=10762
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=40, len=4
-  u[1]: score=40, len=4
-  u[2]: score=40, len=3
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[539021]: rel=0 -> abs=-1 (expected=-1)
-  p[539022]: rel=0 -> abs=-1 (expected=-1)
-  p[539023]: rel=0 -> abs=-1 (expected=-1)
-  p[539024]: rel=0 -> abs=-1 (expected=-1)
-  p[539025]: rel=0 -> abs=-1 (expected=-1)
-  p[539026]: rel=0 -> abs=-1 (expected=-1)
-  p[539027]: rel=0 -> abs=-1 (expected=-1)
-  p[539028]: rel=0 -> abs=-1 (expected=-1)
-  p[539029]: rel=0 -> abs=-1 (expected=-1)
-  p[539030]: rel=0 -> abs=-1 (expected=-1)
-  p[539031]: rel=0 -> abs=-1 (expected=-1)
-  p[539032]: rel=0 -> abs=-1 (expected=-1)
-  p[539033]: rel=0 -> abs=-1 (expected=-1)
-  p[539034]: rel=0 -> abs=-1 (expected=-1)
-  p[539035]: rel=0 -> abs=-1 (expected=-1)
-  p[539036]: rel=0 -> abs=-1 (expected=-1)
-  p[539037]: rel=0 -> abs=-1 (expected=-1)
-  p[539038]: rel=0 -> abs=-1 (expected=-1)
-  p[539039]: rel=0 -> abs=-1 (expected=-1)
-  p[539040]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 539041
-  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
-  Max score in first 100: 15
-  Anchors passing min_sc(40): 14016
-[GPU-DEBUG] First read: n=539041, n_z=14016, n_u=2195, n_v=8947
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=40, len=4
-  u[1]: score=40, len=3
-  u[2]: score=40, len=3
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[820757]: rel=0 -> abs=-1 (expected=-1)
-  p[820758]: rel=0 -> abs=-1 (expected=-1)
-  p[820759]: rel=0 -> abs=-1 (expected=-1)
-  p[820760]: rel=0 -> abs=-1 (expected=-1)
-  p[820761]: rel=0 -> abs=-1 (expected=-1)
-  p[820762]: rel=0 -> abs=-1 (expected=-1)
-  p[820763]: rel=0 -> abs=-1 (expected=-1)
-  p[820764]: rel=0 -> abs=-1 (expected=-1)
-  p[820765]: rel=0 -> abs=-1 (expected=-1)
-  p[820766]: rel=0 -> abs=-1 (expected=-1)
-  p[820767]: rel=1 -> abs=820766 (expected=820766)
-  p[820768]: rel=0 -> abs=-1 (expected=-1)
-  p[820769]: rel=1 -> abs=820768 (expected=820768)
-  p[820770]: rel=1 -> abs=820769 (expected=820769)
-  p[820771]: rel=1 -> abs=820770 (expected=820770)
-  p[820772]: rel=5 -> abs=820767 (expected=820767)
-  p[820773]: rel=1 -> abs=820772 (expected=820772)
-  p[820774]: rel=0 -> abs=-1 (expected=-1)
-  p[820775]: rel=0 -> abs=-1 (expected=-1)
-  p[820776]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 820777
-  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
-  Max score in first 100: 15
-  Anchors passing min_sc(40): 21918
-[GPU-DEBUG] First read: n=820777, n_z=21918, n_u=3274, n_v=13315
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=40, len=5
-  u[1]: score=40, len=4
-  u[2]: score=40, len=5
-[Info] plchain_cal_score_async (gpu/plchain.cu:405) Launching Batch: n_read 37, total anchors 21261363 (mem usage: 42.52%)
-[WARNING] Run CPU kernel for read 332
-[WARNING] Run CPU kernel for read 333
-[Info::gpu_align_batch_execute] Two-tier processing: 18545 short tasks (max_len≤1000bp) + 9123 long tasks (max_len>1000bp)
-[Info::gpu_align_batch_execute]   Short: 3 batches × 7000 tasks/batch
-[Info::gpu_align_batch_execute]   Long:  72 batches × 128 tasks/batch
-[Info::gpu_align_batch_execute] === Processing Short Tasks (phase 1/2) ===
-[Short Tasks] [===========>                  ]  37% (7000/18545 in phase, 7000/27668 total, batch 1/75)[Short Tasks] [======================>       ]  75% (14000/18545 in phase, 14000/27668 total, batch 2/75)[Short Tasks] [==============================] 100% (18545/18545 in phase, 18545/27668 total, batch 3/75)
-[Info::gpu_align_batch_execute] === Short Tasks completed: 18545 tasks processed ===
-[Info::gpu_align_batch_execute] === Processing Long Tasks (phase 2/2) ===
-[Long Tasks] [>                             ]   1% (128/9123 in phase, 18673/27668 total, batch 4/75)[Long Tasks] [>                             ]   2% (256/9123 in phase, 18801/27668 total, batch 5/75)[Long Tasks] [=>                            ]   4% (384/9123 in phase, 18929/27668 total, batch 6/75)[Long Tasks] [=>                            ]   5% (512/9123 in phase, 19057/27668 total, batch 7/75)[Long Tasks] [==>                           ]   7% (640/9123 in phase, 19185/27668 total, batch 8/75)[Long Tasks] [==>                           ]   8% (768/9123 in phase, 19313/27668 total, batch 9/75)[Long Tasks] [==>                           ]   9% (896/9123 in phase, 19441/27668 total, batch 10/75)[Long Tasks] [===>                          ]  11% (1024/9123 in phase, 19569/27668 total, batch 11/75)[Long Tasks] [===>                          ]  12% (1152/9123 in phase, 19697/27668 total, batch 12/75)[Long Tasks] [====>                         ]  14% (1280/9123 in phase, 19825/27668 total, batch 13/75)[Long Tasks] [====>                         ]  15% (1408/9123 in phase, 19953/27668 total, batch 14/75)[Long Tasks] [====>                         ]  16% (1536/9123 in phase, 20081/27668 total, batch 15/75)[Long Tasks] [=====>                        ]  18% (1664/9123 in phase, 20209/27668 total, batch 16/75)[Long Tasks] [=====>                        ]  19% (1792/9123 in phase, 20337/27668 total, batch 17/75)[Long Tasks] [======>                       ]  21% (1920/9123 in phase, 20465/27668 total, batch 18/75)[Long Tasks] [======>                       ]  22% (2048/9123 in phase, 20593/27668 total, batch 19/75)[Long Tasks] [======>                       ]  23% (2176/9123 in phase, 20721/27668 total, batch 20/75)[Long Tasks] [=======>                      ]  25% (2304/9123 in phase, 20849/27668 total, batch 21/75)[Long Tasks] [=======>                      ]  26% (2432/9123 in phase, 20977/27668 total, batch 22/75)[Long Tasks] [========>                     ]  28% (2560/9123 in phase, 21105/27668 total, batch 23/75)[Long Tasks] [========>                     ]  29% (2688/9123 in phase, 21233/27668 total, batch 24/75)[Long Tasks] [=========>                    ]  30% (2816/9123 in phase, 21361/27668 total, batch 25/75)[Long Tasks] [=========>                    ]  32% (2944/9123 in phase, 21489/27668 total, batch 26/75)[Long Tasks] [=========>                    ]  33% (3072/9123 in phase, 21617/27668 total, batch 27/75)[Long Tasks] [==========>                   ]  35% (3200/9123 in phase, 21745/27668 total, batch 28/75)[Long Tasks] [==========>                   ]  36% (3328/9123 in phase, 21873/27668 total, batch 29/75)[Long Tasks] [===========>                  ]  37% (3456/9123 in phase, 22001/27668 total, batch 30/75)[Long Tasks] [===========>                  ]  39% (3584/9123 in phase, 22129/27668 total, batch 31/75)[Long Tasks] [============>                 ]  40% (3712/9123 in phase, 22257/27668 total, batch 32/75)[Long Tasks] [============>                 ]  42% (3840/9123 in phase, 22385/27668 total, batch 33/75)[Long Tasks] [============>                 ]  43% (3968/9123 in phase, 22513/27668 total, batch 34/75)[Long Tasks] [=============>                ]  44% (4096/9123 in phase, 22641/27668 total, batch 35/75)[Long Tasks] [=============>                ]  46% (4224/9123 in phase, 22769/27668 total, batch 36/75)[Long Tasks] [==============>               ]  47% (4352/9123 in phase, 22897/27668 total, batch 37/75)[Long Tasks] [==============>               ]  49% (4480/9123 in phase, 23025/27668 total, batch 38/75)[Long Tasks] [===============>              ]  50% (4608/9123 in phase, 23153/27668 total, batch 39/75)[Long Tasks] [===============>              ]  51% (4736/9123 in phase, 23281/27668 total, batch 40/75)[Long Tasks] [===============>              ]  53% (4864/9123 in phase, 23409/27668 total, batch 41/75)[Long Tasks] [================>             ]  54% (4992/9123 in phase, 23537/27668 total, batch 42/75)[Long Tasks] [================>             ]  56% (5120/9123 in phase, 23665/27668 total, batch 43/75)[Long Tasks] [=================>            ]  57% (5248/9123 in phase, 23793/27668 total, batch 44/75)[Long Tasks] [=================>            ]  58% (5376/9123 in phase, 23921/27668 total, batch 45/75)[Long Tasks] [==================>           ]  60% (5504/9123 in phase, 24049/27668 total, batch 46/75)[Long Tasks] [==================>           ]  61% (5632/9123 in phase, 24177/27668 total, batch 47/75)[Long Tasks] [==================>           ]  63% (5760/9123 in phase, 24305/27668 total, batch 48/75)[Long Tasks] [===================>          ]  64% (5888/9123 in phase, 24433/27668 total, batch 49/75)[Long Tasks] [===================>          ]  65% (6016/9123 in phase, 24561/27668 total, batch 50/75)[Long Tasks] [====================>         ]  67% (6144/9123 in phase, 24689/27668 total, batch 51/75)[Long Tasks] [====================>         ]  68% (6272/9123 in phase, 24817/27668 total, batch 52/75)[Long Tasks] [=====================>        ]  70% (6400/9123 in phase, 24945/27668 total, batch 53/75)[Long Tasks] [=====================>        ]  71% (6528/9123 in phase, 25073/27668 total, batch 54/75)[Long Tasks] [=====================>        ]  72% (6656/9123 in phase, 25201/27668 total, batch 55/75)[Long Tasks] [======================>       ]  74% (6784/9123 in phase, 25329/27668 total, batch 56/75)[Long Tasks] [======================>       ]  75% (6912/9123 in phase, 25457/27668 total, batch 57/75)[Long Tasks] [=======================>      ]  77% (7040/9123 in phase, 25585/27668 total, batch 58/75)[Long Tasks] [=======================>      ]  78% (7168/9123 in phase, 25713/27668 total, batch 59/75)[Long Tasks] [=======================>      ]  79% (7296/9123 in phase, 25841/27668 total, batch 60/75)[Long Tasks] [========================>     ]  81% (7424/9123 in phase, 25969/27668 total, batch 61/75)[Long Tasks] [========================>     ]  82% (7552/9123 in phase, 26097/27668 total, batch 62/75)[Long Tasks] [=========================>    ]  84% (7680/9123 in phase, 26225/27668 total, batch 63/75)[Long Tasks] [=========================>    ]  85% (7808/9123 in phase, 26353/27668 total, batch 64/75)[Long Tasks] [=========================>    ]  86% (7936/9123 in phase, 26481/27668 total, batch 65/75)[Long Tasks] [==========================>   ]  88% (8064/9123 in phase, 26609/27668 total, batch 66/75)[Long Tasks] [==========================>   ]  89% (8192/9123 in phase, 26737/27668 total, batch 67/75)[Long Tasks] [===========================>  ]  91% (8320/9123 in phase, 26865/27668 total, batch 68/75)[Long Tasks] [===========================>  ]  92% (8448/9123 in phase, 26993/27668 total, batch 69/75)[Long Tasks] [============================> ]  94% (8576/9123 in phase, 27121/27668 total, batch 70/75)[Long Tasks] [============================> ]  95% (8704/9123 in phase, 27249/27668 total, batch 71/75)[Long Tasks] [============================> ]  96% (8832/9123 in phase, 27377/27668 total, batch 72/75)[Long Tasks] [=============================>]  98% (8960/9123 in phase, 27505/27668 total, batch 73/75)[Long Tasks] [=============================>]  99% (9088/9123 in phase, 27633/27668 total, batch 74/75)[Long Tasks] [==============================] 100% (9123/9123 in phase, 27668/27668 total, batch 75/75)
-[Info::gpu_align_batch_execute] === Long Tasks completed: 9123 tasks processed ===
-[Align Progress] [==============================] 100% (27668/27668 tasks, 75 batches) - DONE
-
-[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):
-  p[520082]: rel=0 -> abs=-1 (expected=-1)
-  p[520083]: rel=0 -> abs=-1 (expected=-1)
-  p[520084]: rel=0 -> abs=-1 (expected=-1)
-  p[520085]: rel=0 -> abs=-1 (expected=-1)
-  p[520086]: rel=0 -> abs=-1 (expected=-1)
-  p[520087]: rel=0 -> abs=-1 (expected=-1)
-  p[520088]: rel=0 -> abs=-1 (expected=-1)
-  p[520089]: rel=0 -> abs=-1 (expected=-1)
-  p[520090]: rel=0 -> abs=-1 (expected=-1)
-  p[520091]: rel=1 -> abs=520090 (expected=520090)
-  p[520092]: rel=0 -> abs=-1 (expected=-1)
-  p[520093]: rel=2 -> abs=520091 (expected=520091)
-  p[520094]: rel=0 -> abs=-1 (expected=-1)
-  p[520095]: rel=0 -> abs=-1 (expected=-1)
-  p[520096]: rel=1 -> abs=520095 (expected=520095)
-  p[520097]: rel=0 -> abs=-1 (expected=-1)
-  p[520098]: rel=0 -> abs=-1 (expected=-1)
-  p[520099]: rel=0 -> abs=-1 (expected=-1)
-  p[520100]: rel=0 -> abs=-1 (expected=-1)
-  p[520101]: rel=0 -> abs=-1 (expected=-1)
-
-[CRITICAL-DEBUG] First read's f[] (chain scores):
-  Total anchors: 520102
-  First 10 scores: 15 15 15 15 15 15 15 15 15 15 
-  Max score in first 100: 24
-  Anchors passing min_sc(40): 5988
-[GPU-DEBUG] First read: n=520102, n_z=5988, n_u=554, n_v=3814
-[GPU-DEBUG] First 3 u values:
-  u[0]: score=40, len=5
-  u[1]: score=40, len=4
-  u[2]: score=40, len=4
-
-=== CPU vs GPU Backtracking Comparison ===
-[CPU-DEBUG] First read: n=520102, n_u=653, n_v=7825
-[CPU-DEBUG] First 3 u values:
-  u[0]: score=40959, len=4738
-  u[1]: score=120, len=12
-  u[2]: score=118, len=11
-
-[COMPARE] n_u: GPU=554, CPU=653 ✗ MISMATCH
-=== End Comparison ===
-
-[Info::gpu_align_batch_execute] Two-tier processing: 5648 short tasks (max_len≤1000bp) + 1642 long tasks (max_len>1000bp)
-[Info::gpu_align_batch_execute]   Short: 1 batches × 7000 tasks/batch
-[Info::gpu_align_batch_execute]   Long:  13 batches × 128 tasks/batch
-[Info::gpu_align_batch_execute] === Processing Short Tasks (phase 1/2) ===
-[Short Tasks] [==============================] 100% (5648/5648 in phase, 5648/7290 total, batch 1/14)
-[Info::gpu_align_batch_execute] === Short Tasks completed: 5648 tasks processed ===
-[Info::gpu_align_batch_execute] === Processing Long Tasks (phase 2/2) ===
-[Long Tasks] [==>                           ]   7% (128/1642 in phase, 5776/7290 total, batch 2/14)[Long Tasks] [====>                         ]  15% (256/1642 in phase, 5904/7290 total, batch 3/14)[Long Tasks] [======>                       ]  23% (384/1642 in phase, 6032/7290 total, batch 4/14)[Long Tasks] [=========>                    ]  31% (512/1642 in phase, 6160/7290 total, batch 5/14)[Long Tasks] [===========>                  ]  38% (640/1642 in phase, 6288/7290 total, batch 6/14)[Long Tasks] [=============>                ]  46% (768/1642 in phase, 6416/7290 total, batch 7/14)[Long Tasks] [================>             ]  54% (896/1642 in phase, 6544/7290 total, batch 8/14)[Long Tasks] [==================>           ]  62% (1024/1642 in phase, 6672/7290 total, batch 9/14)[Long Tasks] [=====================>        ]  70% (1152/1642 in phase, 6800/7290 total, batch 10/14)[Long Tasks] [=======================>      ]  77% (1280/1642 in phase, 6928/7290 total, batch 11/14)[Long Tasks] [=========================>    ]  85% (1408/1642 in phase, 7056/7290 total, batch 12/14)[Long Tasks] [===========================>  ]  93% (1536/1642 in phase, 7184/7290 total, batch 13/14)[Long Tasks] [==============================] 100% (1642/1642 in phase, 7290/7290 total, batch 14/14)
-[Info::gpu_align_batch_execute] === Long Tasks completed: 1642 tasks processed ===
-[Align Progress] [==============================] 100% (7290/7290 tasks, 14 batches) - DONE
-[M::worker_pipeline::218.397*1.40] mapped 1000 sequences
-[Info] GPU free mem: 30.826355 GB, total mem: 31.732544 GB (after cleanup) 
-[M::main] Version: 2.24-mm2-gb-biosys
-[M::main] CMD: ./minimap2 -a -t 56 --gpu-chain --gpu-cfg gpu/gpu_config.json /home/nfs/mahaotian/CUDA/hg38.mmi /home/nfs/mahaotian/Genome/Data/ONT_60X_HG002/1000-reads_100k_200k.fastq
+[Long Tasks] [>                             ]   1% (128/12213 in phase, 17816/29901 total, batch 4/99)[Long Tasks] [>                             ]   2% (256/12213 in phase, 17944/29901 total, batch 5/99)[Long Tasks] [>                             ]   3% (384/12213 in phase, 18072/29901 total, batch 6/99)[Long Tasks] [=>                            ]   4% (512/12213 in phase, 18200/29901 total, batch 7/99)

@@ -445,35 +445,6 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // DEBUG: Check z[] arrays after sorting for first read
-    if (n_reads > 0) {
-        int *h_num_elements = (int*)malloc(sizeof(int) * n_reads);
-        cudaMemcpy(h_num_elements, d_num_elements, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-        int n_z = h_num_elements[0];
-
-        if (n_z > 0) {
-            int64_t *h_zx = (int64_t*)malloc(sizeof(int64_t) * n_z);
-            int64_t *h_zy = (int64_t*)malloc(sizeof(int64_t) * n_z);
-            cudaMemcpy(h_zx, d_zx, sizeof(int64_t) * n_z, cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_zy, d_zy, sizeof(int64_t) * n_z, cudaMemcpyDeviceToHost);
-
-            fprintf(stderr, "\n[Z-ARRAY-DEBUG] First read after sorting (n_z=%d):\n", n_z);
-            fprintf(stderr, "  Top 10 (highest scores):\n");
-            for (int i = 0; i < 10 && i < n_z; i++) {
-                fprintf(stderr, "    z[%d]: score=%lld, anchor_idx=%lld\n", i, h_zx[i], h_zy[i]);
-            }
-            fprintf(stderr, "  Bottom 10 (lowest scores):\n");
-            int start = n_z > 10 ? n_z - 10 : 0;
-            for (int i = start; i < n_z; i++) {
-                fprintf(stderr, "    z[%d]: score=%lld, anchor_idx=%lld\n", i, h_zx[i], h_zy[i]);
-            }
-
-            free(h_zx);
-            free(h_zy);
-        }
-        free(h_num_elements);
-    }
-
     // Step 3: Backtrack
     mm_chain_backtrack_parallel<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, dev_mem->d_ax, dev_mem->d_ay, dev_mem->d_xrev, dev_mem->d_yrev, dev_mem->d_f, d_p_abs, d_u,
@@ -506,43 +477,6 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                 fprintf(stderr, "  u[%d]: score=%d, len=%d\n", i, score, len);
             }
             free(h_u);
-        }
-
-        // DETAILED ANALYSIS: Manually simulate first chain's backtrack on host
-        if (h_n_z[0] > 0) {
-            int n_z = h_n_z[0];
-            int64_t *h_zx = (int64_t*)malloc(sizeof(int64_t) * n_z);
-            int64_t *h_zy = (int64_t*)malloc(sizeof(int64_t) * n_z);
-            int64_t *h_p = (int64_t*)malloc(sizeof(int64_t) * h_n_a[0]);
-            int32_t *h_f = (int32_t*)malloc(sizeof(int32_t) * h_n_a[0]);
-
-            cudaMemcpy(h_zx, d_zx, sizeof(int64_t) * n_z, cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_zy, d_zy, sizeof(int64_t) * n_z, cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_p, d_p_abs, sizeof(int64_t) * h_n_a[0], cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_f, dev_mem->d_f, sizeof(int32_t) * h_n_a[0], cudaMemcpyDeviceToHost);
-
-            fprintf(stderr, "\n[HOST-BACKTRACK-DEBUG] Simulating first chain's backtrack:\n");
-            fprintf(stderr, "  Starting from k=%d (last in sorted z), z_y[k]=%lld, z_x[k]=%lld\n",
-                    n_z-1, h_zy[n_z-1], h_zx[n_z-1]);
-
-            // Simulate mg_chain_bk_end for the first chain
-            int64_t start_anchor = h_zy[n_z-1];
-            fprintf(stderr, "  Backtrack path (following p[] chain):\n");
-            fprintf(stderr, "    anchor[%lld]: f=%d, p=%lld\n", start_anchor, h_f[start_anchor], h_p[start_anchor]);
-
-            int step = 0;
-            int64_t curr = h_p[start_anchor];
-            while (curr >= 0 && step < 20) {
-                fprintf(stderr, "    anchor[%lld]: f=%d, p=%lld\n", curr, h_f[curr], h_p[curr]);
-                curr = h_p[curr];
-                step++;
-            }
-            fprintf(stderr, "  Total steps followed: %d\n", step + 1);
-
-            free(h_zx);
-            free(h_zy);
-            free(h_p);
-            free(h_f);
         }
     }
     free(h_n_z);

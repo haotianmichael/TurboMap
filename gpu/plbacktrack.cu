@@ -425,7 +425,10 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     // Determine temporary storage requirements
     // CRITICAL: Use custom stream to ensure proper ordering with other GPU operations
-    cub::DeviceSegmentedRadixSort::SortPairsDescending(
+    // NOTE: Use ascending sort (SortPairs) to match CPU radix_sort_128x behavior
+    // CPU sorts ascending, then iterates from k=n_z-1 downto 0 (highest to lowest score)
+    // GPU must do the same: ascending sort, then iterate from k=n_z-1 downto 0
+    cub::DeviceSegmentedRadixSort::SortPairs(
         d_temp_storage, temp_storage_bytes,
         d_zx, d_zx, d_zy, d_zy,
         total_n, n_reads, d_offset, d_ofs_end, 0, sizeof(int64_t) * 8, stream);
@@ -433,9 +436,9 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Allocate temporary storage
     cudaMalloc(&d_temp_storage, temp_storage_bytes);
 
-    // Sort descending by score
+    // Sort ascending by score (to match CPU behavior)
     // CRITICAL: Use custom stream to ensure proper ordering with other GPU operations
-    cub::DeviceSegmentedRadixSort::SortPairsDescending(
+    cub::DeviceSegmentedRadixSort::SortPairs(
         d_temp_storage, temp_storage_bytes,
         d_zx, d_zx, d_zy, d_zy,
         total_n, n_reads, d_offset, d_ofs_end, 0, sizeof(int64_t) * 8, stream);

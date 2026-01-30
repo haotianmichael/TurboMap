@@ -129,20 +129,6 @@ void plchain_backtracking(hostMemPtr *host_mem, deviceMemPtr *dev_mem, chain_rea
         u = mg_chain_backtrack(km, reads[i].n, f, p, v, t, misc.min_cnt, misc.min_score, max_drop, &n_u, &n_v);
         reads[i].u = u;
         reads[i].n_u = n_u;
-
-        // Debug: Print first read's results
-        if (i == 0) {
-            fprintf(stderr, "[CPU-DEBUG] First read: n=%d, n_u=%d, n_v=%d\n",
-                    reads[i].n, n_u, n_v);
-            if (n_u > 0) {
-                fprintf(stderr, "[CPU-DEBUG] First 3 u values:\n");
-                for (int j = 0; j < 3 && j < n_u; j++) {
-                    int32_t score = u[j] >> 32;
-                    int32_t len = (int32_t)u[j];
-                    fprintf(stderr, "  u[%d]: score=%d, len=%d\n", j, score, len);
-                }
-            }
-        }
         kfree(km, p);
         // here f is not managed by km memory pool
         kfree(km, t);
@@ -251,27 +237,6 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id,
         deviceMemPtr *dev_mem = &stream_setup.streams[stream_id].dev_mem;
         cudaStream_t curr_stream = stream_setup.streams[stream_id].cudastream;
 
-        // Debug: Save original state for CPU comparison
-        static int debug_compare = 1;  // Set to 0 to disable comparison
-        chain_read_t *reads_backup = NULL;
-        if (debug_compare && n_reads == 0 && curr_host_mem->size > 0) {
-            // Backup first read for CPU backtracking comparison
-            int n_backup = curr_host_mem->size;
-            reads_backup = (chain_read_t*)malloc(sizeof(chain_read_t) * n_backup);
-            memcpy(reads_backup, stream_setup.streams[stream_id].reads + n_reads,
-                   sizeof(chain_read_t) * n_backup);
-
-            // Deep copy anchor arrays
-            for (int i = 0; i < n_backup; i++) {
-                if (reads_backup[i].n > 0 && reads_backup[i].a) {
-                    mm128_t *a_copy;
-                    KMALLOC(km, a_copy, reads_backup[i].n);
-                    memcpy(a_copy, reads_backup[i].a, sizeof(mm128_t) * reads_backup[i].n);
-                    reads_backup[i].a = a_copy;
-                }
-            }
-        }
-
         cudaMemcpyAsync(dev_mem->d_ax, curr_host_mem->ax,
                         sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
                         curr_stream);
@@ -299,68 +264,6 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id,
         plbacktrack_gpu(curr_host_mem, dev_mem,
                        stream_setup.streams[stream_id].reads + n_reads, misc, km,
                        curr_stream);
-
-        // Debug: Compare with CPU backtracking
-        if (reads_backup) {
-            fprintf(stderr, "\n=== CPU vs GPU Backtracking Comparison ===\n");
-            plchain_backtracking(curr_host_mem, dev_mem, reads_backup, misc, km);
-
-            // Compare results
-            chain_read_t *gpu_read = &stream_setup.streams[stream_id].reads[n_reads];
-            chain_read_t *cpu_read = &reads_backup[0];
-
-            fprintf(stderr, "\n[COMPARE] n_u: GPU=%d, CPU=%d %s\n",
-                    gpu_read->n_u, cpu_read->n_u,
-                    gpu_read->n_u == cpu_read->n_u ? "✓" : "✗ MISMATCH");
-
-            if (gpu_read->n_u == cpu_read->n_u && gpu_read->n_u > 0) {
-                int u_match = 1;
-                for (int i = 0; i < gpu_read->n_u; i++) {
-                    if (gpu_read->u[i] != cpu_read->u[i]) {
-                        u_match = 0;
-                        fprintf(stderr, "[COMPARE] u[%d]: GPU=0x%lx, CPU=0x%lx ✗\n",
-                                i, gpu_read->u[i], cpu_read->u[i]);
-                    }
-                }
-                if (u_match) {
-                    fprintf(stderr, "[COMPARE] All u values match ✓\n");
-                }
-
-                // Compare anchor arrays
-                int gpu_total = 0, cpu_total = 0;
-                for (int i = 0; i < gpu_read->n_u; i++) {
-                    gpu_total += (int32_t)gpu_read->u[i];
-                    cpu_total += (int32_t)cpu_read->u[i];
-                }
-                fprintf(stderr, "[COMPARE] Total anchors: GPU=%d, CPU=%d %s\n",
-                        gpu_total, cpu_total,
-                        gpu_total == cpu_total ? "✓" : "✗ MISMATCH");
-
-                if (gpu_total == cpu_total && gpu_total > 0) {
-                    int anchor_match = 1;
-                    for (int i = 0; i < gpu_total && i < 10; i++) {
-                        if (gpu_read->a[i].x != cpu_read->a[i].x ||
-                            gpu_read->a[i].y != cpu_read->a[i].y) {
-                            anchor_match = 0;
-                            fprintf(stderr, "[COMPARE] a[%d]: GPU=(0x%lx, 0x%lx), CPU=(0x%lx, 0x%lx) ✗\n",
-                                    i, gpu_read->a[i].x, gpu_read->a[i].y,
-                                    cpu_read->a[i].x, cpu_read->a[i].y);
-                        }
-                    }
-                    if (anchor_match) {
-                        fprintf(stderr, "[COMPARE] First 10 anchors match ✓\n");
-                    }
-                }
-            }
-
-            // Cleanup
-            for (int i = 0; i < curr_host_mem->size; i++) {
-                if (reads_backup[i].a) kfree(km, reads_backup[i].a);
-                if (reads_backup[i].u) kfree(km, reads_backup[i].u);
-            }
-            free(reads_backup);
-            fprintf(stderr, "=== End Comparison ===\n\n");
-        }
 
         n_reads += curr_host_mem->size;
     }

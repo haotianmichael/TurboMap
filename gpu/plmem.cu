@@ -307,25 +307,43 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
 
     fprintf(stderr, " [Align] Total BackTrack buffers: %.2f GB\n", bck_total / (1024.0*1024.0*1024.0));
 
+    // ========== Chain Backtrack (plbacktrack_gpu) Dynamic Allocation ==========
+    // These buffers are allocated per-call in plbacktrack_gpu based on micro-batch total_n
+    // Peak memory estimation based on anchor_per_batch:
+    // - d_zx, d_zy, d_v, d_p_abs: 4 * sizeof(int64_t) * total_n = 32 bytes/anchor
+    // - d_t: sizeof(int32_t) * total_n = 4 bytes/anchor
+    // - d_u: sizeof(uint64_t) * total_n = 8 bytes/anchor
+    // - d_ax_out, d_ay_out, d_xrev_out, d_yrev_out: 4 * sizeof(int32_t) * total_n = 16 bytes/anchor
+    // - d_temp_storage (CUB sort): ~8 bytes/anchor estimated
+    // Total: ~68 bytes per anchor (peak during backtracking)
+    size_t backtrack_per_anchor = 4 * sizeof(int64_t) +  // d_zx, d_zy, d_v, d_p_abs
+                                  sizeof(int32_t) +       // d_t
+                                  sizeof(uint64_t) +      // d_u
+                                  4 * sizeof(int32_t) +   // d_ax_out, d_ay_out, d_xrev_out, d_yrev_out
+                                  8;                      // d_temp_storage estimated
+    size_t chain_backtrack_peak = backtrack_per_anchor * anchor_per_batch;
+    fprintf(stderr, " [Chain] Backtrack buffers (dynamic, peak): %.2f MB (%.2f GB)\n",
+            chain_backtrack_peak / (1024.0*1024.0), chain_backtrack_peak / (1024.0*1024.0*1024.0));
+
     // ========== GRAND TOTAL CALCULATION ==========
     // Chain total: sum of all chain-related allocations
-    size_t chain_total_all = chain_total + 
+    size_t chain_total_all = chain_total +
                             (idx_total + cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) +
                             long_total;
-    
+
     // Align total: DP buffers + BackTrack buffers
-    size_t align_dp_total = (seq_unpacked_size *2 + seq_packed_size*2 + 
+    size_t align_dp_total = (seq_unpacked_size *2 + seq_packed_size*2 +
                             metadata_size*5 + global_buffer_bytes + ksw_temp_bytes);
     size_t align_total_all = align_dp_total + bck_total;
-    
-    // Grand total
-    size_t grand_total = chain_total_all + align_total_all;
 
-    fprintf(stderr, " [Chain] Total:       %8.2f MB (%.2f GB)\n", 
+    // Grand total (including chain backtrack peak)
+    size_t grand_total = chain_total_all + align_total_all + chain_backtrack_peak;
+
+    fprintf(stderr, " [Chain] Total:       %8.2f MB (%.2f GB)\n",
             chain_total_all / (1024.0*1024.0), chain_total_all / (1024.0*1024.0*1024.0));
-    fprintf(stderr, " [Align] Total:       %8.2f MB (%.2f GB)\n", 
+    fprintf(stderr, " [Align] Total:       %8.2f MB (%.2f GB)\n",
             align_total_all / (1024.0*1024.0), align_total_all / (1024.0*1024.0*1024.0));
-    fprintf(stderr, "[Info] TuboMap Total GPU Memory: %8.2f MB (%.2f GB)\n",
+    fprintf(stderr, "[Info] TuboMap Total GPU Memory (with backtrack peak): %.2f MB (%.2f GB)\n",
             grand_total / (1024.0*1024.0), grand_total / (1024.0*1024.0*1024.0));
 
     cudaCheck();

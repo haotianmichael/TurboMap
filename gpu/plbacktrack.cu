@@ -378,57 +378,12 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
     cudaStreamSynchronize(stream);
 
-    // DEBUG: Check p[] array conversion for first read
-    if (n_reads > 0 && h_n_a[0] > 0) {
-        uint16_t *h_p_rel = (uint16_t*)malloc(sizeof(uint16_t) * h_n_a[0]);
-        int64_t *h_p_abs = (int64_t*)malloc(sizeof(int64_t) * h_n_a[0]);
-        cudaMemcpy(h_p_rel, dev_mem->d_p, sizeof(uint16_t) * h_n_a[0], cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_p_abs, d_p_abs, sizeof(int64_t) * h_n_a[0], cudaMemcpyDeviceToHost);
-
-        fprintf(stderr, "\n[P-ARRAY-DEBUG] First read p[] conversion (showing last 20):\n");
-        int start = h_n_a[0] > 20 ? h_n_a[0] - 20 : 0;
-        for (int i = start; i < h_n_a[0]; i++) {
-            fprintf(stderr, "  p[%d]: rel=%d -> abs=%lld (expected=%d)\n",
-                    i, h_p_rel[i], h_p_abs[i], h_p_rel[i] == 0 ? -1 : (int)(i - h_p_rel[i]));
-        }
-        free(h_p_rel);
-        free(h_p_abs);
-    }
-
     // Step 1: Filter anchors by score
     mm_filter_anchors<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, d_offset, min_sc, dev_mem->d_f, d_zx, d_zy,
         d_ofs_end, d_t, d_num_elements, d_n_v, n_reads);
 
     cudaStreamSynchronize(stream);
-
-    // CRITICAL DEBUG: Check if f[] scores match between GPU and CPU
-    if (n_reads > 0) {
-        int32_t *h_f = (int32_t*)malloc(sizeof(int32_t) * h_n_a[0]);
-        cudaMemcpy(h_f, dev_mem->d_f, sizeof(int32_t) * h_n_a[0], cudaMemcpyDeviceToHost);
-
-        fprintf(stderr, "\n[CRITICAL-DEBUG] First read's f[] (chain scores):\n");
-        fprintf(stderr, "  Total anchors: %d\n", h_n_a[0]);
-        fprintf(stderr, "  First 10 scores: ");
-        for (int i = 0; i < 10 && i < h_n_a[0]; i++) {
-            fprintf(stderr, "%d ", h_f[i]);
-        }
-        fprintf(stderr, "\n  Max score in first 100: ");
-        int max_score = 0;
-        for (int i = 0; i < 100 && i < h_n_a[0]; i++) {
-            if (h_f[i] > max_score) max_score = h_f[i];
-        }
-        fprintf(stderr, "%d\n", max_score);
-
-        // Count how many pass min_sc threshold
-        int count_pass = 0;
-        for (int i = 0; i < h_n_a[0]; i++) {
-            if (h_f[i] >= min_sc) count_pass++;
-        }
-        fprintf(stderr, "  Anchors passing min_sc(%d): %d\n", min_sc, count_pass);
-
-        free(h_f);
-    }
 
     // Step 2: Sort z arrays by score using CUB (per-read segmented sort)
     size_t temp_storage_bytes = 0;
@@ -462,35 +417,10 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         n_reads, d_n_v, d_n_u, d_num_elements, d_ofs_end);
 
     cudaStreamSynchronize(stream);
-    cudaDeviceSynchronize();  // Flush printf from kernel
 
-    // Debug: Print first read's results
+    // Copy n_u values to host for sorting
     int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
-    int *h_n_v = (int*)malloc(sizeof(int) * n_reads);
-    int *h_n_z = (int*)malloc(sizeof(int) * n_reads);
     cudaMemcpy(h_n_u, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_n_v, d_n_v, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_n_z, d_num_elements, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
-
-    if (n_reads > 0) {
-        fprintf(stderr, "[GPU-DEBUG] First read: n=%d, n_z=%d, n_u=%d, n_v=%d\n",
-                h_n_a[0], h_n_z[0], h_n_u[0], h_n_v[0]);
-
-        // Print first few u values
-        if (h_n_u[0] > 0) {
-            uint64_t *h_u = (uint64_t*)malloc(sizeof(uint64_t) * h_n_u[0]);
-            cudaMemcpy(h_u, d_u, sizeof(uint64_t) * h_n_u[0], cudaMemcpyDeviceToHost);
-            fprintf(stderr, "[GPU-DEBUG] First 3 u values:\n");
-            for (int i = 0; i < 3 && i < h_n_u[0]; i++) {
-                int32_t score = h_u[i] >> 32;
-                int32_t len = (int32_t)h_u[i];
-                fprintf(stderr, "  u[%d]: score=%d, len=%d\n", i, score, len);
-            }
-            free(h_u);
-        }
-    }
-    free(h_n_z);
-    free(h_n_v);
 
     // Step 4: Sort w arrays by target position
     // CRITICAL: w arrays have n_u[i] elements per read, NOT n_a[i]

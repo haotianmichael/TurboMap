@@ -428,6 +428,52 @@ Misc build_misc(const mm_idx_t *mi, const mm_mapopt_t *opt, const int64_t qlen_s
     return misc;
 }
 
+// Check if a read needs RMQ-style re-chaining (for GPU batch processing)
+int needs_rmq_rechain(const mm_mapopt_t *opt, chain_read_t* read) {
+    int n_segs = read->n_seg;
+    int n_regs0 = read->n_u;
+    int qlen_sum = read->seq.qlen_sum;
+    uint64_t *u = read->u;
+    mm128_t *a = read->a;
+
+    if (opt->bw_long > opt->bw &&
+        (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
+        n_segs == 1 && n_regs0 > 1 && u != NULL && a != NULL) {
+        if ((int32_t)u[0] <= 0) {
+            return 0;  // Invalid chain, skip
+        }
+        int32_t st = (int32_t)a[0].y;
+        int32_t en = (int32_t)a[(int32_t)u[0] - 1].y;
+        if (qlen_sum - (en - st) > opt->rmq_rescue_size ||
+            en - st > qlen_sum * opt->rmq_rescue_ratio) {
+            return 1;  // Needs re-chaining
+        }
+    }
+    return 0;
+}
+
+// Prepare a read's anchors for re-chaining (consolidate and sort)
+void prepare_rechain_anchors(chain_read_t* read, void *km) {
+    int n_regs0 = read->n_u;
+    uint64_t *u = read->u;
+    mm128_t *a = read->a;
+
+    // Calculate total anchor count from all chains
+    int64_t total_n = 0;
+    for (int i = 0; i < n_regs0; i++) {
+        total_n += (int32_t)u[i];
+    }
+    read->n = total_n;
+
+    // Free old chain array
+    kfree(km, u);
+    read->u = NULL;
+    read->n_u = 0;
+
+    // Sort anchors for re-chaining
+    radix_sort_128x(a, a + total_n);
+}
+
 void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t* read, Misc misc, void *km) {
     int n_segs = read->n_seg;
     const char *qname = read->seq.name;
@@ -444,24 +490,13 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
     int i;
     mm128_v mv = {0, 0, 0};
 
+    // RMQ re-chaining is handled by GPU batch processing (gpu_batch_rechain)
+    // Skip this branch - reads needing re-chain are identified by needs_rmq_rechain()
     if (opt->bw_long > opt->bw &&
         (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
-        n_segs == 1 && *n_regs0 > 1 && *u != NULL && *a != NULL) {  // re-chain/long-join for long sequences
-        // Additional safety check
-        if ((int32_t)(*u)[0] <= 0) {
-            fprintf(stderr, "[WARNING] post_chaining_helper: Invalid chain length (*u)[0]=%d for n_regs0=%d\n",
-                    (int32_t)(*u)[0], *n_regs0);
-        } else {
-            int32_t st = (int32_t)(*a)[0].y, en = (int32_t)(*a)[(int32_t)(*u)[0] - 1].y;
-		if (*qlen_sum - (en - st) > opt->rmq_rescue_size || en - st > *qlen_sum * opt->rmq_rescue_ratio) {
-			int32_t i;
-			for (i = 0, *n_a = 0; i < *n_regs0; ++i) *n_a += (int32_t)(*u)[i];
-			kfree(km, *u);
-			radix_sort_128x(*a, (*a) + *n_a);
-			*a = mg_lchain_rmq(opt->max_gap, opt->rmq_inner_dist, opt->bw_long, opt->max_chain_skip, opt->rmq_size_cap, opt->min_cnt, opt->min_chain_score,
-							  misc.chn_pen_gap, misc.chn_pen_skip, *n_a, *a, n_regs0, u, km);
-		}
-        }
+        n_segs == 1 && *n_regs0 > 1 && *u != NULL && *a != NULL) {
+        // GPU batch re-chaining handles this case
+        // Do nothing here - just fall through to set frag_gap
     }
     else if (opt->max_occ > opt->mid_occ && *rep_len > 0 &&
              !(opt->flag & MM_F_RMQ)) {  // re-chain, mostly for short reads

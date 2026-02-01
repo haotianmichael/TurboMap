@@ -198,6 +198,10 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t 
 void free_stream_gpu(int n_threads); // for stream_gpu free pinned memory
 // chaining method
 void chain_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t **in_arr_ptr, int *n_read_ptr, int thread_id, void* km);
+// GPU batch re-chaining for reads that need RMQ-style re-chaining
+void gpu_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                       chain_read_t *reads, int *rechain_indices, int n_rechain,
+                       Misc misc, void *km);
 
 /* <lchain.c> Chaining backtracking methods */
 uint64_t *mg_chain_backtrack(void *km, int64_t n, const int32_t *f,
@@ -211,6 +215,8 @@ mm128_t *compact_a(void *km, int32_t n_u, uint64_t *u, int32_t n_v, int32_t *v, 
 Misc build_misc(const mm_idx_t *mi, const mm_mapopt_t *opt, const int64_t qlen_sum, const int n_seg);
 void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
                           chain_read_t *read, Misc misc, void *km);
+int needs_rmq_rechain(const mm_mapopt_t *opt, chain_read_t* read);
+void prepare_rechain_anchors(chain_read_t* read, void *km);
 
 #ifdef __cplusplus
 }

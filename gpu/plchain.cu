@@ -10,6 +10,7 @@
 #include "plrange.cuh"
 #include "plscore.cuh"
 #include "plbacktrack.cuh"
+#include "plvoting.cuh"
 #include "plchain.h"
 #include <utility>
 #include <algorithm>
@@ -304,9 +305,9 @@ void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_r
                 }
             }
 
-            // GPU batch re-chain if any reads need it
+            // GPU voting-based re-chain if any reads need it
             if (n_rechain > 0) {
-                gpu_rechain_batch(mi, opt, out_arr, rechain_indices, n_rechain, misc, km);
+                plvoting_rechain_batch(mi, opt, out_arr, rechain_indices, n_rechain, misc, km);
             }
             free(rechain_indices);
 
@@ -559,9 +560,9 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t*
         }
     }
 
-    // GPU batch re-chain if any reads need it
+    // GPU voting-based re-chain if any reads need it
     if (n_rechain > 0) {
-        gpu_rechain_batch(mi, opt, reads, rechain_indices, n_rechain, misc, km);
+        plvoting_rechain_batch(mi, opt, reads, rechain_indices, n_rechain, misc, km);
     }
     free(rechain_indices);
 
@@ -586,133 +587,10 @@ void free_stream_gpu(int n_threads){
 #endif
 }
 
-// GPU batch re-chaining for reads that need RMQ-style re-chaining
-// This reuses the existing GPU DP infrastructure
-void gpu_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                       chain_read_t *reads, int *rechain_indices, int n_rechain,
-                       Misc misc, void *km)
-{
-    if (n_rechain == 0) return;
-
-    cudaSetDevice(CUDA_DEVICE);
-
-    // Prepare anchors for reads that need re-chaining
-    for (int i = 0; i < n_rechain; i++) {
-        int idx = rechain_indices[i];
-        prepare_rechain_anchors(&reads[idx], km);
-    }
-
-    // Create temporary array of reads to re-chain
-    chain_read_t *rechain_reads = (chain_read_t*)malloc(sizeof(chain_read_t) * n_rechain);
-    for (int i = 0; i < n_rechain; i++) {
-        rechain_reads[i] = reads[rechain_indices[i]];
-    }
-
-    // Calculate total anchors
-    size_t total_n = 0;
-    for (int i = 0; i < n_rechain; i++) {
-        total_n += rechain_reads[i].n;
-    }
-
-    if (total_n == 0) {
-        free(rechain_reads);
-        return;
-    }
-
-    // Use stream 0 for synchronous re-chaining
-    int stream_id = 0;
-
-    // Check if stream is busy - wait if so
-    if (stream_setup.streams[stream_id].busy) {
-        cudaStreamSynchronize(stream_setup.streams[stream_id].cudastream);
-        stream_setup.streams[stream_id].busy = false;
-    }
-
-    // Store original reads pointer
-    chain_read_t *orig_reads = stream_setup.streams[stream_id].reads;
-    int orig_n_read = stream_setup.streams[stream_id].n_read;
-
-    // Set up stream for re-chaining
-    stream_setup.streams[stream_id].reads = rechain_reads;
-    stream_setup.streams[stream_id].n_read = n_rechain;
-
-    // Reset counters
-    cudaMemsetAsync(stream_setup.streams[stream_id].dev_mem.d_long_seg_count, 0,
-                    sizeof(unsigned int), stream_setup.streams[stream_id].cudastream);
-    cudaMemsetAsync(stream_setup.streams[stream_id].dev_mem.d_total_n_long, 0,
-                    sizeof(size_t), stream_setup.streams[stream_id].cudastream);
-
-    for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) {
-        stream_setup.streams[stream_id].host_mems[uid].long_segs_num[0] = 0;
-        stream_setup.streams[stream_id].host_mems[uid].index = uid;
-        stream_setup.streams[stream_id].host_mems[uid].griddim = 0;
-        stream_setup.streams[stream_id].host_mems[uid].size = 0;
-        stream_setup.streams[stream_id].host_mems[uid].total_n = 0;
-        stream_setup.streams[stream_id].host_mems[uid].cut_num = 0;
-    }
-
-    // Process as single micro-batch (simplified)
-    int uid = 0;
-    int griddim = 0;
-    size_t cut_num = 0;
-
-    for (int i = 0; i < n_rechain; i++) {
-        int an_p_block = range_kernel_config.anchor_per_block;
-        int an_p_cut = range_kernel_config.blockdim;
-        int block_num = (rechain_reads[i].n - 1) / an_p_block + 1;
-        griddim += block_num;
-        cut_num += (rechain_reads[i].n - 1) / an_p_cut + 1;
-    }
-
-    // Reorganize input
-    plmem_reorg_input_arr(rechain_reads, n_rechain,
-                          &stream_setup.streams[stream_id].host_mems[uid],
-                          range_kernel_config);
-
-    // Copy to device
-    plmem_async_h2d_short_memcpy(&stream_setup.streams[stream_id], uid);
-
-    // Range selection
-    plrange_async_range_selection(&stream_setup.streams[stream_id].dev_mem,
-                                  &stream_setup.streams[stream_id].cudastream);
-
-    // DP scoring
-    plscore_async_short_mid_forward_dp(&stream_setup.streams[stream_id].dev_mem,
-                                       &stream_setup.streams[stream_id].cudastream);
-
-    // Copy results back
-    plmem_async_d2h_short_memcpy(&stream_setup.streams[stream_id], uid);
-
-    // Synchronize
-    cudaStreamSynchronize(stream_setup.streams[stream_id].cudastream);
-
-    // Backtracking
-    plbacktrack_gpu(&stream_setup.streams[stream_id].host_mems[uid],
-                    &stream_setup.streams[stream_id].dev_mem,
-                    rechain_reads, misc, km,
-                    stream_setup.streams[stream_id].cudastream);
-
-    cudaStreamSynchronize(stream_setup.streams[stream_id].cudastream);
-
-    // Copy results back to original reads array
-    for (int i = 0; i < n_rechain; i++) {
-        int idx = rechain_indices[i];
-        reads[idx].a = rechain_reads[i].a;
-        reads[idx].u = rechain_reads[i].u;
-        reads[idx].n = rechain_reads[i].n;
-        reads[idx].n_u = rechain_reads[i].n_u;
-    }
-
-    // Restore stream state
-    stream_setup.streams[stream_id].reads = orig_reads;
-    stream_setup.streams[stream_id].n_read = orig_n_read;
-
-    free(rechain_reads);
-
-#ifdef DEBUG_PRINT
-    fprintf(stderr, "[Info] GPU re-chained %d reads with %lu total anchors\n", n_rechain, total_n);
-#endif
-}
+/* gpu_rechain_batch has been superseded by plvoting_rechain_batch (plvoting.cu).
+ * The voting-based approach replaces the RMQ-tree with a GPU histogram that
+ * identifies high-coverage reference regions, then runs mg_lchain_dp with
+ * bw_long on the filtered anchor set.  See gpu/plvoting.cu for details. */
 
 #ifdef __cplusplus
 } // extern "C"

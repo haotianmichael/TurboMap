@@ -13,13 +13,14 @@
  *   2. [CPU] Find "winning" bins (vote_count >= min_cnt).  Merge consecutive
  *      winning bins separated by a gap <= VOTING_LARGE_GAP bases (the 50 kb
  *      threshold from the Genome-on-Diet paper).
- *   3. [CPU] Filter the anchor array: keep only anchors whose reference
- *      position falls inside a winning segment.
- *   4. [CPU] Run mg_lchain_dp with bw_long bandwidth on the filtered anchors.
+ *   3. [CPU] Two-pointer filter: keep only anchors inside winning segments.
+ *      Simultaneously build u[] — one entry per winning segment:
+ *        u[i] = (sum_q_span << 32) | n_anchors_in_segment
+ *      No mg_lchain_dp is called.  Each winning segment IS the chain.
  *
- * The key accuracy trade-off: anchors in sparse, low-vote regions are dropped.
- * Chains that span only such regions will be missed, but high-coverage regions
- * (which are the important ones for long reads) are retained.
+ * The key accuracy trade-off: anchors in sparse, low-vote regions are dropped,
+ * and within winning segments all anchors are kept (no optimal-path selection
+ * by DP).  The output b[]/u[] is passed directly to mm_gen_regs → GPU KSW.
  *
  * The GPU voting step replaces the KRMQ tree entirely: instead of O(n log n)
  * tree construction and O(log n) range-maximum queries, we do a single O(n)
@@ -48,16 +49,18 @@ extern "C" {
  * plvoting_rechain_batch - voting-based GPU re-chaining (replaces gpu_rechain_batch)
  *
  * For each read in rechain_indices:
- *   - Anchors have already been consolidated and sorted by prepare_rechain_anchors()
- *   - Runs GPU voting + CPU filter + CPU mg_lchain_dp(bw_long)
- *   - Writes updated a[], u[], n, n_u back into reads[]
+ *   - Runs GPU voting histogram to identify high-coverage reference regions.
+ *   - Filters anchors to winning segments; each segment becomes one chain.
+ *   - Writes b[] (compacted anchors) and u[] (chain descriptors) back to reads[].
+ *   - No mg_lchain_dp is called; output goes directly to mm_gen_regs → GPU KSW.
  *
- * @param mi               Reference index (for penalty parameters)
- * @param opt              Mapping options (bw_long, max_gap, etc.)
+ * @param mi               Reference index
+ * @param opt              Mapping options (max_gap, min_cnt, etc.)
  * @param reads            Array of all reads
  * @param rechain_indices  Indices into reads[] that need re-chaining
  * @param n_rechain        Number of reads to re-chain
- * @param misc             Chaining misc parameters (chn_pen_gap, chn_pen_skip, ...)
+ * @param misc             Chaining misc parameters (unused after DP removal, kept
+ *                         for API compatibility with plchain.cu call sites)
  * @param km               kalloc memory pool
  */
 void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,

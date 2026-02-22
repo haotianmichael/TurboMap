@@ -434,13 +434,28 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
             continue;
         }
 
+        /*
+         * Shrink b[] from worst-case n_a to actual n_b.
+         *
+         * CRITICAL: b was allocated with KMALLOC(km, b, n_a), but voting
+         * filters out most anchors so n_b << n_a.  Leaving the full-size
+         * block in the kalloc pool causes OOM during the subsequent
+         * alignment phase when many reads have been re-chained.
+         * For a batch with 200M total anchors and 805 re-chained reads,
+         * the wasted (n_a - n_b) * 16 bytes can exceed 1.9 GB.
+         */
+        mm128_t *b_final;
+        KMALLOC(km, b_final, n_b);
+        memcpy(b_final, b, n_b * sizeof(mm128_t));
+        kfree(km, b);
+
         /* Shrink u_buf to actual size */
         uint64_t *u_final;
         KMALLOC(km, u_final, n_u);
         memcpy(u_final, u_buf, n_u * sizeof(uint64_t));
         kfree(km, u_buf);
 
-        rd->a   = b;
+        rd->a   = b_final;
         rd->n   = n_b;
         rd->u   = u_final;
         rd->n_u = n_u;

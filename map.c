@@ -1648,15 +1648,15 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
     ctx->a = a;
 	ctx->qlen = qlens[0];  // Store the actual query length
     
-    // Debug: log per-read info before alignment tasks are collected
-    if (skele_n_regs == 0 || n_a <= 0) {
-        fprintf(stderr, "[DEBUG-PRE-ALIGN] read=%d n_regs=%d n_a=%d qlen=%d — skipping loop\n",
-                read_idx, skele_n_regs, n_a, qlens[0]);
-    } else {
-        fprintf(stderr, "[DEBUG-PRE-ALIGN] read=%d n_regs=%d n_a=%d qlen=%d\n",
-                read_idx, skele_n_regs, n_a, qlens[0]);
+    // Debug: always print a summary line; only print full per-region detail
+    // for the first 30 reads so stderr stays manageable on large batches.
+    // Redirect stderr to a file (e.g. 2>debug.log) and tail the last ~100
+    // lines after a crash to see the offending read.
+    fprintf(stderr, "[DEBUG-PRE-ALIGN] read=%d n_regs=%d n_a=%d qlen=%d\n",
+            read_idx, skele_n_regs, n_a, qlens[0]);
+    if (read_idx < 30) {
         for (i = 0; i < skele_n_regs; ++i) {
-            int32_t r_rid = (n_a > 0 && regs0[i].as < n_a)
+            int32_t r_rid = (regs0[i].cnt > 0 && regs0[i].as < n_a)
                             ? (int32_t)(a[regs0[i].as].x << 1 >> 33) : -1;
             fprintf(stderr, "[DEBUG-PRE-ALIGN]   reg=%d as=%d cnt=%d rid=%d rs=%d re=%d qs=%d qe=%d\n",
                     i, regs0[i].as, regs0[i].cnt, r_rid,

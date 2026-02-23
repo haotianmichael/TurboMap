@@ -1310,6 +1310,33 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     }
 
     rs1 = rs, qs1 = qs;
+
+    // Validate anchor-derived coordinates before touching qseq0 / tseq buffers.
+    // Corrupted anchors from voting can produce qs/rs values that exceed allocated
+    // buffers, causing mm_seq_rev to write past the end of qseq0[rev] or tseq.
+    {
+        int32_t seq_len = (int32_t)mi->seq[rid].len;
+        int bad = 0;
+        if (qs0 < 0 || qs0 > qlen) { bad = 1; }
+        if (qs  < 0 || qs  > qlen) { bad = 1; }
+        if (qs0 > qs)              { bad = 1; }
+        if (rs0 < 0 || rs0 > seq_len) { bad = 1; }
+        if (rs  < 0 || rs  > seq_len) { bad = 1; }
+        if (rs0 > rs)              { bad = 1; }
+        if (bad) {
+            fprintf(stderr, "[BUG] mm_align1_batched: bad pre-ext coords: "
+                    "qs0=%d qs=%d qlen=%d rs0=%d rs=%d seq_len=%d "
+                    "re0=%d rs0=%d re=%d rs=%d "
+                    "read=%d reg=%d rid=%d cnt1=%d as1=%d\n",
+                    qs0, qs, qlen, rs0, rs, seq_len,
+                    re0, rs0, re, rs,
+                    read_idx, reg_idx, rid, cnt1, as1);
+            kfree(km, tseq);
+            kfree(km, junc);
+            return;
+        }
+    }
+
 	task_ctx_t task_ctx;
     task_ctx.qs0 = qs0;
 	task_ctx.qe0 = qe0;

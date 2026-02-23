@@ -1188,7 +1188,12 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         mm_adjust_minier(mi, qseq0, &a[as1], &rs, &qs);
         mm_adjust_minier(mi, qseq0, &a[as1 + cnt1 - 1], &re, &qe);
     }
-    assert(cnt1 > 0);
+    if (cnt1 <= 0) {
+        fprintf(stderr, "[BUG] mm_align1_batched: cnt1=%d <= 0, "
+                "read=%d reg=%d rid=%d r->cnt=%d r->as=%d n_a=%d\n",
+                cnt1, read_idx, reg_idx, rid, r->cnt, r->as, n_a);
+        return;
+    }
 
     if (is_splice) {
         if (opt->flag & MM_F_SPLICE_FOR) extra_flag |= rev? KSW_EZ_SPLICE_REV : KSW_EZ_SPLICE_FOR;
@@ -1285,9 +1290,24 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         if (qe0 - r->qe > max_ext) qe0 = r->qe + max_ext;
     }
 
-    assert(re0 > rs0);
+    if (re0 <= rs0) {
+        fprintf(stderr, "[BUG] mm_align1_batched: re0(%d) <= rs0(%d), "
+                "read=%d reg=%d rid=%d cnt1=%d as1=%d r->cnt=%d r->as=%d n_a=%d "
+                "rs=%d re=%d qs=%d qe=%d\n",
+                re0, rs0, read_idx, reg_idx, rid, cnt1, as1,
+                r->cnt, r->as, n_a, rs, re, qs, qe);
+        return;
+    }
     tseq = (uint8_t*)kmalloc(km, re0 - rs0);
     junc = (uint8_t*)kmalloc(km, re0 - rs0);
+    if (tseq == NULL || junc == NULL) {
+        fprintf(stderr, "[BUG] mm_align1_batched: NULL tseq/junc after kmalloc(%d), "
+                "read=%d reg=%d rid=%d\n",
+                re0 - rs0, read_idx, reg_idx, rid);
+        kfree(km, tseq);
+        kfree(km, junc);
+        return;
+    }
 
     rs1 = rs, qs1 = qs;
 	task_ctx_t task_ctx;

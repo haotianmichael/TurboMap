@@ -494,8 +494,8 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
     // Skip this branch - reads needing re-chain are identified by needs_rmq_rechain()
     if (opt->bw_long > opt->bw &&
         (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
-        n_segs == 1 && *n_regs0 > 1 && *u != NULL && *a != NULL) {
-        // GPU batch re-chaining handles this case
+        n_segs == 1 && *n_regs0 >= 1 && *u != NULL && *a != NULL) {
+        // GPU batch re-chaining handles this case (covers 1 or more chains)
         // Do nothing here - just fall through to set frag_gap
     }
     else if (opt->max_occ > opt->mid_occ && *rep_len > 0 &&
@@ -1648,10 +1648,26 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
     ctx->a = a;
 	ctx->qlen = qlens[0];  // Store the actual query length
     
+    // Debug: log per-read info before alignment tasks are collected
+    if (skele_n_regs == 0 || n_a <= 0) {
+        fprintf(stderr, "[DEBUG-PRE-ALIGN] read=%d n_regs=%d n_a=%d qlen=%d — skipping loop\n",
+                read_idx, skele_n_regs, n_a, qlens[0]);
+    } else {
+        fprintf(stderr, "[DEBUG-PRE-ALIGN] read=%d n_regs=%d n_a=%d qlen=%d\n",
+                read_idx, skele_n_regs, n_a, qlens[0]);
+        for (i = 0; i < skele_n_regs; ++i) {
+            int32_t r_rid = (n_a > 0 && regs0[i].as < n_a)
+                            ? (int32_t)(a[regs0[i].as].x << 1 >> 33) : -1;
+            fprintf(stderr, "[DEBUG-PRE-ALIGN]   reg=%d as=%d cnt=%d rid=%d rs=%d re=%d qs=%d qe=%d\n",
+                    i, regs0[i].as, regs0[i].cnt, r_rid,
+                    regs0[i].rs, regs0[i].re, regs0[i].qs, regs0[i].qe);
+        }
+    }
+
     for (i = 0; i < skele_n_regs; ++i) {
         mm_reg1_t r2;
         memset(&r2, 0, sizeof(mm_reg1_t));
-        
+
         // This replaces the mm_align1 call with task collection
 		assert(!((opt->flag&MM_F_SPLICE) && (opt->flag&MM_F_SPLICE_FOR) && (opt->flag&MM_F_SPLICE_REV)));
         mm_align1_batched(gpu_batch, km, opt, mi, qlens[0], qseq0, &regs0[i], &r2, n_a, a, read_idx, i);

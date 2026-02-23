@@ -1368,7 +1368,11 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
 	task_ctx.rev = rev;
  
 	// Left extension
-    if (qs > 0 && rs > 0) {
+    // Guard: rs must not exceed re0, or mm_idx_getseq would write (rs-rs0) bytes
+    // into a (re0-rs0)-byte tseq buffer → overflow.  Pre-ext guard ensures
+    // rs <= seq_len; after clamping re0 = seq_len this gives rs <= re0, but
+    // add the explicit check in case re0 was not clamped (is_sr path).
+    if (qs > 0 && rs > 0 && rs <= re0) {
         if (opt->flag & MM_F_QSTRAND) {
             qseq = &qseq0[0][qs0];
             mm_idx_getseq2(mi, rev, rid, rs0, rs, tseq);
@@ -1479,7 +1483,10 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     // Right extension
     // Guard: if gap fill was skipped due to bad voting anchors, qe/re may be
     // negative or beyond buffer bounds. Only extend when coords are sane.
-    if (qe >= 0 && qe <= qlen && re >= 0 && re <= (int32_t)mi->seq[rid].len
+    // Critical: also require re >= rs0, because tseq was allocated (re0-rs0)
+    // bytes and mm_idx_getseq writes (re0-re) bytes — if re < rs0 then
+    // re0-re > re0-rs0 and we overflow the heap.
+    if (qe >= 0 && qe <= qlen && re >= rs0 && re <= (int32_t)mi->seq[rid].len
             && qe < qe0 && re < re0) {
         if (opt->flag & MM_F_QSTRAND) {
             qseq = &qseq0[0][qe];

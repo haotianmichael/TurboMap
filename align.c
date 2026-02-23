@@ -1384,6 +1384,30 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         
         if (i == cnt1 - 1 || (a[as1+i].y&MM_SEED_LONG_JOIN) || 
             (qe - qs >= opt->min_ksw_len && re - rs >= opt->min_ksw_len)) {
+            // Guard: voting-recombined anchors can produce re > re0 (overflows
+            // tseq buffer) or qe > qlen (overflows qseq0). Check before any
+            // sequence operations.
+            if (re <= rs || qe <= qs) {
+                // Anchor went backwards — bad voting anchor, skip this gap.
+                fprintf(stderr, "[BUG] mm_align1_batched: gap fill backward coords: "
+                        "qe=%d qs=%d re=%d rs=%d read=%d reg=%d i=%d/%d\n",
+                        qe, qs, re, rs, read_idx, reg_idx, i, cnt1);
+                if (re > rs) rs = re;
+                if (qe > qs) qs = qe;
+                continue;
+            }
+            if (re > re0 || qe > qlen) {
+                // Anchor exceeds buffer bounds — clamp to prevent overflow.
+                fprintf(stderr, "[BUG] mm_align1_batched: gap fill OOB: "
+                        "re=%d re0=%d qe=%d qlen=%d read=%d reg=%d i=%d/%d\n",
+                        re, re0, qe, qlen, read_idx, reg_idx, i, cnt1);
+                if (re > re0) re = re0;
+                if (qe > qlen) qe = qlen;
+                if (re <= rs || qe <= qs) {
+                    rs = re; qs = qe;
+                    continue;
+                }
+            }
             int bw1 = bw_long;
 				int max_seq_len = qe - qs > re - rs ? qe - qs : re - rs;
 
@@ -1431,7 +1455,10 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     }
 
     // Right extension
-    if (qe < qe0 && re < re0) {
+    // Guard: if gap fill was skipped due to bad voting anchors, qe/re may be
+    // negative or beyond buffer bounds. Only extend when coords are sane.
+    if (qe >= 0 && qe <= qlen && re >= 0 && re <= (int32_t)mi->seq[rid].len
+            && qe < qe0 && re < re0) {
         if (opt->flag & MM_F_QSTRAND) {
             qseq = &qseq0[0][qe];
             mm_idx_getseq2(mi, rev, rid, re, re0, tseq);

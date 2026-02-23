@@ -1290,6 +1290,28 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         if (qe0 - r->qe > max_ext) qe0 = r->qe + max_ext;
     }
 
+    // Clamp re0/qe0 to hard sequence boundaries BEFORE tseq allocation.
+    // Voting rechain can mix anchors from different chromosomes into one chain:
+    // the tail anchor's ref_pos may belong to another rid whose sequence is
+    // longer than the current one, so re0 ends up > mi->seq[rid].len.
+    // Without this clamp, the gap-fill guard "re > re0" never fires even when
+    // re > seq_len, and mm_idx_getseq reads past the chromosome → SIGSEGV.
+    {
+        int32_t seq_len_rid = (int32_t)mi->seq[rid].len;
+        if (re0 > seq_len_rid) {
+            fprintf(stderr, "[BUG] mm_align1_batched: re0=%d > seq_len=%d, clamping, "
+                    "read=%d reg=%d rid=%d\n",
+                    re0, seq_len_rid, read_idx, reg_idx, rid);
+            re0 = seq_len_rid;
+        }
+        if (qe0 > qlen) {
+            fprintf(stderr, "[BUG] mm_align1_batched: qe0=%d > qlen=%d, clamping, "
+                    "read=%d reg=%d rid=%d\n",
+                    qe0, qlen, read_idx, reg_idx, rid);
+            qe0 = qlen;
+        }
+    }
+
     if (re0 <= rs0) {
         fprintf(stderr, "[BUG] mm_align1_batched: re0(%d) <= rs0(%d), "
                 "read=%d reg=%d rid=%d cnt1=%d as1=%d r->cnt=%d r->as=%d n_a=%d "

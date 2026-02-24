@@ -1,31 +1,34 @@
 /*
  * plvoting.cu  --  GPU-accelerated location-voting re-chaining
  *
- * Full GPU pipeline (Genome-on-Diet style, no CPU DP):
+ * Architecture (Genome-on-Diet style, corrected):
  *
- *   [GPU] voting_bin_kernel_v2
- *         Upload uint64_t ax/ay → vote into histogram d_votes[]
- *   [GPU] mark_dilate_kernel
- *         d_keep_bin[i] = 1 if any bin in [i-gap, i+gap] has votes >= min_votes
- *   [GPU] seg_start_kernel
- *         d_seg_start[i] = 1 at the start of each winning run
- *   [GPU/CUB] cub::DeviceScan::ExclusiveSum(d_seg_start) → d_seg_id[]
- *         Assigns a 0-based segment ID to every bin
- *   [CPU] tiny sync: read n_segs (2 ints from device)
- *   [GPU] tag_mark_kernel
- *         For each anchor: d_mark[j]=1 if in winning bin, d_anchor_seg[j]=segment ID
- *   [GPU/CUB] cub::DeviceScan::ExclusiveSum(d_mark) → d_out_pos[]
- *         Output position in compacted b[] for each kept anchor
- *   [CPU] tiny sync: read n_b (2 ints from device)
- *   [GPU] scatter_compact_kernel
- *         Scatter kept ax/ay to d_bx[]/d_by[] at d_out_pos[j]
- *         atomicAdd d_seg_count[seg] and d_seg_qspan[seg]
- *   [GPU] build_u_kernel
- *         d_u[s] = (d_seg_qspan[s] << 32) | d_seg_count[s]
- *   [CPU] Download d_bx[], d_by[], d_u[] → append to b[], u_buf[]
+ *   INPUT:  raw seed-hit anchors (mm128_t a[], grouped by chromosome/strand)
  *
- * Each winning voting segment becomes one chain directly.
- * No mg_lchain_dp is called.  Output b[]/u[] goes to mm_gen_regs → GPU KSW.
+ *   GPU pipeline per chromosome group:
+ *     [GPU] voting_bin_kernel_v2   – histogram anchor ref_pos into bins
+ *     [GPU] mark_dilate_kernel     – mark bins with votes >= min_cnt, merge gaps
+ *     [GPU] seg_start_kernel       – detect start of each winning run of bins
+ *     [GPU] cub::ExclusiveSum      – assign segment IDs to bins
+ *     [CPU] read n_segs
+ *     [GPU] tag_mark_kernel        – per anchor: mark=keep?, seg_id
+ *     [GPU] cub::ExclusiveSum      – output positions in compacted array
+ *     [CPU] read n_b (kept anchors)
+ *     [GPU] scatter_compact_kernel – compacts anchors AND tracks per-segment
+ *                                    rs_min, re_max, qs_min, qe_max via
+ *                                    atomicMin / atomicMax
+ *     [GPU] build_vt_kernel        – assembles one vt_t per winning segment
+ *     [CPU] download d_vt[]
+ *
+ *   OUTPUT: vt_t regions stored in rd->vt_regions / rd->n_vt.
+ *           rd->a, rd->u are left NULL; no b[]/u[] are produced.
+ *
+ * Critical safety properties:
+ *   1. Each vt_t carries the correct rid/rev (from the chromosome group header).
+ *   2. rs / re come from actual anchor ref_pos on rid  →  tseq[re-rs] is safe.
+ *   3. Cross-chromosome isolation: the chromosome loop enforces same xrev.
+ *   4. Voting regions are NEVER merged back into an anchor chain array;
+ *      they go directly to mm_voting_align_regions() → KSW → CIGAR concat.
  */
 
 #include <stdint.h>
@@ -33,6 +36,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <limits.h>
 
 #include <cub/cub.cuh>
 
@@ -49,7 +53,6 @@
  * voting_bin_kernel_v2
  *
  * Accepts the full uint64_t ax value; extracts ref_pos as the low 32 bits.
- * Avoids the extra int32_t upload needed by the original voting_bin_kernel.
  */
 __global__ void voting_bin_kernel_v2(const uint64_t *d_ax, int64_t n,
                                      int32_t ref_min, int32_t bin_size,
@@ -88,8 +91,7 @@ __global__ void mark_dilate_kernel(const int32_t *d_votes, int8_t *d_keep_bin,
 /*
  * seg_start_kernel
  *
- * d_seg_start[i] = 1 iff bin i is the first bin of a winning run
- * (d_keep_bin[i]=1 and either i==0 or d_keep_bin[i-1]==0).
+ * d_seg_start[i] = 1 iff bin i is the first bin of a winning run.
  * After an exclusive prefix sum, d_seg_id[i] gives the 0-based segment
  * index for bin i (valid only when d_keep_bin[i]=1).
  */
@@ -107,9 +109,8 @@ __global__ void seg_start_kernel(const int8_t *d_keep_bin,
  * tag_mark_kernel
  *
  * For each anchor j:
- *   - Compute its histogram bin from d_ax[j] low 32 bits.
- *   - d_mark[j] = d_keep_bin[bin]  (1 = keep, 0 = discard)
- *   - d_anchor_seg[j] = d_seg_id[bin]  (segment ID, only valid when d_mark=1)
+ *   d_mark[j]       = d_keep_bin[bin]   (1 = keep, 0 = discard)
+ *   d_anchor_seg[j] = d_seg_id[bin]     (segment ID, valid when d_mark=1)
  */
 __global__ void tag_mark_kernel(const uint64_t *d_ax, int64_t n,
                                 int32_t ref_min, int32_t bin_size,
@@ -133,15 +134,18 @@ __global__ void tag_mark_kernel(const uint64_t *d_ax, int64_t n,
 }
 
 /*
- * scatter_compact_kernel
+ * scatter_compact_kernel  (extended)
  *
- * Scatters kept anchors into the compacted output arrays d_bx[]/d_by[],
- * and accumulates per-segment q_span sum and anchor count via atomicAdd.
+ * Scatters kept anchors into compacted d_bx[]/d_by[] and simultaneously
+ * accumulates per-segment coordinate bounds using atomicMin / atomicMax:
  *
- * Because chr_a[] is sorted by ref_pos and segments are non-overlapping
- * ref_pos intervals, anchors from the same segment are contiguous in
- * chr_a[], so their output positions in d_bx[]/d_by[] are also contiguous.
- * This ensures each chain (segment) occupies a consecutive slice in b[].
+ *   d_seg_rs_min[s]  = min ref_pos           in segment s
+ *   d_seg_re_max[s]  = max (ref_pos + 1)     in segment s
+ *   d_seg_qs_min[s]  = min (qpos+1 - q_span) in segment s  (query start)
+ *   d_seg_qe_max[s]  = max (qpos + 1)        in segment s  (query end)
+ *
+ * These four arrays are used by build_vt_kernel to construct vt_t regions.
+ * Initialise them to INT32_MAX / INT32_MIN before calling this kernel.
  */
 __global__ void scatter_compact_kernel(const uint64_t *d_ax, const uint64_t *d_ay,
                                        const int32_t  *d_mark,
@@ -149,36 +153,61 @@ __global__ void scatter_compact_kernel(const uint64_t *d_ax, const uint64_t *d_a
                                        const int32_t  *d_anchor_seg,
                                        int64_t n,
                                        uint64_t *d_bx, uint64_t *d_by,
-                                       int32_t  *d_seg_qspan,
-                                       int32_t  *d_seg_count)
+                                       int32_t  *d_seg_rs_min,
+                                       int32_t  *d_seg_re_max,
+                                       int32_t  *d_seg_qs_min,
+                                       int32_t  *d_seg_qe_max)
 {
     int64_t j = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n || d_mark[j] == 0) return;
-    int32_t out = d_out_pos[j];
-    d_bx[out] = d_ax[j];
-    d_by[out] = d_ay[j];
+
+    int32_t out    = d_out_pos[j];
+    d_bx[out]      = d_ax[j];
+    d_by[out]      = d_ay[j];
+
     int32_t seg    = d_anchor_seg[j];
-    int32_t q_span = (int32_t)((d_ay[j] >> 32) & 0xffU); /* bits 32..39 of ay */
-    atomicAdd(&d_seg_qspan[seg], q_span);
-    atomicAdd(&d_seg_count[seg], 1);
+
+    /* Reference coordinates */
+    int32_t ref_pos = (int32_t)d_ax[j];          /* low 32 bits = ref end (inclusive) */
+    atomicMin(&d_seg_rs_min[seg], ref_pos);
+    atomicMax(&d_seg_re_max[seg], ref_pos + 1);   /* exclusive end */
+
+    /* Query coordinates */
+    int32_t qpos   = (int32_t)d_ay[j];            /* low 32 bits = query end (inclusive) */
+    int32_t q_span = (int32_t)((d_ay[j] >> 32) & 0xffU); /* bits 32..39 = minimizer span */
+    int32_t qs     = qpos + 1 - q_span;           /* inclusive start */
+    atomicMin(&d_seg_qs_min[seg], qs);
+    atomicMax(&d_seg_qe_max[seg], qpos + 1);       /* exclusive end */
 }
 
 /*
- * build_u_kernel
+ * build_vt_kernel
  *
- * Constructs the chain descriptor for each winning segment:
- *   u[s] = (sum_q_span << 32) | anchor_count
- * The score (sum_q_span) is used only for primary/secondary ranking.
+ * Constructs one vt_t per winning segment from the per-segment coordinate
+ * arrays.  rid and rev are uniform across all segments in this chromosome
+ * group, so they are passed as scalars.
+ *
+ * Key safety invariant:
+ *   vt.rs / vt.re come from actual anchor ref_pos values on chromosome rid.
+ *   Therefore allocating tseq[vt.re - vt.rs] in mm_voting_align_regions()
+ *   is always within the chromosome bounds and never causes a buffer overflow.
  */
-__global__ void build_u_kernel(const int32_t *d_seg_qspan,
-                               const int32_t *d_seg_count,
-                               int32_t n_segs,
-                               uint64_t *d_u)
+__global__ void build_vt_kernel(const int32_t *d_seg_rs_min,
+                                const int32_t *d_seg_re_max,
+                                const int32_t *d_seg_qs_min,
+                                const int32_t *d_seg_qe_max,
+                                int32_t n_segs,
+                                int32_t rid, int32_t rev,
+                                vt_t *d_vt)
 {
     int32_t s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= n_segs) return;
-    d_u[s] = ((uint64_t)(uint32_t)d_seg_qspan[s] << 32)
-           |  (uint64_t)(uint32_t)d_seg_count[s];
+    d_vt[s].rid = rid;
+    d_vt[s].rev = rev;
+    d_vt[s].rs  = d_seg_rs_min[s];
+    d_vt[s].re  = d_seg_re_max[s];
+    d_vt[s].qs  = d_seg_qs_min[s];
+    d_vt[s].qe  = d_seg_qe_max[s];
 }
 
 /* =========================================================================
@@ -196,7 +225,7 @@ static void cub_excl_sum(int32_t *d_in, int32_t *d_out, int n)
     cudaFree(d_tmp);
 }
 
-/* Read n_segs or n_b: value = prefix[last] + flag[last]. */
+/* Read total count: value = prefix_sum[last] + flag[last]. */
 static int32_t read_total(const int32_t *d_prefix, const int32_t *d_flag, int n)
 {
     int32_t last_prefix, last_flag;
@@ -213,12 +242,29 @@ static int32_t read_total(const int32_t *d_prefix, const int32_t *d_flag, int n)
 
 extern "C" {
 
+/*
+ * plvoting_rechain_batch
+ *
+ * For each read in rechain_indices:
+ *   1. Sorts anchors by ref_pos (via prepare_rechain_anchors).
+ *   2. Runs the GPU voting pipeline per chromosome group.
+ *   3. Collects vt_t regions (rid, rev, rs, re, qs, qe).
+ *   4. Stores them in rd->vt_regions / rd->n_vt.
+ *
+ * Critically:
+ *   - rd->a is freed (the consumed anchor array).
+ *   - rd->u is left NULL, rd->n_u = 0.
+ *   - NO b[]/u[] anchor-chain arrays are produced.
+ *   - mm_voting_align_regions() in map.c will call KSW directly on each
+ *     vt_t region; results are concatenated at the CIGAR level.
+ */
 void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                             chain_read_t *reads, int *rechain_indices,
                             int n_rechain, Misc misc, void *km)
 {
     if (n_rechain == 0) return;
 
+    /* Sort anchors and release old chain descriptors */
     for (int i = 0; i < n_rechain; ++i)
         prepare_rechain_anchors(&reads[rechain_indices[i]], km);
 
@@ -239,20 +285,22 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
         mm128_t *a   = rd->a;
         if (n_a == 0 || a == NULL) continue;
 
-        /* Output buffers (CPU): worst-case n_a anchors, n_a chain descriptors */
-        mm128_t  *b;
-        uint64_t *u_buf;
-        KMALLOC(km, b,     n_a);
-        KMALLOC(km, u_buf, n_a);
-        int64_t n_b = 0;
-        int     n_u = 0;
+        /* Worst-case: every anchor becomes its own region (unlikely). */
+        vt_t *vt_buf;
+        KMALLOC(km, vt_buf, n_a);
+        int n_vt = 0;
 
         /* ------------------------------------------------------------------ *
-         * Process each chromosome group on GPU.                              *
+         * Process each chromosome/strand group independently.                *
+         * The grouping key is xrev = (int32_t)(a[j].x >> 32):               *
+         *   bit 31 = strand, bits 30..0 ≈ rid.                               *
+         * Using xrev ensures cross-chromosome isolation: uint64_t subtraction *
+         * of targets with different high words will differ by ≥ 2^32, so     *
+         * anchors from different chromosomes never end up in the same group.   *
          * ------------------------------------------------------------------ */
         int64_t chr_start = 0;
         while (chr_start < n_a) {
-            /* Delimit chromosome group */
+            /* Delimit one chromosome/strand group */
             int32_t xrev    = (int32_t)(a[chr_start].x >> 32);
             int64_t chr_end = chr_start;
             while (chr_end < n_a && (int32_t)(a[chr_end].x >> 32) == xrev)
@@ -261,12 +309,17 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
             int64_t       chr_n = chr_end - chr_start;
             const mm128_t *chr_a = a + chr_start;
 
+            /* Extract rid and rev from the first anchor in this group.
+             * Formula matches mmpriv.h: x = (rev<<63)|(rid<<33)|rpos */
+            int32_t rid = (int32_t)(chr_a[0].x << 1 >> 33);
+            int32_t rev = (int32_t)(chr_a[0].x >> 63) & 1;
+
             int32_t ref_min  = (int32_t)chr_a[0].x;
             int32_t ref_max  = (int32_t)chr_a[chr_n - 1].x;
             int32_t ref_span = ref_max - ref_min + 1;
             int32_t n_bins   = (ref_span + bin_size - 1) / bin_size + 1;
 
-            /* ---- Upload ax/ay as uint64_t ---- */
+            /* ---- Upload ax/ay ---- */
             uint64_t *h_ax = (uint64_t *)malloc(chr_n * sizeof(uint64_t));
             uint64_t *h_ay = (uint64_t *)malloc(chr_n * sizeof(uint64_t));
             for (int64_t j = 0; j < chr_n; ++j) {
@@ -356,15 +409,46 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                 continue;
             }
 
-            /* ---- Step 6: scatter anchors, accumulate per-segment stats ---- */
+            /* ---- Step 6: scatter anchors + accumulate per-segment ranges ----
+             *
+             * d_seg_rs_min / d_seg_re_max – reference coordinate bounds
+             * d_seg_qs_min / d_seg_qe_max – query coordinate bounds
+             *
+             * Initialised to INT32_MAX / INT32_MIN so atomicMin/Max work
+             * correctly even for the first anchor in each segment.
+             */
             uint64_t *d_bx, *d_by;
-            int32_t  *d_seg_qspan, *d_seg_count;
-            cudaMalloc(&d_bx,        n_b_chr * sizeof(uint64_t));
-            cudaMalloc(&d_by,        n_b_chr * sizeof(uint64_t));
-            cudaMalloc(&d_seg_qspan, n_segs  * sizeof(int32_t));
-            cudaMalloc(&d_seg_count, n_segs  * sizeof(int32_t));
-            cudaMemset(d_seg_qspan, 0, n_segs * sizeof(int32_t));
-            cudaMemset(d_seg_count, 0, n_segs * sizeof(int32_t));
+            int32_t  *d_seg_rs_min, *d_seg_re_max;
+            int32_t  *d_seg_qs_min, *d_seg_qe_max;
+            cudaMalloc(&d_bx,         n_b_chr * sizeof(uint64_t));
+            cudaMalloc(&d_by,         n_b_chr * sizeof(uint64_t));
+            cudaMalloc(&d_seg_rs_min, n_segs  * sizeof(int32_t));
+            cudaMalloc(&d_seg_re_max, n_segs  * sizeof(int32_t));
+            cudaMalloc(&d_seg_qs_min, n_segs  * sizeof(int32_t));
+            cudaMalloc(&d_seg_qe_max, n_segs  * sizeof(int32_t));
+
+            /* Fill sentinel values for atomicMin / atomicMax.
+             * Use a single host buffer + one bulk cudaMemcpy per array. */
+            {
+                int32_t *h_init = (int32_t *)malloc(n_segs * sizeof(int32_t));
+
+                /* min arrays → INT32_MAX */
+                for (int s = 0; s < n_segs; ++s) h_init[s] = INT32_MAX;
+                cudaMemcpy(d_seg_rs_min, h_init, n_segs * sizeof(int32_t),
+                           cudaMemcpyHostToDevice);
+                cudaMemcpy(d_seg_qs_min, h_init, n_segs * sizeof(int32_t),
+                           cudaMemcpyHostToDevice);
+
+                /* max arrays → INT32_MIN */
+                for (int s = 0; s < n_segs; ++s) h_init[s] = INT32_MIN;
+                cudaMemcpy(d_seg_re_max, h_init, n_segs * sizeof(int32_t),
+                           cudaMemcpyHostToDevice);
+                cudaMemcpy(d_seg_qe_max, h_init, n_segs * sizeof(int32_t),
+                           cudaMemcpyHostToDevice);
+
+                free(h_init);
+            }
+
             {
                 int grd = (int)((chr_n + blk - 1) / blk);
                 scatter_compact_kernel<<<grd, blk>>>(
@@ -372,99 +456,73 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                     d_mark, d_out_pos, d_anchor_seg,
                     chr_n,
                     d_bx, d_by,
-                    d_seg_qspan, d_seg_count);
+                    d_seg_rs_min, d_seg_re_max,
+                    d_seg_qs_min, d_seg_qe_max);
             }
+            /* d_bx / d_by are discarded: we no longer output anchor arrays */
+            cudaFree(d_bx);
+            cudaFree(d_by);
             cudaFree(d_ax_full);
             cudaFree(d_ay_full);
             cudaFree(d_mark);
             cudaFree(d_out_pos);
             cudaFree(d_anchor_seg);
 
-            /* ---- Step 7: build chain descriptors u[] ---- */
-            uint64_t *d_u_gpu;
-            cudaMalloc(&d_u_gpu, n_segs * sizeof(uint64_t));
+            /* ---- Step 7: build vt_t regions ---- */
+            vt_t *d_vt;
+            cudaMalloc(&d_vt, n_segs * sizeof(vt_t));
             {
                 int grd = (n_segs + blk - 1) / blk;
-                build_u_kernel<<<grd, blk>>>(d_seg_qspan, d_seg_count,
-                                             n_segs, d_u_gpu);
+                build_vt_kernel<<<grd, blk>>>(
+                    d_seg_rs_min, d_seg_re_max,
+                    d_seg_qs_min, d_seg_qe_max,
+                    n_segs, rid, rev, d_vt);
             }
-            cudaFree(d_seg_qspan);
-            cudaFree(d_seg_count);
+            cudaFree(d_seg_rs_min);
+            cudaFree(d_seg_re_max);
+            cudaFree(d_seg_qs_min);
+            cudaFree(d_seg_qe_max);
 
-            /* ---- Step 8: download results ---- */
-            uint64_t *h_bx = (uint64_t *)malloc(n_b_chr * sizeof(uint64_t));
-            uint64_t *h_by = (uint64_t *)malloc(n_b_chr * sizeof(uint64_t));
-            uint64_t *h_u  = (uint64_t *)malloc(n_segs  * sizeof(uint64_t));
-            cudaMemcpy(h_bx, d_bx,    n_b_chr * sizeof(uint64_t),
+            /* ---- Step 8: download vt_t regions ---- */
+            cudaMemcpy(vt_buf + n_vt, d_vt,
+                       n_segs * sizeof(vt_t),
                        cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_by, d_by,    n_b_chr * sizeof(uint64_t),
-                       cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_u,  d_u_gpu, n_segs  * sizeof(uint64_t),
-                       cudaMemcpyDeviceToHost);
-            cudaFree(d_bx);
-            cudaFree(d_by);
-            cudaFree(d_u_gpu);
+            cudaFree(d_vt);
+            n_vt += n_segs;
 
-            /* ---- Pack into CPU output buffers ---- */
-            for (int32_t j = 0; j < n_b_chr; ++j) {
-                b[n_b + j].x = h_bx[j];
-                b[n_b + j].y = h_by[j];
-            }
-            for (int32_t s = 0; s < n_segs; ++s)
-                u_buf[n_u + s] = h_u[s];
-            n_b += n_b_chr;
-            n_u += n_segs;
-
-            free(h_bx);
-            free(h_by);
-            free(h_u);
             chr_start = chr_end;
         } /* end chromosome loop */
 
-        /* Free the original (consumed) anchor array */
+        /* Free the consumed anchor array */
         kfree(km, a);
-        rd->a = NULL;
+        rd->a   = NULL;
+        rd->n   = 0;
+        rd->u   = NULL;   /* already freed by prepare_rechain_anchors */
+        rd->n_u = 0;
 
-        if (n_b == 0 || n_u == 0) {
-            kfree(km, b);
-            kfree(km, u_buf);
-            rd->n   = 0;
-            rd->n_u = 0;
-            rd->u   = NULL;
+        if (n_vt == 0) {
+            kfree(km, vt_buf);
+            rd->vt_regions = NULL;
+            rd->n_vt       = 0;
             continue;
         }
 
-        /*
-         * Shrink b[] from worst-case n_a to actual n_b.
-         *
-         * CRITICAL: b was allocated with KMALLOC(km, b, n_a), but voting
-         * filters out most anchors so n_b << n_a.  Leaving the full-size
-         * block in the kalloc pool causes OOM during the subsequent
-         * alignment phase when many reads have been re-chained.
-         * For a batch with 200M total anchors and 805 re-chained reads,
-         * the wasted (n_a - n_b) * 16 bytes can exceed 1.9 GB.
-         */
-        mm128_t *b_final;
-        KMALLOC(km, b_final, n_b);
-        memcpy(b_final, b, n_b * sizeof(mm128_t));
-        kfree(km, b);
+        /* Shrink vt_buf from worst-case n_a to actual n_vt */
+        vt_t *vt_final;
+        KMALLOC(km, vt_final, n_vt);
+        memcpy(vt_final, vt_buf, n_vt * sizeof(vt_t));
+        kfree(km, vt_buf);
 
-        /* Shrink u_buf to actual size */
-        uint64_t *u_final;
-        KMALLOC(km, u_final, n_u);
-        memcpy(u_final, u_buf, n_u * sizeof(uint64_t));
-        kfree(km, u_buf);
+        rd->vt_regions = vt_final;
+        rd->n_vt       = n_vt;
 
-        rd->a   = b_final;
-        rd->n   = n_b;
-        rd->u   = u_final;
-        rd->n_u = n_u;
     } /* end per-read loop */
 
 #ifdef DEBUG_PRINT
     fprintf(stderr,
             "[Info::%s] voting re-chained %d reads "
-            "(bin_size=%d, min_votes=%d, merge_gap_bins=%d)\n",
+            "(bin_size=%d, min_votes=%d, merge_gap_bins=%d) "
+            "→ vt_t regions only, no anchor arrays produced\n",
             __func__, n_rechain, bin_size, min_votes, merge_gap_bins);
 #endif
 }

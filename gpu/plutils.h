@@ -42,6 +42,25 @@ typedef struct {
     Misc misc;
 } input_meta_t;
 
+/*
+ * vt_t – output of GPU location voting.
+ *
+ * Each vt_t describes a single high-coverage reference region identified by
+ * the voting histogram.  Coordinates come from actual anchor ref/query
+ * positions on the correct chromosome, so allocating tseq[re-rs] is always
+ * safe (no cross-chromosome access).
+ *
+ *   rid / rev  – reference sequence ID and strand
+ *   rs / re    – reference range [rs, re)   derived from min/max anchor ref_pos
+ *   qs / qe    – query range    [qs, qe)   derived from min/max anchor qpos
+ */
+typedef struct {
+    int32_t rid;       /* reference sequence ID               */
+    int32_t rev;       /* strand: 0 = forward, 1 = reverse    */
+    int32_t rs, re;    /* reference start / end (re excluded) */
+    int32_t qs, qe;    /* query start / end    (qe excluded)  */
+} vt_t;
+
 typedef struct {
     mm_seq_meta_t seq;
 
@@ -69,6 +88,13 @@ typedef struct {
     // chaining outputs
     uint64_t *u;      // scores for chains
     int n_u;          // number of chains formed from anchors == n_reg0
+
+    /* voting rechain output – NULL when not voted (normal path).
+     * Set by plvoting_rechain_batch().  Consumed and freed by
+     * pre_align_helper_gpu() which calls mm_voting_align_regions()
+     * and then writes results directly into the read_align_ctx_t. */
+    vt_t *vt_regions; /* array of voting regions              */
+    int   n_vt;       /* number of voting regions             */
 
     int thread_id;
 

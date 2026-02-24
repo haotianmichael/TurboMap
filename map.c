@@ -1561,6 +1561,193 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
     }
 }
 
+/* Forward declarations for align.c functions that lack header declarations */
+void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi);
+void mm_append_cigar(mm_reg1_t *r, uint32_t n_cigar, uint32_t *cigar);
+
+/* Comparator for sorting vt_t regions by (rid, rev, rs). */
+static int vt_cmp(const void *a_, const void *b_)
+{
+    const vt_t *a = (const vt_t *)a_;
+    const vt_t *b = (const vt_t *)b_;
+    if (a->rid != b->rid) return a->rid < b->rid ? -1 : 1;
+    if (a->rev != b->rev) return a->rev < b->rev ? -1 : 1;
+    if (a->rs  != b->rs)  return a->rs  < b->rs  ? -1 : 1;
+    return 0;
+}
+
+/*
+ * mm_voting_align_regions - direct KSW alignment of voting regions.
+ *
+ * This function is the CORRECT replacement for the broken approach of
+ * merging voting anchors back into an mm128_t chain and feeding it to
+ * mm_align1_batched.  The fundamental correctness properties are:
+ *
+ *   1. Each vt_t carries its own rid/rev.  tseq is allocated as
+ *      tseq[vt.re - vt.rs] and filled via mm_idx_getseq(mi, vt.rid, ...).
+ *      This is always within chromosome bounds — no cross-chromosome access.
+ *
+ *   2. Between consecutive vt_t entries on the same (rid, rev), a deletion
+ *      CIGAR (and optional insertion CIGAR) bridges the gap; sequences are
+ *      never concatenated across chromosome boundaries.
+ *
+ *   3. No anchor array is produced or passed to mm_align1_batched.
+ *      Results are final mm_reg1_t values with CIGARs attached.
+ *
+ * @param km        kalloc memory pool
+ * @param opt       mapping options (gap costs, bandwidth, zdrop, …)
+ * @param mi        reference index (for mm_idx_getseq)
+ * @param qlen      full query length
+ * @param qseq0     encoded query sequences [0]=fwd [1]=rev
+ * @param vt        voting regions (sorted in-place by (rid,rev,rs))
+ * @param n_vt      number of voting regions
+ * @param n_regs_out  OUTPUT: number of mm_reg1_t produced
+ * @return          calloc'd array of mm_reg1_t; caller must free with free()
+ */
+static mm_reg1_t *mm_voting_align_regions(
+        void *km, const mm_mapopt_t *opt, const mm_idx_t *mi,
+        int qlen, uint8_t *qseq0[2],
+        vt_t *vt, int n_vt, int *n_regs_out)
+{
+    int i, j, k;
+    int8_t mat[25];
+    ksw_extz_t ez;
+
+    int bw = (int)(opt->bw_long * 1.5 + 1.);
+    if (bw < (int)(opt->bw * 1.5 + 1.))
+        bw = (int)(opt->bw * 1.5 + 1.);
+
+    ksw_gen_simple_mat(5, mat, opt->a, opt->b, opt->sc_ambi);
+    memset(&ez, 0, sizeof(ksw_extz_t));
+
+    /* Sort regions so same-chromosome entries are adjacent and ordered. */
+    qsort(vt, n_vt, sizeof(vt_t), vt_cmp);
+
+    /* Worst case: every region → its own mm_reg1_t (different chromosomes). */
+    mm_reg1_t *regs = (mm_reg1_t *)calloc(n_vt, sizeof(mm_reg1_t));
+    int n_regs = 0;
+
+    i = 0;
+    while (i < n_vt) {
+        /* Find the span of this (rid, rev) group. */
+        int32_t g_rid = vt[i].rid;
+        int32_t g_rev = vt[i].rev;
+        int j_end = i;
+        while (j_end < n_vt &&
+               vt[j_end].rid == g_rid && vt[j_end].rev == g_rev)
+            ++j_end;
+
+        /* Initialise one mm_reg1_t for the entire group. */
+        mm_reg1_t *r = &regs[n_regs++];
+        memset(r, 0, sizeof(mm_reg1_t));
+        r->rid  = g_rid;
+        r->rev  = g_rev;
+        r->qs   = vt[i].qs;
+        r->qe   = vt[j_end - 1].qe;
+        r->rs   = vt[i].rs;
+        r->re   = vt[j_end - 1].re;
+        r->cnt  = 0;  /* no anchor array — bypass mm_gen_regs entirely */
+
+        int32_t total_score = 0;
+
+        for (j = i; j < j_end; ++j) {
+            int32_t rs = vt[j].rs, re = vt[j].re;
+            int32_t qs = vt[j].qs, qe = vt[j].qe;
+
+            /* Clamp to chromosome and query bounds (defensive). */
+            if ((uint32_t)g_rid < mi->n_seq) {
+                if (re > (int32_t)mi->seq[g_rid].len)
+                    re = (int32_t)mi->seq[g_rid].len;
+            }
+            if (rs < 0) rs = 0;
+            if (qe > qlen) qe = qlen;
+            if (qs < 0)    qs = 0;
+
+            int tlen   = re - rs;
+            int qlen_r = qe - qs;
+            if (tlen <= 0 || qlen_r <= 0) continue;
+
+            /* ---- Inter-region gap CIGAR ---------------------------------- *
+             * Reference gap  → deletion  (D):  bases present on ref,        *
+             *                               absent from query                *
+             * Query gap      → insertion (I):  bases present in query,       *
+             *                               absent from ref                  *
+             * Both must be >= 0 since regions are sorted and non-overlapping.*
+             * --------------------------------------------------------------- */
+            if (j > i) {
+                int32_t prev_re = vt[j - 1].re;
+                int32_t prev_qe = vt[j - 1].qe;
+                int32_t del_len = rs - prev_re;
+                int32_t ins_len = qs - prev_qe;
+                if (del_len > 0) {
+                    uint32_t op = ((uint32_t)del_len << 4) | MM_CIGAR_DEL;
+                    mm_append_cigar(r, 1, &op);
+                }
+                if (ins_len > 0) {
+                    uint32_t op = ((uint32_t)ins_len << 4) | MM_CIGAR_INS;
+                    mm_append_cigar(r, 1, &op);
+                }
+            }
+
+            /* ---- Fetch reference sequence (SAFE: rs/re on g_rid only) ---- */
+            uint8_t *tseq = (uint8_t *)kmalloc(km, tlen);
+            mm_idx_getseq(mi, g_rid, (uint32_t)rs, (uint32_t)re, tseq);
+
+            /* ---- Query sequence slice ------------------------------------ */
+            const uint8_t *qseq = &qseq0[g_rev][qs];
+
+            /* ---- KSW alignment ------------------------------------------ */
+            ksw_reset_extz(&ez);
+            if (opt->q == opt->q2 && opt->e == opt->e2)
+                ksw_extz2_sse(km, qlen_r, qseq, tlen, tseq,
+                              5, mat, opt->q, opt->e,
+                              bw, opt->zdrop, opt->end_bonus, 0, &ez);
+            else
+                ksw_extd2_sse(km, qlen_r, qseq, tlen, tseq,
+                              5, mat,
+                              opt->q, opt->e, opt->q2, opt->e2,
+                              bw, opt->zdrop, opt->end_bonus, 0, &ez);
+
+            if (ez.n_cigar > 0)
+                mm_append_cigar(r, ez.n_cigar, ez.cigar);
+            if (ez.score > 0)
+                total_score += ez.score;
+
+            kfree(km, tseq);
+            /* ksw_extz_t.cigar is allocated with the km pool by KSW internals */
+            kfree(km, ez.cigar);
+            ez.cigar   = NULL;
+            ez.n_cigar = ez.m_cigar = 0;
+        } /* end per-vt loop within group */
+
+        r->score = total_score;
+
+        /* Compute blen and mlen from the concatenated CIGAR.
+         * M / = count toward both blen and mlen; X, I, D toward blen only. */
+        if (r->p) {
+            r->p->dp_score = total_score;
+            for (k = 0; k < (int)r->p->n_cigar; ++k) {
+                int op  = (int)(r->p->cigar[k] & 0xfU);
+                int len = (int)(r->p->cigar[k] >> 4);
+                if (op == MM_CIGAR_MATCH || op == 7) { /* M or = */
+                    r->blen += len;
+                    r->mlen += len;
+                } else if (op == 8) {                  /* X      */
+                    r->blen += len;
+                } else if (op == MM_CIGAR_INS ||
+                           op == MM_CIGAR_DEL) {       /* I or D */
+                    r->blen += len;
+                }
+            }
+        }
+
+        i = j_end;
+    } /* end per-group loop */
+
+    *n_regs_out = n_regs;
+    return regs;
+}
+
 static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch_t *gpu_batch, const mm_idx_t *mi, void *km)
 {
     if (gpu_batch->n_tasks == 0) return;
@@ -1574,8 +1761,65 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
 }
 
 static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                                chain_read_t *read_, void *km, gpu_align_batch_t *gpu_batch, int read_idx) 
+                                chain_read_t *read_, void *km, gpu_align_batch_t *gpu_batch, int read_idx)
 {
+    extern unsigned char seq_nt4_table[256];
+
+    /* ------------------------------------------------------------------ *
+     * VOTING PATH                                                         *
+     *                                                                     *
+     * The read was re-chained by plvoting_rechain_batch() which output    *
+     * vt_t regions instead of anchor arrays.  Bypass mm_gen_regs and     *
+     * mm_align1_batched completely: call KSW directly per region, then   *
+     * concatenate CIGARs at the CIGAR level.                             *
+     *                                                                     *
+     * This is the architectural fix for the buffer-overflow bug:          *
+     *   OLD: voting → b[]/u[] anchors → mm_align1_batched                 *
+     *        (breaks same-rid and colinear assumptions → OOB write)       *
+     *   NEW: voting → vt_t regions → mm_voting_align_regions → CIGAR     *
+     *        (each vt_t has its own rid; tseq[re-rs] always safe)        *
+     * ------------------------------------------------------------------ */
+    if (read_->n_vt > 0) {
+        const int *qlens_v = read_->qlens;
+        const char **seqs_v = read_->qseqs;
+        int i_v;
+
+        uint8_t *qseq0[2];
+        qseq0[0] = (uint8_t *)kmalloc(km, qlens_v[0] * 2);
+        qseq0[1] = qseq0[0] + qlens_v[0];
+        for (i_v = 0; i_v < qlens_v[0]; ++i_v) {
+            qseq0[0][i_v] = seq_nt4_table[(uint8_t)seqs_v[0][i_v]];
+            qseq0[1][qlens_v[0] - 1 - i_v] =
+                qseq0[0][i_v] < 4 ? 3 - qseq0[0][i_v] : 4;
+        }
+
+        int n_regs = 0;
+        mm_reg1_t *regs = mm_voting_align_regions(
+                km, opt, mi, qlens_v[0], qseq0,
+                read_->vt_regions, read_->n_vt, &n_regs);
+
+        /* Write into the GPU batch context (no GPU tasks submitted for
+         * this read; gpu_batch_process_results will leave it untouched). */
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[read_idx];
+        ctx->regs0    = regs;
+        ctx->n_regs   = n_regs;
+        ctx->qseq0[0] = qseq0[0];
+        ctx->qseq0[1] = qseq0[1];
+        ctx->n_a      = 0;
+        ctx->a        = NULL;
+        ctx->qlen     = qlens_v[0];
+
+        /* Consume and free the vt_t region array. */
+        kfree(km, read_->vt_regions);
+        read_->vt_regions = NULL;
+        read_->n_vt = 0;
+
+        return;  /* skip normal mm_gen_regs + mm_align1_batched */
+    }
+
+    /* ------------------------------------------------------------------ *
+     * NORMAL PATH                                                         *
+     * ------------------------------------------------------------------ */
     int n_segs = read_->n_seg;
     const int *qlens = read_->qlens;
     const char **seqs = read_->qseqs;
@@ -1625,7 +1869,6 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
      *START: GPU replacement for mm_align_skeleton logic
      **************************************/
 
-    extern unsigned char seq_nt4_table[256];
     int32_t skele_n_regs = *n_regs0, n_a;
     uint8_t *qseq0[2];
 

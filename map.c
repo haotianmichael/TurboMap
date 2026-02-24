@@ -1648,10 +1648,7 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
     ctx->a = a;
 	ctx->qlen = qlens[0];  // Store the actual query length
     
-    // Debug: always print a summary line; only print full per-region detail
-    // for the first 30 reads so stderr stays manageable on large batches.
-    // Redirect stderr to a file (e.g. 2>debug.log) and tail the last ~100
-    // lines after a crash to see the offending read.
+#ifdef DEBUG_PRINT
     fprintf(stderr, "[DEBUG-PRE-ALIGN] read=%d n_regs=%d n_a=%d qlen=%d\n",
             read_idx, skele_n_regs, n_a, qlens[0]);
     if (read_idx < 30) {
@@ -1663,6 +1660,7 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
                     regs0[i].rs, regs0[i].re, regs0[i].qs, regs0[i].qe);
         }
     }
+#endif
 
     for (i = 0; i < skele_n_regs; ++i) {
         mm_reg1_t r2;

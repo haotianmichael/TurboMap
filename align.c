@@ -1137,11 +1137,11 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                              int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
                              int n_a, mm128_t *a, int read_idx, int reg_idx)
 {
-    // Debug: Validate anchor data at region boundaries
+#ifdef DEBUG_PRINT
     if (read_idx < 25 && reg_idx < 5) {
         uint32_t qpos_first = (uint32_t)a[r->as].y;
         uint32_t qpos_last = (r->cnt > 0) ? (uint32_t)a[r->as + r->cnt - 1].y : 0;
-        if (qpos_first > qlen || qpos_last > qlen) {
+        if (qpos_first > (uint32_t)qlen || qpos_last > (uint32_t)qlen) {
             fprintf(stderr, "[DEBUG-ALIGN] read_idx=%d, reg_idx=%d, qlen=%d, n_a=%d\n",
                     read_idx, reg_idx, qlen, n_a);
             fprintf(stderr, "[DEBUG-ALIGN]   Region: r->as=%d, r->cnt=%d\n", r->as, r->cnt);
@@ -1150,6 +1150,7 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
             fprintf(stderr, "[DEBUG-ALIGN]   INVALID: qpos exceeds qlen!\n");
         }
     }
+#endif
 
     int is_sr = !!(opt->flag & MM_F_SR), is_splice = !!(opt->flag & MM_F_SPLICE);
     int32_t rid = a[r->as].x<<1>>33, rev = a[r->as].x>>63, as1, cnt1;
@@ -1211,22 +1212,19 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         l += l * opt->a + opt->end_bonus > opt->q? (l * opt->a + opt->end_bonus - opt->q) / opt->e : 0;
         re0 = re + l < (int32_t)mi->seq[rid].len? re + l : mi->seq[rid].len;
     } else {
-        // Complex region computation logic from original mm_align1
-        uint32_t q_span_start = (uint32_t)(a[r->as].y>>32&0xff);
-        uint32_t q_pos_start = (uint32_t)a[r->as].y;
         rs0 = (int32_t)a[r->as].x + 1 - (int32_t)(a[r->as].y>>32&0xff);
         qs0 = (int32_t)a[r->as].y + 1 - (int32_t)(a[r->as].y>>32&0xff);
 
-        // Debug: Check if qs0/rs0 are reasonable
+        // Clamp qs0 to valid range to prevent crash on corrupted voting anchors
         if (qs0 < 0 || qs0 > qlen) {
-            fprintf(stderr, "[DEBUG] Invalid qs0 calculation: read_idx=%d, reg_idx=%d, qlen=%d\n", read_idx, reg_idx, qlen);
-            fprintf(stderr, "[DEBUG]   a[r->as].y=0x%lx, q_pos=%u, q_span=%u\n", a[r->as].y, q_pos_start, q_span_start);
-            fprintf(stderr, "[DEBUG]   Calculated qs0=%d (should be 0 <= qs0 <= %d)\n", qs0, qlen);
-            fprintf(stderr, "[DEBUG]   qs=%d, qe=%d, rs=%d, re=%d\n", qs, qe, rs, re);
-            // Clamp qs0 to valid range to prevent crash
+#ifdef DEBUG_PRINT
+            fprintf(stderr, "[DEBUG] Invalid qs0=%d (qlen=%d) read=%d reg=%d: "
+                    "a[r->as].y=0x%lx q_span=%u qs=%d qe=%d rs=%d re=%d\n",
+                    qs0, qlen, read_idx, reg_idx,
+                    a[r->as].y, (uint32_t)(a[r->as].y>>32&0xff), qs, qe, rs, re);
+#endif
             if (qs0 < 0) qs0 = 0;
             if (qs0 > qlen) qs0 = qlen;
-            fprintf(stderr, "[DEBUG]   Clamped qs0 to %d\n", qs0);
         }
         if (rs0 < 0) rs0 = 0;
         assert(qs0 >= 0);

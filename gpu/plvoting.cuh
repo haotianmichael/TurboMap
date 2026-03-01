@@ -7,24 +7,17 @@
  * Implements the Genome-on-Diet inspired "location voting" heuristic as a
  * CORRECT replacement for RMQ-based long-join re-chaining.
  *
- * Correct architecture (operates on raw seed hits, not chain arrays):
+ * Architecture:
  *
  *   seed hits (mm128_t a[], already DP-chained)
  *       ↓  prepare_rechain_anchors() – flatten + sort by ref_pos
- *       ↓  GPU voting per chromosome group
- *       ↓  vt_t regions (rid + ref_range + qry_range)
- *       ↓  mm_voting_align_regions() – direct KSW per region (NOT mm_align1_batched)
- *       ↓  CIGAR concatenation via mm_append_cigar()
+ *       ↓  GPU voting per chromosome/strand group
+ *       ↓  filtered anchor array b[] + chain descriptors u[]
+ *       ↓  mm_gen_regs → mm_align1_batched (GPU KSW)   ← normal path, unchanged
  *
- * Critical invariants:
- *   1. Voting output is vt_t[] (regions), NOT mm128_t anchor arrays.
- *      Voting results are NEVER re-merged into an anchor chain and NEVER
- *      passed to mm_align1_batched (which assumes same-chromosome colinear
- *      anchors and would overflow on mixed-chromosome input).
- *   2. Each vt_t carries its own rid/rev; tseq buffer = tseq[re-rs] is
- *      always safe because rs/re come from actual anchor positions on rid.
- *   3. Cross-chromosome safety: grouping by xrev = (int32_t)(x >> 32) keeps
- *      anchors from different chromosomes in separate groups.
+ * Voting output feeds directly into the existing GPU alignment pipeline.
+ * Cross-chromosome safety: each chromosome group is processed independently;
+ * anchors from different chromosomes never mix within a single u[] chain entry.
  *
  * Width of each voting bin expressed as a divisor of max_dist.
  * bin_size = max_dist / VOTING_BIN_DIVIDER
@@ -38,29 +31,19 @@
 
 #include "plmem.cuh"
 #include "mmpriv.h"
-#include "plutils.h"   /* chain_read_t, vt_t */
+#include "plutils.h"   /* chain_read_t */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /**
- * plvoting_rechain_batch - voting-based GPU re-chaining (seed-hit layer)
+ * plvoting_rechain_batch - voting-based GPU re-chaining
  *
- * For each read in rechain_indices:
- *   - Runs the full GPU voting pipeline to identify high-coverage ref regions.
- *   - Outputs vt_t regions into reads[i].vt_regions / reads[i].n_vt.
- *   - Does NOT produce anchor arrays (b[]) or chain descriptors (u[]).
- *   - Does NOT call mm_align1_batched; alignment is done by
- *     mm_voting_align_regions() in map.c via direct KSW calls.
- *
- * @param mi               Reference index
- * @param opt              Mapping options (max_gap, min_cnt, etc.)
- * @param reads            Array of all reads (chain_read_t)
- * @param rechain_indices  Indices into reads[] that need re-chaining
- * @param n_rechain        Number of reads to re-chain
- * @param misc             Chaining misc parameters (kept for API compatibility)
- * @param km               kalloc memory pool
+ * For each read in rechain_indices runs the GPU voting pipeline and stores
+ * the filtered anchor array (b[]) in rd->a and chain descriptors (u[]) in
+ * rd->u.  The read then flows through the normal mm_gen_regs →
+ * mm_align1_batched (GPU KSW) path without any special handling.
  */
 void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                             chain_read_t *reads, int *rechain_indices,

@@ -1613,9 +1613,16 @@ static mm_reg1_t *mm_voting_align_regions(
     int8_t mat[25];
     ksw_extz_t ez;
 
-    int bw = (int)(opt->bw_long * 1.5 + 1.);
-    if (bw < (int)(opt->bw * 1.5 + 1.))
-        bw = (int)(opt->bw * 1.5 + 1.);
+    /* bw_long is for chaining long-range joins; within a voting region the
+     * alignment is nearly diagonal.  Use an ADAPTIVE bandwidth:
+     *   bw_base            – covers local indels  (opt->bw * 1.5)
+     *   |tlen – qlen_r|    – covers the size difference between the
+     *                         reference span and query span of this region
+     * Capped at bw_long * 1.5 to handle extreme SVs within a region.
+     * Typical ONT case (tlen ≈ qlen_r): bw_region ≈ 301 instead of 30001
+     * → 100× speedup per region. */
+    const int bw_base = (int)(opt->bw * 1.5 + 1.);
+    const int bw_ceil = (int)(opt->bw_long * 1.5 + 1.);
 
     ksw_gen_simple_mat(5, mat, opt->a, opt->b, opt->sc_ambi);
     memset(&ez, 0, sizeof(ksw_extz_t));
@@ -1709,17 +1716,29 @@ static mm_reg1_t *mm_voting_align_regions(
             /* ---- Query sequence slice ------------------------------------ */
             const uint8_t *qseq = &qseq0[g_rev][qs];
 
+            /* ---- Adaptive bandwidth for this region ---------------------- *
+             * bw_diff = |tlen - qlen_r|: minimum bandwidth to see both     *
+             * sequence ends.  Add bw_base for local indel tolerance.        *
+             * This keeps KSW O(min_len × (bw_diff + bw_base)) instead of   *
+             * O(min_len × bw_long), a ~100× speedup when tlen ≈ qlen_r.    *
+             * ------------------------------------------------------------- */
+            int bw_diff   = tlen > qlen_r ? tlen - qlen_r : qlen_r - tlen;
+            int bw_region = bw_base + bw_diff;
+            if (bw_region > bw_ceil) bw_region = bw_ceil;
+
             /* ---- KSW alignment ------------------------------------------ */
             ksw_reset_extz(&ez);
             if (opt->q == opt->q2 && opt->e == opt->e2)
                 ksw_extz2_sse(km, qlen_r, qseq, tlen, tseq,
                               5, mat, opt->q, opt->e,
-                              bw, opt->zdrop, opt->end_bonus, 0, &ez);
+                              bw_region, opt->zdrop, opt->end_bonus,
+                              KSW_EZ_APPROX_MAX, &ez);
             else
                 ksw_extd2_sse(km, qlen_r, qseq, tlen, tseq,
                               5, mat,
                               opt->q, opt->e, opt->q2, opt->e2,
-                              bw, opt->zdrop, opt->end_bonus, 0, &ez);
+                              bw_region, opt->zdrop, opt->end_bonus,
+                              KSW_EZ_APPROX_MAX, &ez);
 
             if (ez.n_cigar > 0)
                 mm_append_cigar(r, ez.n_cigar, ez.cigar);

@@ -1654,6 +1654,19 @@ static mm_reg1_t *mm_voting_align_regions(
             int32_t rs = vt[j].rs, re = vt[j].re;
             int32_t qs = vt[j].qs, qe = vt[j].qe;
 
+            /* ---- Sentinel guard -------------------------------------------
+             * Segments whose bins contained ZERO anchors (kept only by
+             * mark_dilate dilation, not by their own vote count) are never
+             * written by scatter_compact_kernel, so their atomicMin/Max
+             * outputs stay at the initial sentinel values:
+             *   rs=INT32_MAX, re=INT32_MIN, qs=INT32_MAX, qe=INT32_MIN
+             *
+             * The naive checks (tlen<=0, qlen_r<=0) do NOT catch these
+             * because INT32_MIN - INT32_MAX wraps to 1 in int32_t arithmetic.
+             * We must test the raw vt_t fields BEFORE any arithmetic.
+             * ------------------------------------------------------------- */
+            if (vt[j].rs >= vt[j].re || vt[j].qs >= vt[j].qe) continue;
+
             /* Clamp to chromosome and query bounds (defensive). */
             if ((uint32_t)g_rid < mi->n_seq) {
                 if (re > (int32_t)mi->seq[g_rid].len)

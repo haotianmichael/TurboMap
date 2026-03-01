@@ -484,11 +484,24 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
             cudaFree(d_seg_qe_max);
 
             /* ---- Step 8: download vt_t regions ---- */
-            cudaMemcpy(vt_buf + n_vt, d_vt,
-                       n_segs * sizeof(vt_t),
-                       cudaMemcpyDeviceToHost);
-            cudaFree(d_vt);
-            n_vt += n_segs;
+            /* Download and compact: skip segments whose atomicMin/Max were
+             * never written (bins kept only by dilation, 0 anchors inside).
+             * Those have rs=INT32_MAX / re=INT32_MIN from the initialisation;
+             * rs >= re means the sentinel was never updated. */
+            {
+                vt_t *h_vt_chr = (vt_t *)malloc(n_segs * sizeof(vt_t));
+                cudaMemcpy(h_vt_chr, d_vt,
+                           n_segs * sizeof(vt_t),
+                           cudaMemcpyDeviceToHost);
+                cudaFree(d_vt);
+                for (int32_t sv = 0; sv < n_segs; ++sv) {
+                    /* Valid region: rs < re AND qs < qe (both updated). */
+                    if (h_vt_chr[sv].rs < h_vt_chr[sv].re &&
+                        h_vt_chr[sv].qs < h_vt_chr[sv].qe)
+                        vt_buf[n_vt++] = h_vt_chr[sv];
+                }
+                free(h_vt_chr);
+            }
 
             chr_start = chr_end;
         } /* end chromosome loop */

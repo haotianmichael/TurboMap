@@ -10,7 +10,7 @@
  *   1. [GPU] voting_bin_kernel_v2  – histogram anchor ref_pos into bins
  *   2. [GPU] mark_dilate_kernel   – mark bins with votes >= min_cnt, merge gaps
  *   3. [GPU] seg_start_kernel     – detect start of each winning run
- *   4. [GPU] cub::ExclusiveSum    – assign segment IDs to bins
+ *   4. [GPU] cub::InclusiveSum    – assign segment IDs to bins (1-indexed; tag_mark subtracts 1)
  *   5. [CPU] read n_segs
  *   6. [GPU] tag_mark_kernel      – per anchor: keep?, seg_id
  *   7. [GPU] cub::ExclusiveSum    – output positions in compacted array
@@ -117,7 +117,10 @@ __global__ void tag_mark_kernel(const uint64_t *d_ax, int64_t n,
         d_anchor_seg[j] = 0;
     } else {
         d_mark[j]       = 1;
-        d_anchor_seg[j] = d_seg_id[bin];
+        /* d_seg_id is an inclusive prefix sum of d_seg_start, so it counts
+         * how many segment starts are at positions [0..bin] (inclusive).
+         * The segment ID is therefore d_seg_id[bin] - 1 (0-indexed). */
+        d_anchor_seg[j] = d_seg_id[bin] - 1;
     }
 }
 
@@ -152,6 +155,22 @@ __global__ void scatter_compact_kernel(const uint64_t *d_ax, const uint64_t *d_a
  * Helpers
  * ========================================================================= */
 
+/* Inclusive prefix sum: d_seg_id[i] = sum(d_in[0..i]).
+ * Used for segment ID assignment: every bin in a segment gets the same
+ * value (seg_count_up_to_here), so tag_mark_kernel subtracts 1 for the
+ * 0-based segment ID. */
+static void cub_incl_sum(int32_t *d_in, int32_t *d_out, int n)
+{
+    void   *d_tmp  = nullptr;
+    size_t  tmp_sz = 0;
+    cub::DeviceScan::InclusiveSum(nullptr, tmp_sz, d_in, d_out, n);
+    cudaMalloc(&d_tmp, tmp_sz);
+    cub::DeviceScan::InclusiveSum(d_tmp, tmp_sz, d_in, d_out, n);
+    cudaFree(d_tmp);
+}
+
+/* Exclusive prefix sum: d_out_pos[i] = sum(d_in[0..i-1]).
+ * Used for scatter compaction: anchor j lands at position d_out_pos[j]. */
 static void cub_excl_sum(int32_t *d_in, int32_t *d_out, int n)
 {
     void   *d_tmp  = nullptr;
@@ -162,7 +181,15 @@ static void cub_excl_sum(int32_t *d_in, int32_t *d_out, int n)
     cudaFree(d_tmp);
 }
 
-/* Total count = prefix_sum[last] + flag[last]. */
+/* Read last element of array (= inclusive sum total). */
+static int32_t read_last(const int32_t *d_arr, int n)
+{
+    int32_t val;
+    cudaMemcpy(&val, d_arr + (n - 1), sizeof(int32_t), cudaMemcpyDeviceToHost);
+    return val;
+}
+
+/* Total from exclusive sum: d_prefix[last] + d_flag[last]. */
 static int32_t read_total(const int32_t *d_prefix, const int32_t *d_flag, int n)
 {
     int32_t last_prefix, last_flag;
@@ -280,7 +307,17 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
             }
             cudaFree(d_votes);
 
-            /* Step 3: segment-start flags → exclusive sum → seg IDs */
+            /* Step 3: segment-start flags → inclusive sum → seg IDs.
+             *
+             * We use an INCLUSIVE prefix sum of d_seg_start so that every
+             * bin in a segment gets the same value (the count of segment
+             * starts up to and including that bin).  The actual 0-based
+             * segment ID is (inclusive_sum - 1), applied in tag_mark_kernel.
+             *
+             * An exclusive sum would only give the correct ID to the FIRST
+             * bin of each segment; subsequent bins within the same segment
+             * would get (seg_id + 1), causing out-of-bounds atomicAdd in
+             * scatter_compact and corrupted per-segment anchor counts. */
             int32_t *d_seg_start, *d_seg_id;
             cudaMalloc(&d_seg_start, n_bins * sizeof(int32_t));
             cudaMalloc(&d_seg_id,    n_bins * sizeof(int32_t));
@@ -288,8 +325,9 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                 int grd = (n_bins + blk - 1) / blk;
                 seg_start_kernel<<<grd, blk>>>(d_keep_bin, d_seg_start, n_bins);
             }
-            cub_excl_sum(d_seg_start, d_seg_id, n_bins);
-            int32_t n_segs = read_total(d_seg_id, d_seg_start, n_bins);
+            cub_incl_sum(d_seg_start, d_seg_id, n_bins);
+            /* n_segs = last element of the inclusive sum = total segment starts */
+            int32_t n_segs = read_last(d_seg_id, n_bins);
             cudaFree(d_seg_start);
 
             if (n_segs == 0) {

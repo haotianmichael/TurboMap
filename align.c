@@ -1189,12 +1189,7 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         mm_adjust_minier(mi, qseq0, &a[as1], &rs, &qs);
         mm_adjust_minier(mi, qseq0, &a[as1 + cnt1 - 1], &re, &qe);
     }
-    if (cnt1 <= 0) {
-        fprintf(stderr, "[BUG] mm_align1_batched: cnt1=%d <= 0, "
-                "read=%d reg=%d rid=%d r->cnt=%d r->as=%d n_a=%d\n",
-                cnt1, read_idx, reg_idx, rid, r->cnt, r->as, n_a);
-        return;
-    }
+    if (cnt1 <= 0) return;
 
     if (is_splice) {
         if (opt->flag & MM_F_SPLICE_FOR) extra_flag |= rev? KSW_EZ_SPLICE_REV : KSW_EZ_SPLICE_FOR;
@@ -1296,34 +1291,14 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     // re > seq_len, and mm_idx_getseq reads past the chromosome → SIGSEGV.
     {
         int32_t seq_len_rid = (int32_t)mi->seq[rid].len;
-        if (re0 > seq_len_rid) {
-            fprintf(stderr, "[BUG] mm_align1_batched: re0=%d > seq_len=%d, clamping, "
-                    "read=%d reg=%d rid=%d\n",
-                    re0, seq_len_rid, read_idx, reg_idx, rid);
-            re0 = seq_len_rid;
-        }
-        if (qe0 > qlen) {
-            fprintf(stderr, "[BUG] mm_align1_batched: qe0=%d > qlen=%d, clamping, "
-                    "read=%d reg=%d rid=%d\n",
-                    qe0, qlen, read_idx, reg_idx, rid);
-            qe0 = qlen;
-        }
+        if (re0 > seq_len_rid) re0 = seq_len_rid;
+        if (qe0 > qlen) qe0 = qlen;
     }
 
-    if (re0 <= rs0) {
-        fprintf(stderr, "[BUG] mm_align1_batched: re0(%d) <= rs0(%d), "
-                "read=%d reg=%d rid=%d cnt1=%d as1=%d r->cnt=%d r->as=%d n_a=%d "
-                "rs=%d re=%d qs=%d qe=%d\n",
-                re0, rs0, read_idx, reg_idx, rid, cnt1, as1,
-                r->cnt, r->as, n_a, rs, re, qs, qe);
-        return;
-    }
+    if (re0 <= rs0) return;
     tseq = (uint8_t*)kmalloc(km, re0 - rs0);
     junc = (uint8_t*)kmalloc(km, re0 - rs0);
     if (tseq == NULL || junc == NULL) {
-        fprintf(stderr, "[BUG] mm_align1_batched: NULL tseq/junc after kmalloc(%d), "
-                "read=%d reg=%d rid=%d\n",
-                re0 - rs0, read_idx, reg_idx, rid);
         kfree(km, tseq);
         kfree(km, junc);
         return;
@@ -1344,13 +1319,6 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         if (rs  < 0 || rs  > seq_len) { bad = 1; }
         if (rs0 > rs)              { bad = 1; }
         if (bad) {
-            fprintf(stderr, "[BUG] mm_align1_batched: bad pre-ext coords: "
-                    "qs0=%d qs=%d qlen=%d rs0=%d rs=%d seq_len=%d "
-                    "re0=%d rs0=%d re=%d rs=%d "
-                    "read=%d reg=%d rid=%d cnt1=%d as1=%d\n",
-                    qs0, qs, qlen, rs0, rs, seq_len,
-                    re0, rs0, re, rs,
-                    read_idx, reg_idx, rid, cnt1, as1);
             kfree(km, tseq);
             kfree(km, junc);
             return;
@@ -1412,19 +1380,11 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
             // tseq buffer) or qe > qlen (overflows qseq0). Check before any
             // sequence operations.
             if (re <= rs || qe <= qs) {
-                // Anchor went backwards — bad voting anchor, skip this gap.
-                fprintf(stderr, "[BUG] mm_align1_batched: gap fill backward coords: "
-                        "qe=%d qs=%d re=%d rs=%d read=%d reg=%d i=%d/%d\n",
-                        qe, qs, re, rs, read_idx, reg_idx, i, cnt1);
                 if (re > rs) rs = re;
                 if (qe > qs) qs = qe;
                 continue;
             }
             if (re > re0 || qe > qlen) {
-                // Anchor exceeds buffer bounds — clamp to prevent overflow.
-                fprintf(stderr, "[BUG] mm_align1_batched: gap fill OOB: "
-                        "re=%d re0=%d qe=%d qlen=%d read=%d reg=%d i=%d/%d\n",
-                        re, re0, qe, qlen, read_idx, reg_idx, i, cnt1);
                 if (re > re0) re = re0;
                 if (qe > qlen) qe = qlen;
                 if (re <= rs || qe <= qs) {

@@ -403,35 +403,72 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
             cudaFree(d_by);
             cudaFree(d_seg_cnt);
 
-            /* Step 8: append to master b[] and build u[] entries.
+            /* Step 8: build b[] and u[] with query_pos monotonicity enforcement.
              *
-             * b[] is ordered by ref_pos (preserved from the original sorted
-             * a[]).  Segments are non-overlapping ref_pos ranges, so segment
-             * s's anchors appear as a contiguous block in h_bx/h_by before
-             * segment s+1's anchors.  This satisfies mm_gen_regs's assumption
-             * that u[i]'s anchors are contiguous in a[].
+             * Anchors within each segment are sorted by ref_pos but may have
+             * non-monotone query_pos values (e.g. paralogous seeds).  We scan
+             * each segment and classify every violation (q_pos[k] <= last kept
+             * q_pos) as either:
              *
-             * Score proxy = sum of per-anchor q_span (bits 32-39 of ay),
-             * matching what compact_a / mg_chain_backtrack use. */
+             *   Isolated  – violation at k but NOT at k+1 (next anchor is fine
+             *               relative to last kept q_pos): the single bad anchor
+             *               is silently discarded; the sub-chain continues.
+             *
+             *   Sustained – violation at k AND at k+1 (genuine direction
+             *               reversal): close the current sub-chain and open a
+             *               new one starting at anchor k.
+             *
+             * This avoids both the fragmentation of "cut at every violation"
+             * and the correctness problem of ignoring monotonicity entirely.
+             *
+             * ay layout (from lchain.c): flags<<40 | q_span<<32 | q_pos
+             *   → q_pos  = (int32_t)(ay)          [low 32 bits]
+             *   → q_span = (ay >> 32) & 0xff       [bits 32-39]
+             */
             int64_t anchor_off = 0;
             for (int32_t s = 0; s < n_segs; ++s) {
                 int32_t cnt = h_seg_cnt[s];
                 if (cnt == 0) continue;
 
-                uint64_t score = 0;
-                for (int32_t k = 0; k < cnt; ++k)
-                    score += (h_by[anchor_off + k] >> 32) & 0xffU;
+                int32_t  last_q  = INT32_MIN; /* q_pos of last kept anchor   */
+                uint64_t sub_sc  = 0;         /* score for current sub-chain */
+                int32_t  sub_cnt = 0;         /* anchors in current sub-chain */
 
-                u_buf[n_u++] = (score << 32) | (uint64_t)cnt;
-                anchor_off  += cnt;
-            }
+                for (int32_t k = 0; k < cnt; ++k) {
+                    int32_t  qp  = (int32_t)(h_by[anchor_off + k]);
+                    uint64_t qsp = (h_by[anchor_off + k] >> 32) & 0xffU;
 
-            /* Copy compacted anchors into the master b[] array. */
-            for (int64_t j = 0; j < n_b_chr; ++j) {
-                b[n_b + j].x = h_bx[j];
-                b[n_b + j].y = h_by[j];
+                    if (qp > last_q) {
+                        /* Monotone: keep anchor */
+                        b[n_b].x = h_bx[anchor_off + k];
+                        b[n_b].y = h_by[anchor_off + k];
+                        ++n_b; sub_sc += qsp; ++sub_cnt; last_q = qp;
+                    } else {
+                        /* Violation: check if sustained (next anchor also
+                         * violates relative to last kept q_pos) */
+                        int8_t sustained =
+                            (k + 1 < cnt) &&
+                            ((int32_t)(h_by[anchor_off + k + 1]) <= last_q);
+
+                        if (!sustained) {
+                            /* Isolated bad anchor – discard it silently */
+                        } else {
+                            /* Sustained reversal – close sub-chain, open new */
+                            if (sub_cnt > 0)
+                                u_buf[n_u++] = (sub_sc << 32) | (uint64_t)sub_cnt;
+                            b[n_b].x = h_bx[anchor_off + k];
+                            b[n_b].y = h_by[anchor_off + k];
+                            ++n_b; sub_sc = qsp; sub_cnt = 1; last_q = qp;
+                        }
+                    }
+                }
+
+                /* Flush last sub-chain of this segment */
+                if (sub_cnt > 0)
+                    u_buf[n_u++] = (sub_sc << 32) | (uint64_t)sub_cnt;
+
+                anchor_off += cnt;
             }
-            n_b += n_b_chr;
 
             free(h_bx);
             free(h_by);

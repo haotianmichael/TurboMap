@@ -401,17 +401,32 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             );
 
             // ===== Fused Persistent KSW Kernel (align + backtrack in one launch) =====
-            // n_concurrent_blocks slots process all batch_size tasks via atomic work stealing.
-            // Backtrack is done immediately after alignment within the same block,
-            // so the backtrack buffer is slot-indexed (reused across tasks).
+            // Clamp concurrent blocks per phase: backtrack_p is allocated as
+            //   short_task_batch_size × max_align_backtrack_size (short per-slot size).
+            // For long tasks current_max_backtrack_size >> short per-slot size, so far
+            // fewer slots fit. Cap to avoid out-of-bounds access.
             int parallel_threads = 32;   // one warp per block
             size_t parallel_smem = 3072; // 3072 bytes smem → 32 blocks/SM on V100
+
+            size_t bt_p_total_bytes = (size_t)dev_mem->short_task_batch_size *
+                                      dev_mem->max_align_backtrack_size;
+            size_t max_slots_this_phase = bt_p_total_bytes /
+                                          (size_t)current_max_backtrack_size;
+            int phase_concurrent_blocks = n_concurrent_blocks;
+            if ((size_t)phase_concurrent_blocks > max_slots_this_phase)
+                phase_concurrent_blocks = (int)max_slots_this_phase;
+            if (phase_concurrent_blocks > batch_size)
+                phase_concurrent_blocks = batch_size;
+            if (phase_concurrent_blocks < 1) phase_concurrent_blocks = 1;
+
+            // Also clamp temp_buffer: allocated for short_task_batch_size slots
+            // (safe for both phases since 7000 >> 2560 >> 128)
 
             // Reset atomic task counter to 0 before this batch
             int zero = 0;
             cudaMemcpy(d_task_counter, &zero, sizeof(int), cudaMemcpyHostToDevice);
 
-            ksw_fused_persistent_kernel<<<n_concurrent_blocks, parallel_threads,
+            ksw_fused_persistent_kernel<<<phase_concurrent_blocks, parallel_threads,
                                           parallel_smem>>>(
                 d_task_counter,
                 d_packed_query,

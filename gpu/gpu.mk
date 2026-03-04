@@ -49,6 +49,7 @@ else
 	GPU_FLAGS	= $(CUDAFLAGS)
 	GPU_ANALYZE = $(CUDANALYZEFLAG)
 	GPU_TESTFL	= $(CUDATESTFLAG)
+	LIBS		+= -lnvToolsExt
 endif
 
 ifeq ($(DEBUG),analyze)

@@ -2,6 +2,7 @@
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
+#include <nvToolsExt.h>
 
 
 #define CHECKCUDAERROR(error) \
@@ -126,6 +127,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     // - Short tasks (90% of workload): 10,000 tasks/batch × 1.5MB = ~15GB backtrack
     // - Long tasks (10% of workload): 200 tasks/batch × 75MB = ~14.3GB backtrack
 
+    nvtxRangePush("gpu_align_batch_execute:entry");
+
     int kernel_blocks = 28;
     size_t short_task_max_len = dev_mem->short_task_max_len;      // 1000bp
     size_t short_batch_size = dev_mem->short_task_batch_size;      // 10,000
@@ -133,6 +136,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     // Phase 1: Classify tasks by length
     // CRITICAL: Use max(qlen, tlen) NOT (qlen+tlen) to prevent buffer overflow
+    nvtxRangePush("classify_tasks");
     int *task_indices_short = (int*)malloc(n_tasks * sizeof(int));
     int *task_indices_long = (int*)malloc(n_tasks * sizeof(int));
     int n_short_tasks = 0;
@@ -146,6 +150,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             task_indices_long[n_long_tasks++] = i;
         }
     }
+    nvtxRangePop(); // classify_tasks
 
     int total_batches_short = (n_short_tasks + short_batch_size - 1) / short_batch_size;
     int total_batches_long = (n_long_tasks + long_batch_size - 1) / long_batch_size;
@@ -204,6 +209,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                              short_batch_persistent : long_batch_persistent;  // 120000
     // CIGAR host buffer covers the largest phase (short: 120000×2000×4=960MB)
     size_t cigar_buffer_size = max_batch_size * max_cigar_len;  // 240M uint32_t entries = 960MB
+    nvtxRangePush("host_buffer_alloc");
     uint32_t *h_cigar_buffer = (uint32_t*)calloc(cigar_buffer_size, sizeof(uint32_t));
     int *h_cigar_lengths = (int*)calloc(max_batch_size, sizeof(int));
     int32_t *h_scores = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
@@ -213,6 +219,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *h_mqe_t = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
     int32_t *h_mte = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
     int32_t *h_mte_q = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
+    nvtxRangePop(); // host_buffer_alloc
 
     // Host arrays for batch preparation (sized for LARGEST batch)
     uint32_t *h_query_offsets = (uint32_t*)calloc(max_batch_size, sizeof(uint32_t));
@@ -312,6 +319,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             size_t total_query_bytes = 0, total_target_bytes = 0;
             uint32_t max_query_len = 0;
 
+            nvtxRangePush("batch_seq_prep_offsets");
             // Calculate offsets and prepare sequences for this batch
             for (int i = 0; i < batch_size; i++) {
                 int task_idx = current_task_indices[batch_start + i];
@@ -349,6 +357,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 h_task_to_align_id[i] = i;
             }
 
+            nvtxRangePop(); // batch_seq_prep_offsets
+
+            nvtxRangePush("batch_seq_alloc_and_copy");
             // Prepare unpacked sequences for this batch
             uint8_t *h_unpacked_query = (uint8_t*)calloc(total_query_bytes, 1);
             uint8_t *h_unpacked_target = (uint8_t*)calloc(total_target_bytes, 1);
@@ -373,6 +384,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
             }
 
+            nvtxRangePop(); // batch_seq_alloc_and_copy
+
+            nvtxRangePush("H2D_seq_upload");
             // Copy batch data to GPU
             cudaMemcpy(d_unpacked_query, h_unpacked_query,
                        total_query_bytes, cudaMemcpyHostToDevice);
@@ -389,6 +403,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemcpy(d_flag, h_flag,
                        batch_size * sizeof(int32_t), cudaMemcpyHostToDevice);
 
+
+            nvtxRangePop(); // H2D_seq_upload
 
             // Launch packing kernel
             int query_tasks_per_thread = (int)ceil((double)total_query_bytes /
@@ -407,6 +423,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 total_target_bytes / 4
             );
 
+            nvtxRangePush("counter_reset_and_kernel_launch");
             // ===== Fused Persistent KSW Kernel (align + backtrack in one launch) =====
             // Clamp concurrent blocks per phase: backtrack_p is allocated as
             //   short_task_batch_size × max_align_backtrack_size (short per-slot size).
@@ -466,13 +483,18 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel launch failed: %s\n",
                         cudaGetErrorString(kernel_err));
             }
+            nvtxRangePop(); // counter_reset_and_kernel_launch
+
+            nvtxRangePush("kernel_sync");
             cudaDeviceSynchronize();
+            nvtxRangePop(); // kernel_sync
             kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel execution failed: %s\n",
                         cudaGetErrorString(kernel_err));
             }
 
+            nvtxRangePush("D2H_cigar_and_results");
             if (cigar_buffer) {
                 cudaMemcpy(h_cigar_buffer,
                            d_cigar_buffer,
@@ -514,10 +536,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                        batch_size * sizeof(int32_t),
                        cudaMemcpyDeviceToHost);
 
+            nvtxRangePop(); // D2H_cigar_and_results
+
             // Wait for completion
             cudaDeviceSynchronize();
             cudaCheck();
 
+            nvtxRangePush("cpu_result_mapping");
             // Map results back to tasks
             for (int i = 0; i < batch_size; i++) {
                 int task_idx = current_task_indices[batch_start + i];  // Use task index from current phase
@@ -567,6 +592,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
                 tasks[task_idx].zdropped = 0;
             }
+
+            nvtxRangePop(); // cpu_result_mapping
 
             // Cleanup batch buffers
             free(h_unpacked_query);
@@ -623,4 +650,5 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     free(h_mqe_t);
     free(h_mte);
     free(h_mte_q);
+    nvtxRangePop(); // gpu_align_batch_execute:entry
 }

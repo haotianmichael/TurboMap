@@ -2,8 +2,8 @@
  * plvoting.cu  --  GPU-accelerated location-voting re-chaining (batch)
  *
  * Replaces mg_lchain_rmq with GPU voting.  ALL (read, chr-group) pairs
- * across the entire rechain batch are processed in a single GPU pipeline
- * pass with only two H↔D synchronisation points.
+ * across the entire rechain batch are processed in one or more GPU mini-
+ * batch passes, each capped at MEM_BUDGET_BYTES of GPU memory.
  *
  * Algorithm per (read, chr-group) – now executed in one fused batch:
  *   1. [GPU] voting_bin_kernel_batched   – histogram anchor ref_pos into bins
@@ -14,13 +14,13 @@
  *   6. [GPU] seg_excl_sum_kernel         – output positions; record n_compact/group
  *   7. [GPU] scatter_compact_kernel_batched
  *                                        – compact anchors, count per-seg
- *   8. [CPU] single D2H download: bx/by, n_segs[], n_compact[], seg_cnt[]
+ *   8. [CPU] D2H download per mini-batch into pre-allocated full-batch host bufs
  *   9. [CPU] build per-read b[]/u[] with q_pos monotonicity enforcement
  *
- * No CUB / DeviceSegmentedScan dependency – segmented prefix sums are
- * implemented as simple sequential per-group kernels (one GPU thread per
- * group).  This is fast in practice because n_bins per group is small
- * (~50-200) and the kernel is I/O bound, not compute bound.
+ * n_bins per group is capped at the group's anchor count (a_n) to avoid
+ * enormous bin arrays for sparse groups.  When the cap applies, the bin
+ * size is scaled up so every anchor still maps into [0, n_bins) -- no
+ * anchor is ever cut off.
  *
  * OUTPUT: rd->a = filtered anchor array b[]
  *         rd->u = chain descriptors u[]
@@ -38,6 +38,9 @@
 #include "kalloc.h"
 #include "hipify.cuh"
 #include "plvoting.cuh"
+
+/* 8 GB GPU memory budget per mini-batch for voting arrays */
+#define MEM_BUDGET_BYTES (8ULL << 30)
 
 /* =========================================================================
  * Device helpers
@@ -67,14 +70,15 @@ __device__ static inline int find_group(const int32_t *d_off, int n_groups,
  * Step 1: voting histogram for all groups.
  *
  * tid indexes into the flat anchor array [0, total_anchors).
- * Group membership is found via binary search on d_anchor_off[0..n_groups].
+ * Each group uses its own per-group bin size (d_bin_size[g]) so that
+ * no anchor falls outside [0, n_bins_g).
  */
 __global__ void voting_bin_kernel_batched(
         const uint64_t *d_ax,
         const int32_t  *d_anchor_off,  /* [n_groups+1] */
         const int32_t  *d_bin_off,     /* [n_groups+1] */
         const int32_t  *d_ref_min,     /* [n_groups]   */
-        int32_t         bin_size,
+        const int32_t  *d_bin_size,    /* [n_groups]   per-group bin size */
         int32_t        *d_votes,       /* flat [total_bins], zeroed by caller */
         int             n_groups,
         int             total_anchors)
@@ -86,7 +90,8 @@ __global__ void voting_bin_kernel_batched(
     int32_t bin_off = d_bin_off[g];
     int32_t n_bins  = d_bin_off[g + 1] - bin_off;
     int32_t ref_pos = (int32_t)d_ax[tid];
-    int32_t bin     = (ref_pos - d_ref_min[g]) / bin_size;
+    int32_t bsz     = d_bin_size[g];
+    int32_t bin     = (ref_pos - d_ref_min[g]) / bsz;
     if (bin >= 0 && bin < n_bins)
         atomicAdd(&d_votes[bin_off + bin], 1);
 }
@@ -177,7 +182,7 @@ __global__ void tag_mark_kernel_batched(
         const int32_t  *d_anchor_off,  /* [n_groups+1] */
         const int32_t  *d_bin_off,     /* [n_groups+1] */
         const int32_t  *d_ref_min,     /* [n_groups]   */
-        int32_t         bin_size,
+        const int32_t  *d_bin_size,    /* [n_groups]   per-group bin size */
         const int8_t   *d_keep_bin,
         const int32_t  *d_seg_id,      /* inclusive prefix sum of seg_start */
         int32_t        *d_mark,
@@ -192,7 +197,8 @@ __global__ void tag_mark_kernel_batched(
     int32_t bin_off = d_bin_off[g];
     int32_t n_bins  = d_bin_off[g + 1] - bin_off;
     int32_t ref_pos = (int32_t)d_ax[tid];
-    int32_t bin     = (ref_pos - d_ref_min[g]) / bin_size;
+    int32_t bsz     = d_bin_size[g];
+    int32_t bin     = (ref_pos - d_ref_min[g]) / bsz;
 
     if (bin < 0 || bin >= n_bins || d_keep_bin[bin_off + bin] == 0) {
         d_mark[tid]       = 0;
@@ -232,12 +238,6 @@ __global__ void seg_excl_sum_kernel(
 
 /*
  * Step 7: scatter-compact for all groups.
- *
- * Group g's compacted anchors land at d_bx[anchor_off[g] + d_out_pos[tid]]
- * (worst-case output partitioning: each group has its own slice of d_bx/d_by).
- *
- * Per-segment anchor counts go to d_seg_cnt_flat[bin_off[g] + seg_id]
- * (at most n_bins_g segments per group, so bin_off fits).
  */
 __global__ void scatter_compact_kernel_batched(
         const uint64_t *d_ax,
@@ -266,6 +266,168 @@ __global__ void scatter_compact_kernel_batched(
 }
 
 /* =========================================================================
+ * run_voting_minibatch – executes steps 1-7 for one mini-batch, then D2H
+ * =========================================================================
+ *
+ * mb_n            : number of groups in this mini-batch
+ * mb_total_anchors: total anchors across mini-batch groups
+ * mb_total_bins   : total bins across mini-batch groups (after cap)
+ * mb_h_ax/ay      : packed host anchor arrays for this mini-batch
+ * mb_bin_off[]    : local bin offsets  [mb_n+1], starting from 0
+ * mb_anchor_off[] : local anchor offsets [mb_n+1], starting from 0
+ * mb_ref_min[]    : per-group ref_min [mb_n]
+ * mb_bin_size_h[] : per-group effective bin size [mb_n]
+ *
+ * Results written into caller's full-batch host buffers at base offsets:
+ *   h_bx/by        + base_anchor
+ *   h_nsegs/ncompact + mb_g   (group index in the global vg[] array)
+ *   h_seg_cnt_flat  + base_bin
+ */
+static void run_voting_minibatch(
+        int             mb_n,
+        int32_t         mb_total_anchors,
+        int32_t         mb_total_bins,
+        const uint64_t *mb_h_ax,
+        const uint64_t *mb_h_ay,
+        const int32_t  *mb_bin_off,
+        const int32_t  *mb_anchor_off,
+        const int32_t  *mb_ref_min,
+        const int32_t  *mb_bin_size_h,
+        int32_t         min_votes,
+        int32_t         merge_gap_bins,
+        /* output slices */
+        uint64_t       *h_bx_base,
+        uint64_t       *h_by_base,
+        int32_t        *h_nsegs_base,
+        int32_t        *h_ncompact_base,
+        int32_t        *h_seg_cnt_flat_base)
+{
+    const int blk = 256;
+
+    /* ---- upload anchors + metadata ---- */
+    uint64_t *d_ax, *d_ay;
+    int32_t  *d_bin_off_d, *d_anchor_off_d, *d_ref_min_d, *d_bin_size_d;
+
+    cudaMalloc(&d_ax,           (size_t)mb_total_anchors * sizeof(uint64_t));
+    cudaMalloc(&d_ay,           (size_t)mb_total_anchors * sizeof(uint64_t));
+    cudaMalloc(&d_bin_off_d,    (size_t)(mb_n + 1)       * sizeof(int32_t));
+    cudaMalloc(&d_anchor_off_d, (size_t)(mb_n + 1)       * sizeof(int32_t));
+    cudaMalloc(&d_ref_min_d,    (size_t)mb_n             * sizeof(int32_t));
+    cudaMalloc(&d_bin_size_d,   (size_t)mb_n             * sizeof(int32_t));
+
+    cudaMemcpy(d_ax,           mb_h_ax,         (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ay,           mb_h_ay,         (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bin_off_d,    mb_bin_off,      (size_t)(mb_n + 1)       * sizeof(int32_t),  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_anchor_off_d, mb_anchor_off,   (size_t)(mb_n + 1)       * sizeof(int32_t),  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ref_min_d,    mb_ref_min,      (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice);
+    cudaMemcpy(d_bin_size_d,   mb_bin_size_h,   (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice);
+
+    /* ---- bin-level arrays ---- */
+    int32_t *d_votes, *d_seg_start, *d_seg_id;
+    int8_t  *d_keep_bin;
+    cudaMalloc(&d_votes,     (size_t)mb_total_bins * sizeof(int32_t));
+    cudaMalloc(&d_keep_bin,  (size_t)mb_total_bins * sizeof(int8_t));
+    cudaMalloc(&d_seg_start, (size_t)mb_total_bins * sizeof(int32_t));
+    cudaMalloc(&d_seg_id,    (size_t)mb_total_bins * sizeof(int32_t));
+    cudaMemset(d_votes, 0,   (size_t)mb_total_bins * sizeof(int32_t));
+
+    /* ---- per-group scalars ---- */
+    int32_t *d_nsegs_d, *d_ncompact_d;
+    cudaMalloc(&d_nsegs_d,    (size_t)mb_n * sizeof(int32_t));
+    cudaMalloc(&d_ncompact_d, (size_t)mb_n * sizeof(int32_t));
+
+    /* ---- anchor-level arrays ---- */
+    int32_t *d_mark, *d_anchor_seg, *d_out_pos;
+    cudaMalloc(&d_mark,       (size_t)mb_total_anchors * sizeof(int32_t));
+    cudaMalloc(&d_anchor_seg, (size_t)mb_total_anchors * sizeof(int32_t));
+    cudaMalloc(&d_out_pos,    (size_t)mb_total_anchors * sizeof(int32_t));
+
+    /* ---- output arrays ---- */
+    uint64_t *d_bx, *d_by;
+    int32_t  *d_seg_cnt_flat_d;
+    cudaMalloc(&d_bx,              (size_t)mb_total_anchors * sizeof(uint64_t));
+    cudaMalloc(&d_by,              (size_t)mb_total_anchors * sizeof(uint64_t));
+    cudaMalloc(&d_seg_cnt_flat_d,  (size_t)mb_total_bins    * sizeof(int32_t));
+    cudaMemset(d_seg_cnt_flat_d, 0,(size_t)mb_total_bins    * sizeof(int32_t));
+
+    /* ---- step 1: voting histogram ---- */
+    {
+        int grd = (mb_total_anchors + blk - 1) / blk;
+        voting_bin_kernel_batched<<<grd, blk>>>(
+            d_ax, d_anchor_off_d, d_bin_off_d, d_ref_min_d, d_bin_size_d,
+            d_votes, mb_n, mb_total_anchors);
+    }
+
+    /* ---- step 2: mark + dilate ---- */
+    {
+        int grd = (mb_total_bins + blk - 1) / blk;
+        mark_dilate_kernel_batched<<<grd, blk>>>(
+            d_votes, d_keep_bin, d_bin_off_d,
+            min_votes, merge_gap_bins, mb_n, mb_total_bins);
+    }
+    cudaFree(d_votes);
+
+    /* ---- step 3: segment-start flags ---- */
+    {
+        int grd = (mb_total_bins + blk - 1) / blk;
+        seg_start_kernel_batched<<<grd, blk>>>(
+            d_keep_bin, d_seg_start, d_bin_off_d, mb_n, mb_total_bins);
+    }
+
+    /* ---- step 4: segmented inclusive prefix sum → seg IDs + n_segs ---- */
+    {
+        int grd = (mb_n + blk - 1) / blk;
+        seg_incl_sum_kernel<<<grd, blk>>>(
+            d_seg_start, d_seg_id, d_bin_off_d, d_nsegs_d, mb_n);
+    }
+    cudaFree(d_seg_start);
+
+    /* ---- step 5: tag anchors (mark + segment ID) ---- */
+    {
+        int grd = (mb_total_anchors + blk - 1) / blk;
+        tag_mark_kernel_batched<<<grd, blk>>>(
+            d_ax, d_anchor_off_d, d_bin_off_d, d_ref_min_d, d_bin_size_d,
+            d_keep_bin, d_seg_id,
+            d_mark, d_anchor_seg, mb_n, mb_total_anchors);
+    }
+    cudaFree(d_keep_bin);
+    cudaFree(d_seg_id);
+
+    /* ---- step 6: segmented exclusive prefix sum → output positions + n_compact ---- */
+    {
+        int grd = (mb_n + blk - 1) / blk;
+        seg_excl_sum_kernel<<<grd, blk>>>(
+            d_mark, d_out_pos, d_anchor_off_d, d_ncompact_d, mb_n);
+    }
+
+    /* ---- step 7: scatter compact ---- */
+    {
+        int grd = (mb_total_anchors + blk - 1) / blk;
+        scatter_compact_kernel_batched<<<grd, blk>>>(
+            d_ax, d_ay,
+            d_mark, d_out_pos, d_anchor_seg,
+            d_anchor_off_d, d_bin_off_d,
+            d_bx, d_by, d_seg_cnt_flat_d,
+            mb_n, mb_total_anchors);
+    }
+    cudaFree(d_ax);  cudaFree(d_ay);
+    cudaFree(d_mark); cudaFree(d_out_pos); cudaFree(d_anchor_seg);
+    cudaFree(d_bin_off_d); cudaFree(d_anchor_off_d);
+    cudaFree(d_ref_min_d); cudaFree(d_bin_size_d);
+
+    /* ---- D2H download into caller's full-batch host arrays ---- */
+    cudaMemcpy(h_bx_base,            d_bx,           (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_by_base,            d_by,           (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_nsegs_base,         d_nsegs_d,      (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ncompact_base,      d_ncompact_d,   (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_seg_cnt_flat_base,  d_seg_cnt_flat_d,(size_t)mb_total_bins   * sizeof(int32_t),  cudaMemcpyDeviceToHost);
+
+    cudaFree(d_bx); cudaFree(d_by);
+    cudaFree(d_nsegs_d); cudaFree(d_ncompact_d);
+    cudaFree(d_seg_cnt_flat_d);
+}
+
+/* =========================================================================
  * Main exported function
  * ========================================================================= */
 
@@ -273,12 +435,6 @@ extern "C" {
 
 /*
  * plvoting_rechain_batch
- *
- * For each read in rechain_indices:
- *   1. Sorts anchors by ref_pos (via prepare_rechain_anchors).
- *   2. Runs the GPU voting pipeline (all reads/groups in one pass).
- *   3. Compacts winning anchors into b[] and builds u[] chain descriptors.
- *   4. Stores b[]/u[] in rd->a/rd->u for downstream GPU KSW alignment.
  */
 void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                             chain_read_t *reads, int *rechain_indices,
@@ -294,18 +450,18 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                                    ? (max_dist / VOTING_BIN_DIVIDER) : 1;
     const int32_t min_votes      = (opt->min_cnt > 1) ? opt->min_cnt : 2;
     const int32_t merge_gap_bins = (VOTING_LARGE_GAP + bin_size - 1) / bin_size;
-    const int     blk            = 256;
 
     /* ====================================================================
      * Phase 1: enumerate all (read, chr-group) pairs → vg[] descriptors
      * ==================================================================== */
 
     struct VgDesc {
-        int     ri;       /* index into rechain_indices            */
-        int32_t a_start;  /* first anchor of this group in rd->a  */
-        int32_t a_n;      /* number of anchors                     */
-        int32_t ref_min;  /* smallest ref_pos in this group        */
-        int32_t n_bins;   /* voting bin count                      */
+        int     ri;           /* index into rechain_indices            */
+        int32_t a_start;      /* first anchor of this group in rd->a  */
+        int32_t a_n;          /* number of anchors                     */
+        int32_t ref_min;      /* smallest ref_pos in this group        */
+        int32_t n_bins;       /* voting bin count (capped at a_n)      */
+        int32_t eff_bin_size; /* effective bin size (>= bin_size)      */
     };
 
     int       vg_cap = 64, n_vg = 0;
@@ -324,20 +480,46 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
             while (chr_end < n_a && (int32_t)(a[chr_end].x >> 32) == xrev)
                 ++chr_end;
 
-            int32_t ref_min  = (int32_t)a[chr_start].x;
-            int32_t ref_max  = (int32_t)a[chr_end - 1].x;
+            int32_t a_n     = (int32_t)(chr_end - chr_start);
+            int32_t ref_min = (int32_t)a[chr_start].x;
+            int32_t ref_max = (int32_t)a[chr_end - 1].x;
+            /* ref_span as used in original n_bins formula (+1 so ref_max maps
+             * to bin <= n_bins-1 under integer division)                      */
             int32_t ref_span = ref_max - ref_min + 1;
-            int32_t n_bins   = (ref_span + bin_size - 1) / bin_size + 1;
+
+            /* Compute n_bins and eff_bin_size.
+             *
+             * Principle: n_bins = min(original_n_bins, a_n) with eff_bin_size
+             * scaled up when we apply the cap so that every anchor still maps
+             * into [0, n_bins).  No anchor is ever cut off.
+             *
+             * When capping: eff_bin_size = floor((ref_span-1)/a_n) + 1
+             * guarantees (ref_max - ref_min) / eff_bin_size < a_n.
+             */
+            int32_t n_bins_g, bsz_g;
+            if (a_n <= 1) {
+                n_bins_g = 1;
+                bsz_g    = bin_size;
+            } else {
+                n_bins_g = (ref_span + bin_size - 1) / bin_size + 1;
+                if (n_bins_g > a_n) {
+                    n_bins_g = a_n;
+                    bsz_g    = (ref_span - 1) / a_n + 1;
+                } else {
+                    bsz_g = bin_size;
+                }
+            }
 
             if (n_vg == vg_cap) {
                 vg_cap *= 2;
                 vg      = (VgDesc *)realloc(vg, vg_cap * sizeof(VgDesc));
             }
-            vg[n_vg].ri      = ri;
-            vg[n_vg].a_start = (int32_t)chr_start;
-            vg[n_vg].a_n     = (int32_t)(chr_end - chr_start);
-            vg[n_vg].ref_min = ref_min;
-            vg[n_vg].n_bins  = n_bins;
+            vg[n_vg].ri           = ri;
+            vg[n_vg].a_start      = (int32_t)chr_start;
+            vg[n_vg].a_n          = a_n;
+            vg[n_vg].ref_min      = ref_min;
+            vg[n_vg].n_bins       = n_bins_g;
+            vg[n_vg].eff_bin_size = bsz_g;
             ++n_vg;
 
             chr_start = chr_end;
@@ -352,222 +534,109 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
     int32_t *bin_off    = (int32_t *)malloc((n_vg + 1) * sizeof(int32_t));
     int32_t *anchor_off = (int32_t *)malloc((n_vg + 1) * sizeof(int32_t));
-    int32_t *ref_min_h  = (int32_t *)malloc(n_vg       * sizeof(int32_t));
 
     bin_off[0] = anchor_off[0] = 0;
     for (int g = 0; g < n_vg; ++g) {
         bin_off[g + 1]    = bin_off[g]    + vg[g].n_bins;
         anchor_off[g + 1] = anchor_off[g] + vg[g].a_n;
-        ref_min_h[g]      = vg[g].ref_min;
     }
-    int total_bins    = bin_off[n_vg];
-    int total_anchors = anchor_off[n_vg];
+    int32_t total_bins    = bin_off[n_vg];
+    int32_t total_anchors = anchor_off[n_vg];
 
     /* ====================================================================
-     * Phase 3: pack all anchors into flat host arrays, then H→D upload
+     * Phase 3: pre-allocate full-batch host output buffers
      * ==================================================================== */
 
-    uint64_t *h_ax = (uint64_t *)malloc(total_anchors * sizeof(uint64_t));
-    uint64_t *h_ay = (uint64_t *)malloc(total_anchors * sizeof(uint64_t));
-    for (int g = 0; g < n_vg; ++g) {
-        chain_read_t *rd = &reads[rechain_indices[vg[g].ri]];
-        mm128_t      *a  = rd->a + vg[g].a_start;
-        int           off = anchor_off[g];
-        for (int j = 0; j < vg[g].a_n; ++j) {
-            h_ax[off + j] = a[j].x;
-            h_ay[off + j] = a[j].y;
+    uint64_t *h_bx           = (uint64_t *)malloc((size_t)total_anchors * sizeof(uint64_t));
+    uint64_t *h_by           = (uint64_t *)malloc((size_t)total_anchors * sizeof(uint64_t));
+    int32_t  *h_nsegs        = (int32_t  *)malloc((size_t)n_vg          * sizeof(int32_t));
+    int32_t  *h_ncompact     = (int32_t  *)malloc((size_t)n_vg          * sizeof(int32_t));
+    int32_t  *h_seg_cnt_flat = (int32_t  *)malloc((size_t)total_bins    * sizeof(int32_t));
+
+    /* ====================================================================
+     * Phase 4: mini-batch GPU pipeline
+     *
+     * Groups are processed in slices; each slice's peak GPU memory usage
+     * is bounded by MEM_BUDGET_BYTES.
+     *
+     * Peak cost per mini-batch (bytes):
+     *   anchors : mb_total_anchors * (8+8 upload + 4+4+4 work + 8+8 output) = * 44
+     *   bins    : mb_total_bins    * (4+1+4+4 work + 4 seg_cnt)             = * 17
+     * ==================================================================== */
+
+    int mb_g = 0;
+    while (mb_g < n_vg) {
+
+        /* determine mini-batch end */
+        int     mb_end = mb_g;
+        int64_t mb_na  = 0, mb_nb = 0;
+        while (mb_end < n_vg) {
+            int64_t na   = vg[mb_end].a_n;
+            int64_t nb   = vg[mb_end].n_bins;
+            size_t  cost = (size_t)(mb_na + na) * 44 +
+                           (size_t)(mb_nb + nb) * 17;
+            if (cost > MEM_BUDGET_BYTES && mb_end > mb_g) break;
+            mb_na += na;
+            mb_nb += nb;
+            ++mb_end;
         }
+
+        int     mb_n              = mb_end - mb_g;
+        int32_t mb_total_anchors  = (int32_t)mb_na;
+        int32_t mb_total_bins     = (int32_t)mb_nb;
+        int32_t base_anchor       = anchor_off[mb_g];
+        int32_t base_bin          = bin_off[mb_g];
+
+        /* build local (0-based) offset arrays for this mini-batch */
+        int32_t *mb_bin_off    = (int32_t *)malloc((size_t)(mb_n + 1) * sizeof(int32_t));
+        int32_t *mb_anchor_off = (int32_t *)malloc((size_t)(mb_n + 1) * sizeof(int32_t));
+        int32_t *mb_ref_min    = (int32_t *)malloc((size_t)mb_n       * sizeof(int32_t));
+        int32_t *mb_bin_size_h = (int32_t *)malloc((size_t)mb_n       * sizeof(int32_t));
+
+        mb_bin_off[0] = mb_anchor_off[0] = 0;
+        for (int i = 0; i < mb_n; ++i) {
+            int g = mb_g + i;
+            mb_bin_off[i + 1]    = mb_bin_off[i]    + vg[g].n_bins;
+            mb_anchor_off[i + 1] = mb_anchor_off[i] + vg[g].a_n;
+            mb_ref_min[i]        = vg[g].ref_min;
+            mb_bin_size_h[i]     = vg[g].eff_bin_size;
+        }
+
+        /* pack mini-batch anchors into flat host arrays */
+        uint64_t *mb_h_ax = (uint64_t *)malloc((size_t)mb_total_anchors * sizeof(uint64_t));
+        uint64_t *mb_h_ay = (uint64_t *)malloc((size_t)mb_total_anchors * sizeof(uint64_t));
+        for (int i = 0; i < mb_n; ++i) {
+            int           g   = mb_g + i;
+            chain_read_t *rd  = &reads[rechain_indices[vg[g].ri]];
+            mm128_t      *a   = rd->a + vg[g].a_start;
+            int           off = mb_anchor_off[i];
+            for (int j = 0; j < vg[g].a_n; ++j) {
+                mb_h_ax[off + j] = a[j].x;
+                mb_h_ay[off + j] = a[j].y;
+            }
+        }
+
+        /* run GPU pipeline and write results into global host buffers */
+        run_voting_minibatch(
+            mb_n, mb_total_anchors, mb_total_bins,
+            mb_h_ax, mb_h_ay,
+            mb_bin_off, mb_anchor_off, mb_ref_min, mb_bin_size_h,
+            min_votes, merge_gap_bins,
+            h_bx           + base_anchor,
+            h_by           + base_anchor,
+            h_nsegs        + mb_g,
+            h_ncompact     + mb_g,
+            h_seg_cnt_flat + base_bin);
+
+        free(mb_h_ax); free(mb_h_ay);
+        free(mb_bin_off); free(mb_anchor_off);
+        free(mb_ref_min); free(mb_bin_size_h);
+
+        mb_g = mb_end;
     }
-
-    uint64_t *d_ax, *d_ay;
-    cudaMalloc(&d_ax, total_anchors * sizeof(uint64_t));
-    cudaMalloc(&d_ay, total_anchors * sizeof(uint64_t));
-    cudaMemcpy(d_ax, h_ax, total_anchors * sizeof(uint64_t),
-               cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ay, h_ay, total_anchors * sizeof(uint64_t),
-               cudaMemcpyHostToDevice);
-    free(h_ax);
-    free(h_ay);
-
-    /* Upload per-group metadata */
-    int32_t *d_bin_off, *d_anchor_off_d, *d_ref_min;
-    cudaMalloc(&d_bin_off,      (n_vg + 1) * sizeof(int32_t));
-    cudaMalloc(&d_anchor_off_d, (n_vg + 1) * sizeof(int32_t));
-    cudaMalloc(&d_ref_min,       n_vg      * sizeof(int32_t));
-    cudaMemcpy(d_bin_off,      bin_off,    (n_vg + 1) * sizeof(int32_t),
-               cudaMemcpyHostToDevice);
-    cudaMemcpy(d_anchor_off_d, anchor_off, (n_vg + 1) * sizeof(int32_t),
-               cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ref_min,      ref_min_h,   n_vg      * sizeof(int32_t),
-               cudaMemcpyHostToDevice);
-    free(ref_min_h);
 
     /* ====================================================================
-     * Phase 4: full GPU pipeline – zero intermediate D→H syncs
-     * ==================================================================== */
-
-#define VOTING_DBG_ALLOC(ptr, sz, label) do { \
-    size_t _free = 0, _total = 0; \
-    cudaMemGetInfo(&_free, &_total); \
-    fprintf(stderr, "[VOTING-DBG] PRE  %-20s  size=%10zu B (%6.1f MB)  gpu_free=%zu MB / %zu MB\n", \
-            (label), (size_t)(sz), (sz)/1048576.0, _free>>20, _total>>20); \
-    fflush(stderr); \
-    cudaError_t _e = cudaMalloc(&(ptr), (sz)); \
-    size_t _free2 = 0, _total2 = 0; \
-    cudaMemGetInfo(&_free2, &_total2); \
-    fprintf(stderr, "[VOTING-DBG] POST %-20s  ptr=%p  err=%s  gpu_free=%zu MB\n", \
-            (label), (void*)(ptr), cudaGetErrorString(_e), _free2>>20); \
-    fflush(stderr); \
-} while(0)
-
-    fprintf(stderr, "[VOTING-DBG] === plvoting_rechain_batch entry ===\n");
-    fprintf(stderr, "[VOTING-DBG] n_vg=%d  total_anchors=%d  total_bins=%d\n",
-            n_vg, total_anchors, total_bins);
-    fprintf(stderr, "[VOTING-DBG] size breakdown (MB):\n");
-    fprintf(stderr, "[VOTING-DBG]   d_ax/d_ay already allocated: 2 x %zu = %.1f MB\n",
-            (size_t)total_anchors * 8, total_anchors * 8 * 2 / 1048576.0);
-    fprintf(stderr, "[VOTING-DBG]   d_votes+keep+seg_start+seg_id (bins): 4 x %zu = %.1f MB\n",
-            (size_t)total_bins * 4, total_bins * 4 * 4 / 1048576.0);
-    fprintf(stderr, "[VOTING-DBG]   d_mark+anchor_seg+out_pos (anchors): 3 x %zu = %.1f MB\n",
-            (size_t)total_anchors * 4, total_anchors * 4 * 3 / 1048576.0);
-    fprintf(stderr, "[VOTING-DBG]   d_bx/d_by (anchors, worst-case output): 2 x %zu = %.1f MB\n",
-            (size_t)total_anchors * 8, total_anchors * 8 * 2 / 1048576.0);
-    fprintf(stderr, "[VOTING-DBG]   d_seg_cnt_flat (bins): %zu = %.1f MB\n",
-            (size_t)total_bins * 4, total_bins * 4 / 1048576.0);
-    fflush(stderr);
-
-    /* -- Bin-level arrays -- */
-    int32_t *d_votes, *d_seg_start, *d_seg_id;
-    int8_t  *d_keep_bin;
-    VOTING_DBG_ALLOC(d_votes,     (size_t)total_bins * sizeof(int32_t), "d_votes");
-    VOTING_DBG_ALLOC(d_keep_bin,  (size_t)total_bins * sizeof(int8_t),  "d_keep_bin");
-    VOTING_DBG_ALLOC(d_seg_start, (size_t)total_bins * sizeof(int32_t), "d_seg_start");
-    VOTING_DBG_ALLOC(d_seg_id,    (size_t)total_bins * sizeof(int32_t), "d_seg_id");
-    cudaMemset(d_votes, 0, (size_t)total_bins * sizeof(int32_t));
-
-    /* -- Per-group result scalars -- */
-    int32_t *d_nsegs, *d_ncompact;
-    VOTING_DBG_ALLOC(d_nsegs,    (size_t)n_vg * sizeof(int32_t), "d_nsegs");
-    VOTING_DBG_ALLOC(d_ncompact, (size_t)n_vg * sizeof(int32_t), "d_ncompact");
-
-    /* -- Anchor-level arrays -- */
-    int32_t *d_mark, *d_anchor_seg, *d_out_pos;
-    VOTING_DBG_ALLOC(d_mark,       (size_t)total_anchors * sizeof(int32_t), "d_mark");
-    VOTING_DBG_ALLOC(d_anchor_seg, (size_t)total_anchors * sizeof(int32_t), "d_anchor_seg");
-    VOTING_DBG_ALLOC(d_out_pos,    (size_t)total_anchors * sizeof(int32_t), "d_out_pos");
-
-    /* -- Output: worst-case (all anchors kept per group, partition by group) -- */
-    uint64_t *d_bx, *d_by;
-    int32_t  *d_seg_cnt_flat;
-    VOTING_DBG_ALLOC(d_bx,           (size_t)total_anchors * sizeof(uint64_t), "d_bx");
-    VOTING_DBG_ALLOC(d_by,           (size_t)total_anchors * sizeof(uint64_t), "d_by");
-    /* seg_cnt_flat: group g uses [bin_off[g], bin_off[g]+n_segs_g), fits in total_bins */
-    VOTING_DBG_ALLOC(d_seg_cnt_flat, (size_t)total_bins * sizeof(int32_t), "d_seg_cnt_flat");
-    cudaMemset(d_seg_cnt_flat, 0, (size_t)total_bins * sizeof(int32_t));
-
-    {
-        size_t _free = 0, _total = 0;
-        cudaMemGetInfo(&_free, &_total);
-        fprintf(stderr, "[VOTING-DBG] === All allocs done, launching kernels. gpu_free=%zu MB / %zu MB ===\n",
-                _free>>20, _total>>20);
-        fprintf(stderr, "[VOTING-DBG] ptr check: d_votes=%p d_keep_bin=%p d_mark=%p d_bx=%p d_by=%p\n",
-                (void*)d_votes, (void*)d_keep_bin, (void*)d_mark, (void*)d_bx, (void*)d_by);
-        fflush(stderr);
-    }
-
-#undef VOTING_DBG_ALLOC
-
-    /* Step 1: voting histogram */
-    {
-        int grd = (total_anchors + blk - 1) / blk;
-        voting_bin_kernel_batched<<<grd, blk>>>(
-            d_ax, d_anchor_off_d, d_bin_off, d_ref_min,
-            bin_size, d_votes, n_vg, total_anchors);
-    }
-
-    /* Step 2: mark + dilate */
-    {
-        int grd = (total_bins + blk - 1) / blk;
-        mark_dilate_kernel_batched<<<grd, blk>>>(
-            d_votes, d_keep_bin, d_bin_off,
-            min_votes, merge_gap_bins, n_vg, total_bins);
-    }
-    cudaFree(d_votes);
-
-    /* Step 3: segment-start flags */
-    {
-        int grd = (total_bins + blk - 1) / blk;
-        seg_start_kernel_batched<<<grd, blk>>>(
-            d_keep_bin, d_seg_start, d_bin_off, n_vg, total_bins);
-    }
-
-    /* Step 4: segmented inclusive prefix sum → seg IDs + per-group n_segs */
-    {
-        int grd = (n_vg + blk - 1) / blk;
-        seg_incl_sum_kernel<<<grd, blk>>>(
-            d_seg_start, d_seg_id, d_bin_off, d_nsegs, n_vg);
-    }
-    cudaFree(d_seg_start);
-
-    /* Step 5: tag anchors (mark + segment ID) */
-    {
-        int grd = (total_anchors + blk - 1) / blk;
-        tag_mark_kernel_batched<<<grd, blk>>>(
-            d_ax, d_anchor_off_d, d_bin_off, d_ref_min,
-            bin_size, d_keep_bin, d_seg_id,
-            d_mark, d_anchor_seg, n_vg, total_anchors);
-    }
-    cudaFree(d_keep_bin);
-    cudaFree(d_seg_id);
-
-    /* Step 6: segmented exclusive prefix sum → output positions + n_compact */
-    {
-        int grd = (n_vg + blk - 1) / blk;
-        seg_excl_sum_kernel<<<grd, blk>>>(
-            d_mark, d_out_pos, d_anchor_off_d, d_ncompact, n_vg);
-    }
-
-    /* Step 7: scatter compact */
-    {
-        int grd = (total_anchors + blk - 1) / blk;
-        scatter_compact_kernel_batched<<<grd, blk>>>(
-            d_ax, d_ay,
-            d_mark, d_out_pos, d_anchor_seg,
-            d_anchor_off_d, d_bin_off,
-            d_bx, d_by, d_seg_cnt_flat,
-            n_vg, total_anchors);
-    }
-    cudaFree(d_ax);  cudaFree(d_ay);
-    cudaFree(d_mark); cudaFree(d_out_pos); cudaFree(d_anchor_seg);
-    cudaFree(d_bin_off); cudaFree(d_anchor_off_d); cudaFree(d_ref_min);
-
-    /* ====================================================================
-     * Phase 5: single D→H download
-     * ==================================================================== */
-
-    uint64_t *h_bx          = (uint64_t *)malloc(total_anchors * sizeof(uint64_t));
-    uint64_t *h_by          = (uint64_t *)malloc(total_anchors * sizeof(uint64_t));
-    int32_t  *h_nsegs       = (int32_t  *)malloc(n_vg          * sizeof(int32_t));
-    int32_t  *h_ncompact    = (int32_t  *)malloc(n_vg          * sizeof(int32_t));
-    int32_t  *h_seg_cnt_flat= (int32_t  *)malloc(total_bins    * sizeof(int32_t));
-
-    cudaMemcpy(h_bx,           d_bx,           total_anchors * sizeof(uint64_t),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_by,           d_by,           total_anchors * sizeof(uint64_t),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_nsegs,        d_nsegs,        n_vg          * sizeof(int32_t),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ncompact,     d_ncompact,     n_vg          * sizeof(int32_t),
-               cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_seg_cnt_flat, d_seg_cnt_flat, total_bins    * sizeof(int32_t),
-               cudaMemcpyDeviceToHost);
-
-    cudaFree(d_bx); cudaFree(d_by);
-    cudaFree(d_nsegs); cudaFree(d_ncompact);
-    cudaFree(d_seg_cnt_flat);
-
-    /* ====================================================================
-     * Phase 6: build per-read b[]/u[] output
+     * Phase 5: build per-read b[]/u[] output
      *
      * Groups in vg[] are ordered by (ri, chr-group).  We iterate in order,
      * accumulating output for each read.
@@ -586,7 +655,7 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
             int           idx = rechain_indices[ri];
             chain_read_t *rd  = &reads[idx];
 
-            /* Free old anchor array (data is now on GPU / in h_bx/h_by) */
+            /* Free old anchor array (data is now in h_bx/h_by) */
             kfree(km, rd->a);
             rd->a   = NULL; rd->n   = 0;
             rd->u   = NULL; rd->n_u = 0;
@@ -610,18 +679,12 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
                 if (n_segs_g == 0 || n_compact_g == 0) { ++g; continue; }
 
-                int32_t seg_base    = bin_off[g];    /* index into h_seg_cnt_flat */
-                int64_t anchor_base = anchor_off[g]; /* base in h_bx/h_by         */
+                int32_t seg_base      = bin_off[g];     /* index into h_seg_cnt_flat */
+                int64_t anchor_base   = anchor_off[g];  /* base in h_bx/h_by         */
                 int64_t anchor_cursor = anchor_base;
 
                 /* ---------------------------------------------------------- *
-                 * Step 8: build b[] and u[] with query_pos monotonicity.
-                 *
-                 * Within each segment anchors are in ref_pos order but may
-                 * have non-monotone query_pos.  Classify each violation as:
-                 *   Isolated  – bad anchor at k but k+1 is fine: discard k.
-                 *   Sustained – bad at both k and k+1 (direction reversal):
-                 *               close sub-chain, open new one at k.
+                 * Build b[] and u[] with query_pos monotonicity.
                  * ---------------------------------------------------------- */
                 for (int32_t s = 0; s < n_segs_g; ++s) {
                     int32_t cnt = h_seg_cnt_flat[seg_base + s];

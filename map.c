@@ -1877,33 +1877,79 @@ static void worker_for(void *_data, long i_in, int tid) {
     }
 	km_destroy(km);
 }
+
+// Deep-copy a chain_read_t (with its anchor data) into a batch using the batch's km.
+// Used to defer CPU-fallback reads for later GPU processing.
+static void deep_copy_read_to_batch(mm_batch_trbuf_t *dst, const chain_read_t *src,
+                                    const mm_mapopt_t *opt)
+{
+    chain_read_t *r = &dst->reads[dst->count];
+    *r = *src;  // shallow copy of all scalars and pointer values
+
+    // Deep-copy arrays into dst->km so their lifetime is tied to the batch
+    if (opt->flag & MM_F_INDEPEND_SEG) {
+        r->qlens = (int*)kmalloc(dst->km, sizeof(int));
+        r->qseqs = (const char**)kmalloc(dst->km, sizeof(const char*));
+        r->qlens[0] = src->qlens[0];
+        r->qseqs[0] = src->qseqs[0];
+    } else {
+        r->qlens = (int*)kmalloc(dst->km, sizeof(int) * src->n_seg);
+        r->qseqs = (const char**)kmalloc(dst->km, sizeof(const char*) * src->n_seg);
+        memcpy(r->qlens, src->qlens, sizeof(int) * src->n_seg);
+        memcpy(r->qseqs, src->qseqs, sizeof(const char*) * src->n_seg);
+    }
+    r->mini_pos = (uint64_t*)kmalloc(dst->km, src->n_mini_pos * sizeof(uint64_t));
+    memcpy(r->mini_pos, src->mini_pos, src->n_mini_pos * sizeof(uint64_t));
+    r->a = (mm128_t*)kmalloc(dst->km, src->n * sizeof(mm128_t));
+    memcpy(r->a, src->a, src->n * sizeof(mm128_t));
+
+    // u/n_u are chaining outputs – not yet available on these fallback reads
+    r->u    = NULL;
+    r->n_u  = 0;
+
+    dst->count++;
+    dst->total_n += src->n;
+}
+
 static void* gpu_batch_consumer(void *data) {
     step_t *s = (step_t*)data;
     mm_tbuf_t *b = s->buf[0];
     
     mm_batch_trbuf_t acc_batch, launched_batch, pending_batch;
-    
+
+    // fallback_batch: collects reads that overflowed GPU capacity during the main loop.
+    // After the main loop they are submitted together to the GPU chain pipeline,
+    // avoiding inline single-threaded CPU chaining.
+    mm_batch_trbuf_t fallback_batch;
+
     acc_batch.km = km_init();
     acc_batch.count = 0;
     acc_batch.total_n = 0;
     acc_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
 	memset(acc_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
     acc_batch.batchid = 0;
-    
+
     launched_batch.km = km_init();
     launched_batch.count = 0;
     launched_batch.total_n = 0;
     launched_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
 	memset(launched_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
     launched_batch.batchid = 2;
-    
+
     pending_batch.km = km_init();
     pending_batch.count = 0;
     pending_batch.total_n = 0;
     pending_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
 	memset(pending_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
     pending_batch.batchid = 1;
-    
+
+    fallback_batch.km = km_init();
+    fallback_batch.count = 0;
+    fallback_batch.total_n = 0;
+    fallback_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
+    memset(fallback_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
+    fallback_batch.batchid = -1;
+
     int is_full = 0;
     int has_launched = 0;
     int is_pending = 0;
@@ -1982,11 +2028,10 @@ static void* gpu_batch_consumer(void *data) {
                     // 返回了上一个launched batch（已完成）
                     assert(has_launched);
                     
-                    // CPU fallback for reads that didn't fit
-                    for (kernel_batch.count; kernel_batch.count<launched_batch.count; kernel_batch.count++) {
-                        fprintf(stderr, "[WARNING] Run CPU kernel for read %d\n", kernel_batch.count);
-                        mm_map_chain(s->p->mi, s->p->opt, &launched_batch.reads[kernel_batch.count], 
-                                    b, launched_batch.km);
+                    // Defer overflow reads to fallback_batch for later GPU processing
+                    for (; kernel_batch.count < launched_batch.count; kernel_batch.count++) {
+                        fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", kernel_batch.count);
+                        deep_copy_read_to_batch(&fallback_batch, &launched_batch.reads[kernel_batch.count], s->p->opt);
                     }
                     assert(kernel_batch.count == launched_batch.count);
                     
@@ -2021,11 +2066,10 @@ static void* gpu_batch_consumer(void *data) {
                 finish_stream_gpu(s->p->mi, s->p->opt, &kernel_batch.reads, 
                                  &kernel_batch.count, 0, launched_batch.km);
                 
-                // CPU fallback
-                for (kernel_batch.count; kernel_batch.count < launched_batch.count; kernel_batch.count++) {
-                    fprintf(stderr, "[WARNING] Run CPU kernel for read %d\n", kernel_batch.count);
-                    mm_map_chain(s->p->mi, s->p->opt, &launched_batch.reads[kernel_batch.count], 
-                                b, launched_batch.km);
+                // Defer overflow reads to fallback_batch for later GPU processing
+                for (; kernel_batch.count < launched_batch.count; kernel_batch.count++) {
+                    fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", kernel_batch.count);
+                    deep_copy_read_to_batch(&fallback_batch, &launched_batch.reads[kernel_batch.count], s->p->opt);
                 }
                 assert(kernel_batch.count == launched_batch.count);
                 
@@ -2075,6 +2119,57 @@ static void* gpu_batch_consumer(void *data) {
         }
     }
     
+    // ===== Process deferred fallback reads through GPU chaining =====
+    // These reads overflowed the GPU micro-batch capacity during the main loop.
+    // The GPU stream is now idle; submit them in sub-batches so they go through
+    // the same GPU chain → GPU align path as normal reads.
+    while (fallback_batch.count > 0) {
+        fprintf(stderr, "[Info] Processing %d deferred fallback reads via GPU chain\n",
+                fallback_batch.count);
+
+        // Submit fallback batch to GPU (first call: no previously-launched batch to return)
+        chain_read_t *fb_reads = fallback_batch.reads;
+        int fb_count = fallback_batch.count;
+        chain_stream_gpu(s->p->mi, s->p->opt, &fb_reads, &fb_count, 0, fallback_batch.km);
+        // fb_reads == NULL and fb_count == 0 here (no previous batch)
+
+        // Drain the GPU stream and retrieve chained results
+        chain_read_t *fb_result_reads = NULL;
+        int fb_result_count = 0;
+        finish_stream_gpu(s->p->mi, s->p->opt, &fb_result_reads, &fb_result_count, 0, fallback_batch.km);
+        // fb_result_reads == fallback_batch.reads (same array, now with u/n_u filled)
+
+        // Safety net: if GPU still couldn't chain some reads, fall back to CPU for those
+        for (; fb_result_count < fallback_batch.count; fb_result_count++) {
+            fprintf(stderr, "[WARNING] Fallback GPU also overflowed, running CPU chain for read %d\n",
+                    fb_result_count);
+            mm_map_chain(s->p->mi, s->p->opt, &fallback_batch.reads[fb_result_count],
+                         b, fallback_batch.km);
+        }
+
+        // Send all fallback reads through GPU alignment (same as normal pending_batch)
+        mm_batch_trbuf_t fb_align_batch;
+        fb_align_batch.reads    = fallback_batch.reads;
+        fb_align_batch.count    = fallback_batch.count;
+        fb_align_batch.total_n  = fallback_batch.total_n;
+        fb_align_batch.km       = fallback_batch.km;
+        fb_align_batch.batchid  = -1;
+
+        for (int iread = 0; iread < fb_align_batch.count; iread++) {
+            int i   = fb_align_batch.reads[iread].seq.i;
+            int j   = fb_align_batch.reads[iread].seq.seg_id;
+            int off = s->seg_off[i] + j;
+            for (int k = 0; k < fb_align_batch.reads[iread].n_seg; k++) {
+                s->rep_len[off + k] = fb_align_batch.reads[iread].rep_len;
+                s->frag_gap[off + k] = fb_align_batch.reads[iread].frag_gap;
+            }
+        }
+        prepare_align_batch_gpu(&fb_align_batch, b, s);
+
+        // Reset so the while-condition exits (all reads processed in one pass)
+        mm_trbuf_batch_reset(&fallback_batch, s->batch_max_reads, s->p->opt);
+    }
+
     // Cleanup
 	mm_trbuf_batch_reset(&acc_batch, s->batch_max_reads, s->p->opt);
 	mm_trbuf_batch_reset(&launched_batch, s->batch_max_reads, s->p->opt);
@@ -2083,10 +2178,12 @@ static void* gpu_batch_consumer(void *data) {
 	free(acc_batch.reads);
 	free(launched_batch.reads);
 	free(pending_batch.reads);
+	free(fallback_batch.reads);
 
 	km_destroy(acc_batch.km);
 	km_destroy(launched_batch.km);
 	km_destroy(pending_batch.km);
+	km_destroy(fallback_batch.km);
 
     return NULL;
 }

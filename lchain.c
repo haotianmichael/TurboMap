@@ -3,7 +3,6 @@
 #include <stdio.h>
 #include <assert.h>
 #include "mmpriv.h"
-#include <nvToolsExt.h>
 #include "kalloc.h"
 #include "krmq.h"
 
@@ -149,7 +148,6 @@ static inline int32_t comput_sc(const mm128_t *ai, const mm128_t *aj, int32_t ma
 mm128_t *mg_lchain_dp(int max_dist_x, int max_dist_y, int bw, int max_skip, int max_iter, int min_cnt, int min_sc, float chn_pen_gap, float chn_pen_skip,
 					  int is_cdna, int n_seg, int64_t n, mm128_t *a, int *n_u_, uint64_t **_u, void *km)
 { // TODO: make sure this works when n has more than 32 bits
-	nvtxRangePush("mg_lchain_dp");
 	int32_t *f, *t, *v, n_u, n_v, mmax_f = 0, max_drop = bw;
 	int64_t *p, i, j, max_ii, st = 0, n_iter = 0;
 	uint64_t *u;
@@ -157,7 +155,6 @@ mm128_t *mg_lchain_dp(int max_dist_x, int max_dist_y, int bw, int max_skip, int 
 	if (_u) *_u = 0, *n_u_ = 0;
 	if (n == 0 || a == 0) {
 		kfree(km, a);
-		nvtxRangePop();
 		return 0;
 	}
 	if (max_dist_x < bw) max_dist_x = bw;
@@ -214,12 +211,9 @@ mm128_t *mg_lchain_dp(int max_dist_x, int max_dist_y, int bw, int max_skip, int 
 	kfree(km, p); kfree(km, f); kfree(km, t);
 	if (n_u == 0) {
 		kfree(km, a); kfree(km, v);
-		nvtxRangePop();
 		return 0;
 	}
-	mm128_t *_ret_dp = compact_a(km, n_u, u, n_v, v, a);
-	nvtxRangePop();
-	return _ret_dp;
+	return compact_a(km, n_u, u, n_v, v, a);
 }
 
 typedef struct lc_elem_s {
@@ -256,7 +250,6 @@ static inline int32_t comput_sc_simple(const mm128_t *ai, const mm128_t *aj, flo
 mm128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_skip, int cap_rmq_size, int min_cnt, int min_sc, float chn_pen_gap, float chn_pen_skip,
 					   int64_t n, mm128_t *a, int *n_u_, uint64_t **_u, void *km)
 {
-	nvtxRangePush("mg_lchain_rmq");
 	int32_t *f,*t, *v, n_u, n_v, mmax_f = 0, max_rmq_size = 0, max_drop = bw;
 	int64_t *p, i, i0, st = 0, st_inner = 0, n_iter = 0;
 	uint64_t *u;
@@ -267,7 +260,6 @@ mm128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_ski
 	if (_u) *_u = 0, *n_u_ = 0;
 	if (n == 0 || a == 0) {
 		kfree(km, a);
-		nvtxRangePop();
 		return 0;
 	}
 	if (max_dist < bw) max_dist = bw;
@@ -371,10 +363,7 @@ mm128_t *mg_lchain_rmq(int max_dist, int max_dist_inner, int bw, int max_chn_ski
 	kfree(km, p); kfree(km, f); kfree(km, t);
 	if (n_u == 0) {
 		kfree(km, a); kfree(km, v);
-		nvtxRangePop();
 		return 0;
 	}
-	mm128_t *_ret_rmq = compact_a(km, n_u, u, n_v, v, a);
-	nvtxRangePop();
-	return _ret_rmq;
+	return compact_a(km, n_u, u, n_v, v, a);
 }

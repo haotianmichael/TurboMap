@@ -259,7 +259,11 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
 
    
     // Allocate buffers for SHORT tasks (most common case, optimized for throughput)
-    size_t alloc_tasks = short_task_batch_size;
+    // alloc_slots: backtrack buffer is slot-indexed (persistent kernel reuses slots).
+    // Keep 7000 slots so both phases fit:
+    //   Short: 7000 × 1.5MB = 10.5GB  (hardware runs ≤2560 concurrently)
+    //   Long:  140 × 75MB  = 10.5GB  (same buffer, capped by plalign.cu)
+    size_t alloc_slots = short_task_batch_size;  // 7000
 
     // Calculate max_antidiag based on SHORT task length (1000bp per sequence)
     size_t max_antidiag_short = 2 * short_task_max_len;  // 2000 antidiagonals for 1000+1000bp
@@ -272,12 +276,17 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     dev_mem->max_align_backtrack_size = max_antidiag_short * max_n_col;  // Optimized for short tasks
     dev_mem->max_align_cigar_len = 2 * short_task_max_len;  // Optimized for short tasks
 
-    size_t bt_p_bytes = alloc_tasks * dev_mem->max_align_backtrack_size;
-    size_t bt_off_bytes = alloc_tasks * max_antidiag_short * sizeof(int);
-    size_t bt_off_end_bytes = alloc_tasks * max_antidiag_short * sizeof(int);
-    size_t bt_n_col_bytes = alloc_tasks * sizeof(int);
-    size_t cigar_buf_bytes = alloc_tasks * dev_mem->max_align_cigar_len * sizeof(uint32_t);
-    size_t cigar_len_bytes = alloc_tasks * sizeof(int);
+    size_t bt_p_bytes       = alloc_slots * dev_mem->max_align_backtrack_size;
+    size_t bt_off_bytes     = alloc_slots * max_antidiag_short * sizeof(int);
+    size_t bt_off_end_bytes = alloc_slots * max_antidiag_short * sizeof(int);
+    size_t bt_n_col_bytes   = alloc_slots * sizeof(int);
+
+    // CIGAR buffer: task-indexed output, sized for max_align_tasks per batch.
+    // With persistent kernel batch_size = max_align_tasks (short) or 2400 (long),
+    // both require max_align_tasks × max_align_cigar_len × 4 = 120000×2000×4 = 960MB.
+    // Same 960MB covers long tasks: 2400 × 100000 × 4 = 960MB.
+    size_t cigar_buf_bytes = dev_mem->max_align_tasks * dev_mem->max_align_cigar_len * sizeof(uint32_t);
+    size_t cigar_len_bytes = dev_mem->max_align_tasks * sizeof(int);
 
     cudaMalloc(&dev_mem->d_align_backtrack_p, bt_p_bytes);
     cudaMalloc(&dev_mem->d_align_backtrack_off, bt_off_bytes);

@@ -192,12 +192,18 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     // Host buffers for CIGAR and results
     // Note: Device buffer is sized for 10000 short tasks OR 200 long tasks (same total size)
-    // We allocate host buffer large enough for either case
-    size_t max_batch_size = (short_batch_size > long_batch_size) ? short_batch_size : long_batch_size;
+    // Persistent kernel batch sizes: limited by CIGAR buffer (960MB = max_align_tasks × max_cigar_len).
+    // Short tasks: one batch = max_align_tasks (120000) → ceil(n_short/120000) launches.
+    // Long  tasks: one batch = 960MB / (long_cigar_len × 4) = 2400 → ceil(n_long/2400) launches.
+    // (Previously: short=7000→23 launches, long=128→31 launches)
     size_t long_cigar_len = 2 * max_query_len_limit;  // 100000 for long tasks (50000bp)
-    // Total buffer size: max(short_batch × short_cigar, long_batch × long_cigar)
-    size_t cigar_buffer_size = (short_batch_size * max_cigar_len > long_batch_size * long_cigar_len) ?
-                               (short_batch_size * max_cigar_len) : (long_batch_size * long_cigar_len);
+    size_t short_batch_persistent = (size_t)dev_mem->max_align_tasks;  // 120000
+    size_t cigar_buf_total_tasks   = (size_t)dev_mem->max_align_tasks;  // device allocation
+    size_t long_batch_persistent   = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;  // 2400
+    size_t max_batch_size = (short_batch_persistent > long_batch_persistent) ?
+                             short_batch_persistent : long_batch_persistent;  // 120000
+    // CIGAR host buffer covers the largest phase (short: 120000×2000×4=960MB)
+    size_t cigar_buffer_size = max_batch_size * max_cigar_len;  // 240M uint32_t entries = 960MB
     uint32_t *h_cigar_buffer = (uint32_t*)calloc(cigar_buffer_size, sizeof(uint32_t));
     int *h_cigar_lengths = (int*)calloc(max_batch_size, sizeof(int));
     int32_t *h_scores = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
@@ -239,7 +245,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         // Select phase-specific parameters
         int *current_task_indices = (phase == 0) ? task_indices_short : task_indices_long;
         int n_tasks_in_phase = (phase == 0) ? n_short_tasks : n_long_tasks;
-        size_t current_batch_size = (phase == 0) ? short_batch_size : long_batch_size;
+        // Use persistent-kernel batch sizes (CIGAR-buffer limited, not backtrack-limited)
+        size_t current_batch_size = (phase == 0) ? short_batch_persistent : long_batch_persistent;
         const char *phase_name = (phase == 0) ? "Short Tasks" : "Long Tasks";
 
         // Dynamic backtrack buffer sizing based on phase

@@ -406,34 +406,76 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
      * Phase 4: full GPU pipeline – zero intermediate D→H syncs
      * ==================================================================== */
 
+#define VOTING_DBG_ALLOC(ptr, sz, label) do { \
+    size_t _free = 0, _total = 0; \
+    cudaMemGetInfo(&_free, &_total); \
+    fprintf(stderr, "[VOTING-DBG] PRE  %-20s  size=%10zu B (%6.1f MB)  gpu_free=%zu MB / %zu MB\n", \
+            (label), (size_t)(sz), (sz)/1048576.0, _free>>20, _total>>20); \
+    fflush(stderr); \
+    cudaError_t _e = cudaMalloc(&(ptr), (sz)); \
+    size_t _free2 = 0, _total2 = 0; \
+    cudaMemGetInfo(&_free2, &_total2); \
+    fprintf(stderr, "[VOTING-DBG] POST %-20s  ptr=%p  err=%s  gpu_free=%zu MB\n", \
+            (label), (void*)(ptr), cudaGetErrorString(_e), _free2>>20); \
+    fflush(stderr); \
+} while(0)
+
+    fprintf(stderr, "[VOTING-DBG] === plvoting_rechain_batch entry ===\n");
+    fprintf(stderr, "[VOTING-DBG] n_vg=%d  total_anchors=%d  total_bins=%d\n",
+            n_vg, total_anchors, total_bins);
+    fprintf(stderr, "[VOTING-DBG] size breakdown (MB):\n");
+    fprintf(stderr, "[VOTING-DBG]   d_ax/d_ay already allocated: 2 x %zu = %.1f MB\n",
+            (size_t)total_anchors * 8, total_anchors * 8 * 2 / 1048576.0);
+    fprintf(stderr, "[VOTING-DBG]   d_votes+keep+seg_start+seg_id (bins): 4 x %zu = %.1f MB\n",
+            (size_t)total_bins * 4, total_bins * 4 * 4 / 1048576.0);
+    fprintf(stderr, "[VOTING-DBG]   d_mark+anchor_seg+out_pos (anchors): 3 x %zu = %.1f MB\n",
+            (size_t)total_anchors * 4, total_anchors * 4 * 3 / 1048576.0);
+    fprintf(stderr, "[VOTING-DBG]   d_bx/d_by (anchors, worst-case output): 2 x %zu = %.1f MB\n",
+            (size_t)total_anchors * 8, total_anchors * 8 * 2 / 1048576.0);
+    fprintf(stderr, "[VOTING-DBG]   d_seg_cnt_flat (bins): %zu = %.1f MB\n",
+            (size_t)total_bins * 4, total_bins * 4 / 1048576.0);
+    fflush(stderr);
+
     /* -- Bin-level arrays -- */
     int32_t *d_votes, *d_seg_start, *d_seg_id;
     int8_t  *d_keep_bin;
-    cudaMalloc(&d_votes,     total_bins * sizeof(int32_t));
-    cudaMalloc(&d_keep_bin,  total_bins * sizeof(int8_t));
-    cudaMalloc(&d_seg_start, total_bins * sizeof(int32_t));
-    cudaMalloc(&d_seg_id,    total_bins * sizeof(int32_t));
-    cudaMemset(d_votes, 0, total_bins * sizeof(int32_t));
+    VOTING_DBG_ALLOC(d_votes,     (size_t)total_bins * sizeof(int32_t), "d_votes");
+    VOTING_DBG_ALLOC(d_keep_bin,  (size_t)total_bins * sizeof(int8_t),  "d_keep_bin");
+    VOTING_DBG_ALLOC(d_seg_start, (size_t)total_bins * sizeof(int32_t), "d_seg_start");
+    VOTING_DBG_ALLOC(d_seg_id,    (size_t)total_bins * sizeof(int32_t), "d_seg_id");
+    cudaMemset(d_votes, 0, (size_t)total_bins * sizeof(int32_t));
 
     /* -- Per-group result scalars -- */
     int32_t *d_nsegs, *d_ncompact;
-    cudaMalloc(&d_nsegs,    n_vg * sizeof(int32_t));
-    cudaMalloc(&d_ncompact, n_vg * sizeof(int32_t));
+    VOTING_DBG_ALLOC(d_nsegs,    (size_t)n_vg * sizeof(int32_t), "d_nsegs");
+    VOTING_DBG_ALLOC(d_ncompact, (size_t)n_vg * sizeof(int32_t), "d_ncompact");
 
     /* -- Anchor-level arrays -- */
     int32_t *d_mark, *d_anchor_seg, *d_out_pos;
-    cudaMalloc(&d_mark,       total_anchors * sizeof(int32_t));
-    cudaMalloc(&d_anchor_seg, total_anchors * sizeof(int32_t));
-    cudaMalloc(&d_out_pos,    total_anchors * sizeof(int32_t));
+    VOTING_DBG_ALLOC(d_mark,       (size_t)total_anchors * sizeof(int32_t), "d_mark");
+    VOTING_DBG_ALLOC(d_anchor_seg, (size_t)total_anchors * sizeof(int32_t), "d_anchor_seg");
+    VOTING_DBG_ALLOC(d_out_pos,    (size_t)total_anchors * sizeof(int32_t), "d_out_pos");
 
     /* -- Output: worst-case (all anchors kept per group, partition by group) -- */
     uint64_t *d_bx, *d_by;
     int32_t  *d_seg_cnt_flat;
-    cudaMalloc(&d_bx,           total_anchors * sizeof(uint64_t));
-    cudaMalloc(&d_by,           total_anchors * sizeof(uint64_t));
+    VOTING_DBG_ALLOC(d_bx,           (size_t)total_anchors * sizeof(uint64_t), "d_bx");
+    VOTING_DBG_ALLOC(d_by,           (size_t)total_anchors * sizeof(uint64_t), "d_by");
     /* seg_cnt_flat: group g uses [bin_off[g], bin_off[g]+n_segs_g), fits in total_bins */
-    cudaMalloc(&d_seg_cnt_flat, total_bins    * sizeof(int32_t));
-    cudaMemset(d_seg_cnt_flat, 0, total_bins  * sizeof(int32_t));
+    VOTING_DBG_ALLOC(d_seg_cnt_flat, (size_t)total_bins * sizeof(int32_t), "d_seg_cnt_flat");
+    cudaMemset(d_seg_cnt_flat, 0, (size_t)total_bins * sizeof(int32_t));
+
+    {
+        size_t _free = 0, _total = 0;
+        cudaMemGetInfo(&_free, &_total);
+        fprintf(stderr, "[VOTING-DBG] === All allocs done, launching kernels. gpu_free=%zu MB / %zu MB ===\n",
+                _free>>20, _total>>20);
+        fprintf(stderr, "[VOTING-DBG] ptr check: d_votes=%p d_keep_bin=%p d_mark=%p d_bx=%p d_by=%p\n",
+                (void*)d_votes, (void*)d_keep_bin, (void*)d_mark, (void*)d_bx, (void*)d_by);
+        fflush(stderr);
+    }
+
+#undef VOTING_DBG_ALLOC
 
     /* Step 1: voting histogram */
     {

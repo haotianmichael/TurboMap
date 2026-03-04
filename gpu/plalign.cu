@@ -2,7 +2,6 @@
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
-#include <algorithm>
 
 
 #define CHECKCUDAERROR(error) \
@@ -169,13 +168,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     uint32_t *d_query_lens = dev_mem->d_align_query_lens;
     uint32_t *d_target_lens = dev_mem->d_align_target_lens;
     int32_t *d_flag = dev_mem->d_align_flag;
-    void *d_global_buffer = dev_mem->d_align_global_buffer;
     void *d_ksw_temp_buffer = dev_mem->d_align_ksw_temp_buffer;
     size_t ksw_temp_per_task = dev_mem->align_ksw_temp_per_task;
     uint8_t *d_backtrack_p = dev_mem->d_align_backtrack_p;
     int *d_backtrack_off = dev_mem->d_align_backtrack_off;
     int *d_backtrack_off_end = dev_mem->d_align_backtrack_off_end;
-    int *d_backtrack_n_col = dev_mem->d_align_backtrack_n_col;
     uint32_t *d_cigar_buffer = dev_mem->d_align_cigar_buffer;
     int *d_cigar_lengths = dev_mem->d_align_cigar_lengths;
     size_t max_backtrack_size = dev_mem->max_align_backtrack_size;
@@ -183,7 +180,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t max_query_len_limit = dev_mem->max_align_query_len;
     int8_t *d_mat = dev_mem->d_align_mat;
     void *device_res = dev_mem->d_align_device_res;
-    void *d_ez_array = dev_mem->d_align_ez_array;
     int32_t *d_scores = dev_mem->d_align_scores;
     int32_t *d_query_ends = dev_mem->d_align_query_ends;
     int32_t *d_target_ends = dev_mem->d_align_target_ends;
@@ -191,6 +187,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *d_mqe_t = dev_mem->d_align_mqe_t;
     int32_t *d_mte = dev_mem->d_align_mte;
     int32_t *d_mte_q = dev_mem->d_align_mte_q;
+    int  *d_task_counter = dev_mem->d_align_task_counter;
+    int   n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
 
     // Host buffers for CIGAR and results
     // Note: Device buffer is sized for 10000 short tasks OR 200 long tasks (same total size)
@@ -209,7 +207,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *h_mqe_t = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
     int32_t *h_mte = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
     int32_t *h_mte_q = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    short2 *h_sort_buffer = (short2*)calloc(max_batch_size, sizeof(short2));
 
     // Host arrays for batch preparation (sized for LARGEST batch)
     uint32_t *h_query_offsets = (uint32_t*)calloc(max_batch_size, sizeof(uint32_t));
@@ -403,49 +400,20 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 total_target_bytes / 4
             );
 
-            // Launch sorting kernel
-            ksw_sort<<<kernel_blocks, kernel_threads>>>(
-                d_packed_query,
-                d_packed_target,
-                d_query_lens,
-                d_target_lens,
-                d_query_offsets,
-                d_target_offsets,
-                batch_size,
-                max_query_len_limit,
-                (short2*)d_global_buffer
-            );
+            // ===== Fused Persistent KSW Kernel (align + backtrack in one launch) =====
+            // n_concurrent_blocks slots process all batch_size tasks via atomic work stealing.
+            // Backtrack is done immediately after alignment within the same block,
+            // so the backtrack buffer is slot-indexed (reused across tasks).
+            int parallel_threads = 32;   // one warp per block
+            size_t parallel_smem = 3072; // 3072 bytes smem → 32 blocks/SM on V100
 
-            // Sort on CPU (hybrid approach)
-            size_t sort_offset = kernel_blocks * (kernel_threads / 8) *
-                                max_query_len_limit * 3;
-            cudaMemcpy(h_sort_buffer,
-                       (short2*)d_global_buffer + sort_offset,
-                       batch_size * sizeof(short2),
-                       cudaMemcpyDeviceToHost);
-            cudaDeviceSynchronize();
+            // Reset atomic task counter to 0 before this batch
+            int zero = 0;
+            cudaMemcpy(d_task_counter, &zero, sizeof(int), cudaMemcpyHostToDevice);
 
-            std::sort(h_sort_buffer, h_sort_buffer + batch_size,
-                      [](short2 a, short2 b) { return a.x < b.x; });
-
-            cudaMemcpy((short2*)d_global_buffer + sort_offset,
-                       h_sort_buffer,
-                       batch_size * sizeof(short2),
-                       cudaMemcpyHostToDevice);
-
-            // Configure and launch AGATHA kernel
-            size_t shared_mem = (kernel_threads / 32) *
-                               ((32 * (8 * (g_config.slice_width + 1))) + 28) * sizeof(int32_t);
-            //cudaFuncSetAttribute(agatha_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem);
-
-            // ===== KSW Alignment Kernel (Phase 1: Compute scores and save backtrack) =====
-            // Use phase-specific backtrack buffer sizes for optimal memory usage
-            int parallel_threads = 32;  // One warp per block
-            int parallel_blocks = batch_size;  // One block per task
-            size_t parallel_smem = 3072;  // Shared memory per SM: 98,304 bytes-> blocks per SM: min(32, 98,304 ÷ 3,072) = min(32, 32) = 32 blocks
-
-            ksw_semi_global_kernel<<<parallel_blocks, parallel_threads,
-                            parallel_smem>>>(
+            ksw_fused_persistent_kernel<<<n_concurrent_blocks, parallel_threads,
+                                          parallel_smem>>>(
+                d_task_counter,
                 d_packed_query,
                 d_packed_target,
                 d_query_lens,
@@ -457,60 +425,33 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 d_backtrack_p,
                 d_backtrack_off,
                 d_backtrack_off_end,
-                d_backtrack_n_col,
-                current_max_backtrack_size,  // Phase-specific backtrack size
-                current_max_antidiag,        // Phase-specific antidiagonal count
-            (ksw_extz_t*)d_ez_array,
-            (uint8_t*)d_ksw_temp_buffer,
-            d_flag,
-            ksw_temp_per_task,
-            batch_size,
-            5,  // m = alphabet size(ACGTN)
-            opt->zdrop,
-            opt->end_bonus
+                (int)current_max_backtrack_size,
+                (int)current_max_antidiag,
+                d_ksw_temp_buffer,
+                d_flag,
+                ksw_temp_per_task,
+                batch_size,
+                5,              // m = alphabet size (ACGTN)
+                opt->zdrop,
+                opt->end_bonus,
+                cigar_buffer ? d_cigar_buffer  : NULL,
+                cigar_buffer ? d_cigar_lengths : NULL,
+                (int)current_max_cigar_len
             );
 
-            // Check for kernel launch errors
             cudaError_t kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
-                fprintf(stderr, "[ERROR] KSW alignment kernel launch failed: %s\n",
+                fprintf(stderr, "[ERROR] KSW fused persistent kernel launch failed: %s\n",
                         cudaGetErrorString(kernel_err));
             }
             cudaDeviceSynchronize();
             kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
-                fprintf(stderr, "[ERROR] KSW alignment kernel execution failed: %s\n",
+                fprintf(stderr, "[ERROR] KSW fused persistent kernel execution failed: %s\n",
                         cudaGetErrorString(kernel_err));
             }
 
-            // ===== KSW Backtracking Kernel (Phase 2: Generate CIGAR) =====
             if (cigar_buffer) {
-                ksw_backtrack_kernel<<<parallel_blocks, parallel_threads,
-                                parallel_smem>>>(
-                    d_backtrack_p,
-                    d_backtrack_off,
-                    d_backtrack_off_end,
-                    d_backtrack_n_col,
-                    d_query_lens,
-                    d_target_lens,
-                    (gasal_res_t*)device_res,
-                    d_cigar_buffer,
-                    d_cigar_lengths,
-                    current_max_cigar_len,       // Phase-specific CIGAR length
-                    current_max_backtrack_size,   // Phase-specific backtrack size
-                    current_max_antidiag,         // CRITICAL: stride for off/off_end arrays (phase-specific)
-                    d_flag,
-                    batch_size
-                );
-
-                // Check for backtrack kernel errors
-                kernel_err = cudaGetLastError();
-                if (kernel_err != cudaSuccess) {
-                    fprintf(stderr, "[ERROR] KSW backtrack kernel launch failed: %s\n",
-                            cudaGetErrorString(kernel_err));
-                }
-
-                // Copy CIGAR results back to host
                 cudaMemcpy(h_cigar_buffer,
                            d_cigar_buffer,
                            batch_size * current_max_cigar_len * sizeof(uint32_t),
@@ -660,5 +601,4 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     free(h_mqe_t);
     free(h_mte);
     free(h_mte_q);
-    free(h_sort_buffer);
 }

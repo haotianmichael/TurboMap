@@ -148,6 +148,10 @@ typedef struct {
     int32_t *d_align_mte_q;          // query position when reaching end of target
     int32_t *d_align_task_to_align_id;
     int8_t *d_align_mat;             // scoring matrix
+
+    // Persistent kernel configuration
+    int   n_align_concurrent_blocks; // number of slots for persistent kernel
+    int  *d_align_task_counter;      // atomic task counter (reset before each kernel launch)
 } deviceMemPtr;
 
 typedef struct stream_ptr_t{

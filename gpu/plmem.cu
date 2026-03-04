@@ -299,6 +299,15 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
 
+    // Persistent kernel: atomic task counter + concurrent block count
+    // V100: 80 SMs x 32 blocks/SM (with 3072 bytes smem) = 2560 concurrent blocks
+    // Use query to get actual SM count for portability
+    int numSMs = 0;
+    cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
+    int max_blocks_per_sm = 32;  // limited by shared memory (3072 bytes/block, 98304/SM)
+    dev_mem->n_align_concurrent_blocks = numSMs * max_blocks_per_sm;
+    cudaMalloc(&dev_mem->d_align_task_counter, sizeof(int));
+
     // Calculate total memory allocated for alignment backtrack
     size_t bck_total = bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes +
                          cigar_buf_bytes + cigar_len_bytes +
@@ -404,6 +413,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     if (dev_mem->d_align_target_ends) cudaFree(dev_mem->d_align_target_ends);
     if (dev_mem->d_align_task_to_align_id) cudaFree(dev_mem->d_align_task_to_align_id);
     if (dev_mem->d_align_mat) cudaFree(dev_mem->d_align_mat);
+    if (dev_mem->d_align_task_counter) cudaFree(dev_mem->d_align_task_counter);
 
     cudaCheck();
 }

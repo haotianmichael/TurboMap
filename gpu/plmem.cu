@@ -316,6 +316,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     int max_blocks_per_sm = 32;  // limited by shared memory (3072 bytes/block, 98304/SM)
     dev_mem->n_align_concurrent_blocks = numSMs * max_blocks_per_sm;
     cudaMalloc(&dev_mem->d_align_task_counter, sizeof(int));
+    cudaStreamCreate(&dev_mem->align_stream);
 
     // Calculate total memory allocated for alignment backtrack
     size_t bck_total = bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes +
@@ -423,6 +424,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     if (dev_mem->d_align_task_to_align_id) cudaFree(dev_mem->d_align_task_to_align_id);
     if (dev_mem->d_align_mat) cudaFree(dev_mem->d_align_mat);
     if (dev_mem->d_align_task_counter) cudaFree(dev_mem->d_align_task_counter);
+    cudaStreamDestroy(dev_mem->align_stream);
 
     cudaCheck();
 }

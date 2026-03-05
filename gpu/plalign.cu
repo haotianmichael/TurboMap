@@ -190,6 +190,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *d_mte_q = dev_mem->d_align_mte_q;
     int  *d_task_counter = dev_mem->d_align_task_counter;
     int   n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
+    cudaStream_t align_stream = dev_mem->align_stream;
 
     // Host buffers for CIGAR and results
     // Note: Device buffer is sized for 10000 short tasks OR 200 long tasks (same total size)
@@ -226,12 +227,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int8_t h_scoring_matrix[25];
     ksw_gen_simple_mat(5, h_scoring_matrix, opt->a, opt->b, opt->sc_ambi);
     cudaError_t err;
-    CHECKCUDAERROR(cudaMemcpy(d_mat, h_scoring_matrix, 25 * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CHECKCUDAERROR(cudaMemcpyAsync(d_mat, h_scoring_matrix, 25 * sizeof(int8_t),
+                                   cudaMemcpyHostToDevice, align_stream));
 
     // Initialize device result structure directly on device
     // Using a kernel avoids host-device structure alignment issues with cudaMemcpy
     // Performance impact: ~5-10 microseconds (negligible compared to alignment kernel runtime)
-    init_gasal_res<<<1, 1>>>((gasal_res_t*)device_res, d_scores, d_query_ends, d_target_ends,
+    init_gasal_res<<<1, 1, 0, align_stream>>>((gasal_res_t*)device_res, d_scores, d_query_ends, d_target_ends,
                               d_mqe, d_mqe_t, d_mte, d_mte_q);
     CHECKCUDAERROR(cudaGetLastError());
 
@@ -376,21 +378,21 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
 
 
-            // Copy batch data to GPU
-            cudaMemcpy(d_unpacked_query, h_unpacked_query,
-                       total_query_bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(d_unpacked_target, h_unpacked_target,
-                       total_target_bytes, cudaMemcpyHostToDevice);
-            cudaMemcpy(d_query_offsets, h_query_offsets,
-                       batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_target_offsets, h_target_offsets,
-                       batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_query_lens, h_query_lens,
-                       batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_target_lens, h_target_lens,
-                       batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_flag, h_flag,
-                       batch_size * sizeof(int32_t), cudaMemcpyHostToDevice);
+            // Copy batch data to GPU (async on align_stream so chain stream stays free)
+            cudaMemcpyAsync(d_unpacked_query, h_unpacked_query,
+                            total_query_bytes, cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_unpacked_target, h_unpacked_target,
+                            total_target_bytes, cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_query_offsets, h_query_offsets,
+                            batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_target_offsets, h_target_offsets,
+                            batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_query_lens, h_query_lens,
+                            batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_target_lens, h_target_lens,
+                            batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_flag, h_flag,
+                            batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
 
 
 
@@ -400,7 +402,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             int target_tasks_per_thread = (int)ceil((double)total_target_bytes /
                                                    (8 * kernel_threads * kernel_blocks));
 
-            gasal_pack_kernel<<<kernel_blocks, kernel_threads>>>(
+            gasal_pack_kernel<<<kernel_blocks, kernel_threads, 0, align_stream>>>(
                 (uint32_t*)d_unpacked_query,
                 (uint32_t*)d_unpacked_target,
                 d_packed_query,
@@ -430,15 +432,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 phase_concurrent_blocks = batch_size;
             if (phase_concurrent_blocks < 1) phase_concurrent_blocks = 1;
 
-            // Also clamp temp_buffer: allocated for short_task_batch_size slots
-            // (safe for both phases since 7000 >> 2560 >> 128)
-
-            // Reset atomic task counter to 0 before this batch
-            int zero = 0;
-            cudaMemcpy(d_task_counter, &zero, sizeof(int), cudaMemcpyHostToDevice);
+            // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
+            cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
             ksw_fused_persistent_kernel<<<phase_concurrent_blocks, parallel_threads,
-                                          parallel_smem>>>(
+                                          parallel_smem, align_stream>>>(
                 d_task_counter,
                 d_packed_query,
                 d_packed_target,
@@ -471,57 +469,57 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         cudaGetErrorString(kernel_err));
             }
 
-            cudaDeviceSynchronize();
+            // Queue D2H transfers after kernel on align_stream — no global sync needed.
+            // Chain stream remains free to process the next batch concurrently.
+            if (cigar_buffer) {
+                cudaMemcpyAsync(h_cigar_buffer,
+                                d_cigar_buffer,
+                                batch_size * current_max_cigar_len * sizeof(uint32_t),
+                                cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_cigar_lengths,
+                                d_cigar_lengths,
+                                batch_size * sizeof(int),
+                                cudaMemcpyDeviceToHost, align_stream);
+            }
+
+            // Copy results back (async, ordered after kernel via align_stream)
+            cudaMemcpyAsync(h_scores,
+                            d_scores,
+                            batch_size * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_query_ends,
+                            d_query_ends,
+                            batch_size * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_target_ends,
+                            d_target_ends,
+                            batch_size * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_mqe,
+                            d_mqe,
+                            batch_size * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_mqe_t,
+                            d_mqe_t,
+                            batch_size * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_mte,
+                            d_mte,
+                            batch_size * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_mte_q,
+                            d_mte_q,
+                            batch_size * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, align_stream);
+
+            // Wait only for align_stream — chain stream is free during this sync.
+            // After this point host buffers are valid for CPU result mapping.
+            cudaStreamSynchronize(align_stream);
             kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel execution failed: %s\n",
                         cudaGetErrorString(kernel_err));
             }
-
-            if (cigar_buffer) {
-                cudaMemcpy(h_cigar_buffer,
-                           d_cigar_buffer,
-                           batch_size * current_max_cigar_len * sizeof(uint32_t),
-                           cudaMemcpyDeviceToHost);
-                cudaMemcpy(h_cigar_lengths,
-                           d_cigar_lengths,
-                           batch_size * sizeof(int),
-                           cudaMemcpyDeviceToHost);
-            }
-
-            // Copy results back
-            cudaMemcpy(h_scores,
-                       d_scores,
-                       batch_size * sizeof(int32_t),
-                       cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_query_ends,
-                       d_query_ends,
-                       batch_size * sizeof(int32_t),
-                       cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_target_ends,
-                       d_target_ends,
-                       batch_size * sizeof(int32_t),
-                       cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_mqe,
-                       d_mqe,
-                       batch_size * sizeof(int32_t),
-                       cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_mqe_t,
-                       d_mqe_t,
-                       batch_size * sizeof(int32_t),
-                       cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_mte,
-                       d_mte,
-                       batch_size * sizeof(int32_t),
-                       cudaMemcpyDeviceToHost);
-            cudaMemcpy(h_mte_q,
-                       d_mte_q,
-                       batch_size * sizeof(int32_t),
-                       cudaMemcpyDeviceToHost);
-
-
-            // Wait for completion
-            cudaDeviceSynchronize();
             cudaCheck();
 
             // Map results back to tasks

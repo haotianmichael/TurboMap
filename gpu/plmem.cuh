@@ -152,6 +152,10 @@ typedef struct {
     // Persistent kernel configuration
     int   n_align_concurrent_blocks; // number of slots for persistent kernel
     int  *d_align_task_counter;      // atomic task counter (reset before each kernel launch)
+
+    // Dedicated stream for alignment kernels (separate from chaining stream 0)
+    // so that chain(N+1) can overlap with align(N) on the GPU.
+    cudaStream_t align_stream;
 } deviceMemPtr;
 
 typedef struct stream_ptr_t{

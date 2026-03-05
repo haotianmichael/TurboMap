@@ -32,14 +32,14 @@ static align_config_t g_config = {
 // gpu_align_batch_execute() or gpu_align_batch_submit().
 deviceMemPtr *g_current_dev_mem = NULL;
 
-extern "C" void gpu_align_set_device_mem(void *dev_mem_ptr) {
+void gpu_align_set_device_mem(void *dev_mem_ptr) {
     g_current_dev_mem = (deviceMemPtr *)dev_mem_ptr;
 }
 
 // Select which stream slot's dev_mem to use for subsequent alignment calls.
 // stream_setup is defined in plmem.cu; declared extern here.
 extern streamSetup_t stream_setup;
-extern "C" void gpu_align_select_slot(int slot_id) {
+void gpu_align_select_slot(int slot_id) {
     g_current_dev_mem = &stream_setup.streams[slot_id].dev_mem;
 }
 static bool g_subst_scores_uploaded = false;
@@ -117,8 +117,6 @@ __global__ void init_gasal_res(gasal_res_t *res,
     }
 }
 extern "C" void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
-                            uint8_t *seq_buffer, uint32_t *cigar_buffer);
-void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                             uint8_t *seq_buffer, uint32_t *cigar_buffer) {
     if (n_tasks <= 0) return;
     gpu_align_copy_param();

@@ -32,19 +32,18 @@ typedef struct score_kernel_config_t{
  * Prerequisite: chain_stream_launch requires the slot to be IDLE (not busy).
  * chain_stream_collect returns NULL if the slot was never launched.
  * ----------------------------------------------------------------------- */
+#include "plutils.h"   /* chain_read_t */
+#include "../minimap.h" /* mm_idx_t, mm_mapopt_t */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-struct mm_idx_t;
-struct mm_mapopt_t;
-typedef struct chain_read_t chain_read_t;
-
-void chain_stream_launch(const struct mm_idx_t *mi, const struct mm_mapopt_t *opt,
+void chain_stream_launch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                          chain_read_t *reads, int n_reads,
                          int slot_id, void *km);
 
-chain_read_t *chain_stream_collect(const struct mm_idx_t *mi, const struct mm_mapopt_t *opt,
+chain_read_t *chain_stream_collect(const mm_idx_t *mi, const mm_mapopt_t *opt,
                                    int slot_id, int *n_reads_out, void *km);
 
 #ifdef __cplusplus

@@ -28,8 +28,20 @@ static align_config_t g_config = {
 };
 
 // Global pointer to current stream's device memory
-// Set by gpu_align_set_device_mem() before calling gpu_align_batch_execute()
+// Set by gpu_align_set_device_mem() / gpu_align_select_slot() before calling
+// gpu_align_batch_execute() or gpu_align_batch_submit().
 deviceMemPtr *g_current_dev_mem = NULL;
+
+extern "C" void gpu_align_set_device_mem(void *dev_mem_ptr) {
+    g_current_dev_mem = (deviceMemPtr *)dev_mem_ptr;
+}
+
+// Select which stream slot's dev_mem to use for subsequent alignment calls.
+// stream_setup is defined in plmem.cu; declared extern here.
+extern streamSetup_t stream_setup;
+extern "C" void gpu_align_select_slot(int slot_id) {
+    g_current_dev_mem = &stream_setup.streams[slot_id].dev_mem;
+}
 static bool g_subst_scores_uploaded = false;
 
 static void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi)

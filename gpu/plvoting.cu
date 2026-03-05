@@ -300,7 +300,9 @@ static void run_voting_minibatch(
         uint64_t       *h_by_base,
         int32_t        *h_nsegs_base,
         int32_t        *h_ncompact_base,
-        int32_t        *h_seg_cnt_flat_base)
+        int32_t        *h_seg_cnt_flat_base,
+        /* CUDA stream to use – must NOT be the NULL/legacy default stream */
+        cudaStream_t    stream)
 {
     const int blk = 256;
 
@@ -315,12 +317,12 @@ static void run_voting_minibatch(
     cudaMalloc(&d_ref_min_d,    (size_t)mb_n             * sizeof(int32_t));
     cudaMalloc(&d_bin_size_d,   (size_t)mb_n             * sizeof(int32_t));
 
-    cudaMemcpy(d_ax,           mb_h_ax,         (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ay,           mb_h_ay,         (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_bin_off_d,    mb_bin_off,      (size_t)(mb_n + 1)       * sizeof(int32_t),  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_anchor_off_d, mb_anchor_off,   (size_t)(mb_n + 1)       * sizeof(int32_t),  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_ref_min_d,    mb_ref_min,      (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice);
-    cudaMemcpy(d_bin_size_d,   mb_bin_size_h,   (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_ax,           mb_h_ax,       (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_ay,           mb_h_ay,       (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_bin_off_d,    mb_bin_off,    (size_t)(mb_n + 1)       * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_anchor_off_d, mb_anchor_off, (size_t)(mb_n + 1)       * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_ref_min_d,    mb_ref_min,    (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_bin_size_d,   mb_bin_size_h, (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
 
     /* ---- bin-level arrays ---- */
     int32_t *d_votes, *d_seg_start, *d_seg_id;
@@ -329,7 +331,7 @@ static void run_voting_minibatch(
     cudaMalloc(&d_keep_bin,  (size_t)mb_total_bins * sizeof(int8_t));
     cudaMalloc(&d_seg_start, (size_t)mb_total_bins * sizeof(int32_t));
     cudaMalloc(&d_seg_id,    (size_t)mb_total_bins * sizeof(int32_t));
-    cudaMemset(d_votes, 0,   (size_t)mb_total_bins * sizeof(int32_t));
+    cudaMemsetAsync(d_votes, 0, (size_t)mb_total_bins * sizeof(int32_t), stream);
 
     /* ---- per-group scalars ---- */
     int32_t *d_nsegs_d, *d_ncompact_d;
@@ -345,15 +347,18 @@ static void run_voting_minibatch(
     /* ---- output arrays ---- */
     uint64_t *d_bx, *d_by;
     int32_t  *d_seg_cnt_flat_d;
-    cudaMalloc(&d_bx,              (size_t)mb_total_anchors * sizeof(uint64_t));
-    cudaMalloc(&d_by,              (size_t)mb_total_anchors * sizeof(uint64_t));
-    cudaMalloc(&d_seg_cnt_flat_d,  (size_t)mb_total_bins    * sizeof(int32_t));
-    cudaMemset(d_seg_cnt_flat_d, 0,(size_t)mb_total_bins    * sizeof(int32_t));
+    cudaMalloc(&d_bx,             (size_t)mb_total_anchors * sizeof(uint64_t));
+    cudaMalloc(&d_by,             (size_t)mb_total_anchors * sizeof(uint64_t));
+    cudaMalloc(&d_seg_cnt_flat_d, (size_t)mb_total_bins    * sizeof(int32_t));
+    cudaMemsetAsync(d_seg_cnt_flat_d, 0, (size_t)mb_total_bins * sizeof(int32_t), stream);
+
+    /* All 7 kernels and transfers run on 'stream' to avoid the implicit
+     * global barrier of the legacy NULL/default stream. */
 
     /* ---- step 1: voting histogram ---- */
     {
         int grd = (mb_total_anchors + blk - 1) / blk;
-        voting_bin_kernel_batched<<<grd, blk>>>(
+        voting_bin_kernel_batched<<<grd, blk, 0, stream>>>(
             d_ax, d_anchor_off_d, d_bin_off_d, d_ref_min_d, d_bin_size_d,
             d_votes, mb_n, mb_total_anchors);
     }
@@ -361,23 +366,25 @@ static void run_voting_minibatch(
     /* ---- step 2: mark + dilate ---- */
     {
         int grd = (mb_total_bins + blk - 1) / blk;
-        mark_dilate_kernel_batched<<<grd, blk>>>(
+        mark_dilate_kernel_batched<<<grd, blk, 0, stream>>>(
             d_votes, d_keep_bin, d_bin_off_d,
             min_votes, merge_gap_bins, mb_n, mb_total_bins);
     }
+    // cudaFree is safe here: CUDA ensures the free happens after all prior
+    // stream work completes (stream-ordered semantics via driver).
     cudaFree(d_votes);
 
     /* ---- step 3: segment-start flags ---- */
     {
         int grd = (mb_total_bins + blk - 1) / blk;
-        seg_start_kernel_batched<<<grd, blk>>>(
+        seg_start_kernel_batched<<<grd, blk, 0, stream>>>(
             d_keep_bin, d_seg_start, d_bin_off_d, mb_n, mb_total_bins);
     }
 
     /* ---- step 4: segmented inclusive prefix sum → seg IDs + n_segs ---- */
     {
         int grd = (mb_n + blk - 1) / blk;
-        seg_incl_sum_kernel<<<grd, blk>>>(
+        seg_incl_sum_kernel<<<grd, blk, 0, stream>>>(
             d_seg_start, d_seg_id, d_bin_off_d, d_nsegs_d, mb_n);
     }
     cudaFree(d_seg_start);
@@ -385,7 +392,7 @@ static void run_voting_minibatch(
     /* ---- step 5: tag anchors (mark + segment ID) ---- */
     {
         int grd = (mb_total_anchors + blk - 1) / blk;
-        tag_mark_kernel_batched<<<grd, blk>>>(
+        tag_mark_kernel_batched<<<grd, blk, 0, stream>>>(
             d_ax, d_anchor_off_d, d_bin_off_d, d_ref_min_d, d_bin_size_d,
             d_keep_bin, d_seg_id,
             d_mark, d_anchor_seg, mb_n, mb_total_anchors);
@@ -396,14 +403,14 @@ static void run_voting_minibatch(
     /* ---- step 6: segmented exclusive prefix sum → output positions + n_compact ---- */
     {
         int grd = (mb_n + blk - 1) / blk;
-        seg_excl_sum_kernel<<<grd, blk>>>(
+        seg_excl_sum_kernel<<<grd, blk, 0, stream>>>(
             d_mark, d_out_pos, d_anchor_off_d, d_ncompact_d, mb_n);
     }
 
     /* ---- step 7: scatter compact ---- */
     {
         int grd = (mb_total_anchors + blk - 1) / blk;
-        scatter_compact_kernel_batched<<<grd, blk>>>(
+        scatter_compact_kernel_batched<<<grd, blk, 0, stream>>>(
             d_ax, d_ay,
             d_mark, d_out_pos, d_anchor_seg,
             d_anchor_off_d, d_bin_off_d,
@@ -416,11 +423,15 @@ static void run_voting_minibatch(
     cudaFree(d_ref_min_d); cudaFree(d_bin_size_d);
 
     /* ---- D2H download into caller's full-batch host arrays ---- */
-    cudaMemcpy(h_bx_base,            d_bx,           (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_by_base,            d_by,           (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_nsegs_base,         d_nsegs_d,      (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ncompact_base,      d_ncompact_d,   (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_seg_cnt_flat_base,  d_seg_cnt_flat_d,(size_t)mb_total_bins   * sizeof(int32_t),  cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(h_bx_base,           d_bx,            (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_by_base,           d_by,            (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_nsegs_base,        d_nsegs_d,       (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_ncompact_base,     d_ncompact_d,    (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_seg_cnt_flat_base, d_seg_cnt_flat_d,(size_t)mb_total_bins    * sizeof(int32_t),  cudaMemcpyDeviceToHost, stream);
+
+    /* Sync here so the caller can use the D2H results immediately after return,
+     * and so cudaFree below doesn't race with the pending D2H transfers. */
+    cudaStreamSynchronize(stream);
 
     cudaFree(d_bx); cudaFree(d_by);
     cudaFree(d_nsegs_d); cudaFree(d_ncompact_d);
@@ -438,7 +449,8 @@ extern "C" {
  */
 void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                             chain_read_t *reads, int *rechain_indices,
-                            int n_rechain, Misc misc, void *km)
+                            int n_rechain, Misc misc, void *km,
+                            cudaStream_t stream)
 {
     if (n_rechain == 0) return;
 
@@ -626,7 +638,8 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
             h_by           + base_anchor,
             h_nsegs        + mb_g,
             h_ncompact     + mb_g,
-            h_seg_cnt_flat + base_bin);
+            h_seg_cnt_flat + base_bin,
+            stream);
 
         free(mb_h_ax); free(mb_h_ay);
         free(mb_bin_off); free(mb_anchor_off);

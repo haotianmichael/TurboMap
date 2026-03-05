@@ -305,9 +305,12 @@ void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_r
                 }
             }
 
-            // GPU voting-based re-chain if any reads need it
+            // GPU voting-based re-chain if any reads need it.
+            // Pass the chain stream so voting kernels run on it rather than
+            // the NULL/default stream (which is an implicit global barrier).
             if (n_rechain > 0) {
-                plvoting_rechain_batch(mi, opt, out_arr, rechain_indices, n_rechain, misc, km);
+                plvoting_rechain_batch(mi, opt, out_arr, rechain_indices, n_rechain, misc, km,
+                                       stream_setup.streams[stream_id].cudastream);
             }
             free(rechain_indices);
 
@@ -560,9 +563,10 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t*
         }
     }
 
-    // GPU voting-based re-chain if any reads need it
+    // GPU voting-based re-chain if any reads need it (use chain stream, not NULL stream).
     if (n_rechain > 0) {
-        plvoting_rechain_batch(mi, opt, reads, rechain_indices, n_rechain, misc, km);
+        plvoting_rechain_batch(mi, opt, reads, rechain_indices, n_rechain, misc, km,
+                               stream_setup.streams[t].cudastream);
     }
     free(rechain_indices);
 
@@ -576,6 +580,77 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t*
 
 }
 
+
+/**
+ * chain_stream_launch - submit a new chain batch to slot_id without waiting
+ *                       for any previous batch on that slot.
+ *
+ * The caller MUST ensure slot_id is not busy (i.e., chain_stream_collect was
+ * called previously or the slot was never used).
+ *
+ * Since the slot is not busy, plchain_cal_score_async skips the collect block
+ * and goes directly to H2D upload + kernel launch, then marks the slot busy.
+ * On return, the caller's reads/n_reads pointers are consumed (set to NULL/0).
+ */
+void chain_stream_launch(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                         chain_read_t *reads, int n_reads,
+                         int slot_id, void *km) {
+    assert(opt->max_frag_len <= 0);
+    assert(!stream_setup.streams[slot_id].busy);
+
+    Misc misc = build_misc(mi, opt, 0, 1);
+    /* plchain_cal_score_async takes the new batch as in/out parameters.
+     * It saves the reads pointer into stream_setup.streams[slot_id].reads,
+     * marks the slot busy, and returns with *reads_ = NULL, *n_read_ = 0.
+     * Because the slot is not busy the collect block is skipped. */
+    plchain_cal_score_async(mi, opt, &reads, &n_reads, misc, stream_setup, slot_id, km);
+    (void)reads; (void)n_reads; /* both are NULL/0 after the call */
+}
+
+/**
+ * chain_stream_collect - synchronize slot_id's chain stream, run backtrack +
+ *                        voting + post_chaining, and return the read array.
+ *
+ * Returns the chain_read_t array (owned by the slot) and n_reads_out.
+ * After this call slot_id is IDLE and can be reused with chain_stream_launch.
+ */
+chain_read_t *chain_stream_collect(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                                   int slot_id, int *n_reads_out, void *km) {
+    assert(opt->max_frag_len <= 0);
+    Misc misc = build_misc(mi, opt, 0, 1);
+
+    if (!stream_setup.streams[slot_id].busy) {
+        *n_reads_out = 0;
+        return NULL;
+    }
+
+    cudaStreamSynchronize(stream_setup.streams[slot_id].cudastream);
+
+    int n_read = plchain_post_gpu_helper(stream_setup, slot_id, misc, km);
+    chain_read_t *reads = stream_setup.streams[slot_id].reads;
+    stream_setup.streams[slot_id].busy = false;
+
+    if (reads) {
+        int *rechain_indices = (int *)malloc(sizeof(int) * n_read);
+        int n_rechain = 0;
+        for (int i = 0; i < n_read; i++) {
+            if (needs_rmq_rechain(opt, &reads[i]))
+                rechain_indices[n_rechain++] = i;
+        }
+        if (n_rechain > 0) {
+            plvoting_rechain_batch(mi, opt, reads, rechain_indices, n_rechain,
+                                   misc, km,
+                                   stream_setup.streams[slot_id].cudastream);
+        }
+        free(rechain_indices);
+
+        for (int i = 0; i < n_read; i++)
+            post_chaining_helper(mi, opt, &reads[i], misc, km);
+    }
+
+    *n_reads_out = n_read;
+    return reads;
+}
 
 void free_stream_gpu(int n_threads){
     plmem_stream_cleanup();

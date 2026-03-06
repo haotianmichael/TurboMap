@@ -61,41 +61,53 @@ __device__ static int64_t mg_chain_bk_end(int32_t max_drop, const int64_t *z_x,
 }
 
 // Kernel 1: Filter anchors by score and populate z arrays
+//
+// Optimization: one block per task.
+//   - Coalesced reads: all blockDim.x threads read g_sc[ofs + tid..+blockDim.x-1]
+//   - Parallel t[] zero: blockDim.x threads cover blockDim.x elements per step
+//   - Shared-memory atomic for the output index k: smem atomics serialize
+//     within the SM in ~5 cycles vs serial k++ which cannot overlap iterations.
+//     Output order before the CUB sort is arbitrary – the sort fixes it anyway.
 __global__ void mm_filter_anchors(int* n_a, int* offset, int32_t min_sc,
                                    int32_t* g_sc, int64_t* g_zx, int64_t* g_zy,
                                    int* ofs_end, int32_t* g_t, int* num_elements,
                                    int* g_n_v, int n_task)
 {
-    int id = threadIdx.x + blockIdx.x * blockDim.x;
+    __shared__ int s_k;  // shared output index counter
 
-    for(int job_idx = id; job_idx < n_task; job_idx += gridDim.x * blockDim.x) {
-        int ofs = offset[job_idx];
-        int n = n_a[job_idx];
-        int32_t* f = &g_sc[ofs];
-        int64_t* z_x = &g_zx[ofs];
-        int64_t* z_y = &g_zy[ofs];
-        int32_t* t = &g_t[ofs];
+    int task_id = blockIdx.x;
+    if (task_id >= n_task) return;
 
-        int64_t i, k, n_z = 0;
+    int ofs = offset[task_id];
+    int n   = n_a[task_id];
+    int32_t* f   = &g_sc[ofs];
+    int64_t* z_x = &g_zx[ofs];
+    int64_t* z_y = &g_zy[ofs];
+    int32_t* t   = &g_t[ofs];
 
-        // Initialize t (visited) array
-        for(int j = 0; j < n; j++) t[j] = 0;
+    if (threadIdx.x == 0) s_k = 0;
+    __syncthreads();
 
-        // Populate z[] - filter anchors by score
-        for (i = 0, k = 0; i < n; ++i) {
-            if (f[i] >= min_sc) {
-                ++n_z;
-                z_x[k] = (int64_t)f[i];
-                z_y[k++] = i;
-            }
+    // Parallel t[] zero – coalesced writes, blockDim.x elements per step
+    for (int j = threadIdx.x; j < n; j += blockDim.x)
+        t[j] = 0;
+    __syncthreads();
+
+    // Filter g_sc by min_sc; use smem atomic to claim output slot k
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        if (f[i] >= min_sc) {
+            int k = atomicAdd(&s_k, 1);   // shared-mem atomic – very fast
+            z_x[k] = (int64_t)f[i];
+            z_y[k] = (int64_t)i;
         }
+    }
+    __syncthreads();
 
-        num_elements[job_idx] = n_z;
-        ofs_end[job_idx] = ofs + n_z;
-
-        if(n_z <= 0) {
-            g_n_v[job_idx] = 0;
-        }
+    if (threadIdx.x == 0) {
+        int n_z = s_k;
+        num_elements[task_id] = n_z;
+        ofs_end[task_id]      = ofs + n_z;
+        if (n_z <= 0) g_n_v[task_id] = 0;
     }
 }
 
@@ -295,19 +307,21 @@ __global__ void mm_set_chain(int* g_na, int n_task, int32_t* g_ax, int32_t* g_ay
 
 // Helper to expand uint16_t predecessor to int64_t and convert to absolute index
 // This matches CPU version's p_rel2idx function
+//
+// Optimization: one block per task → all threads in a block access consecutive
+// p_rel[ofs+i..ofs+i+255] → coalesced 16-bit reads; same for int64_t writes.
+// Old: one thread per task with serial inner loop → uncoalesced + no ILP.
 __global__ void expand_p_to_int64(uint16_t* p_rel, int64_t* p_expanded, int* offset, int* n_a, int n_task)
 {
-    int id = threadIdx.x + blockIdx.x * blockDim.x;
-    for(int job_idx = id; job_idx < n_task; job_idx += gridDim.x * blockDim.x) {
-        int ofs = offset[job_idx];
-        int n = n_a[job_idx];
-        for (int i = 0; i < n; ++i) {
-            // Convert relative distance to absolute index (like CPU p_rel2idx)
-            if (p_rel[ofs + i] == 0)
-                p_expanded[ofs + i] = -1;
-            else
-                p_expanded[ofs + i] = i - p_rel[ofs + i];  // Absolute index
-        }
+    int task_id = blockIdx.x;
+    if (task_id >= n_task) return;
+
+    int ofs = offset[task_id];
+    int n   = n_a[task_id];
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        uint16_t r = p_rel[ofs + i];
+        p_expanded[ofs + i] = (r == 0) ? -1 : (int64_t)(i - (int)r);
     }
 }
 
@@ -373,13 +387,15 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
 
 
     // Expand uint16_t predecessors to int64_t (keep relative distance semantics)
-    expand_p_to_int64<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
+    // One block per read: coalesced uint16_t reads and int64_t writes.
+    expand_p_to_int64<<<n_reads, THREAD_NUM_SHORT, 0, stream>>>(
         dev_mem->d_p, d_p_abs, d_offset, d_n_a, n_reads);
 
     cudaStreamSynchronize(stream);
 
     // Step 1: Filter anchors by score
-    mm_filter_anchors<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
+    // One block per read; shared memory holds the output index counter (1 int).
+    mm_filter_anchors<<<n_reads, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, d_offset, min_sc, dev_mem->d_f, d_zx, d_zy,
         d_ofs_end, d_t, d_num_elements, d_n_v, n_reads);
 

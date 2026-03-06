@@ -248,8 +248,4 @@ void gpu_align_cleanup();
 // This should be called before gpu_align_batch_execute
 void gpu_align_set_device_mem(void *dev_mem_ptr);
 
-// Select which stream slot's device memory to use for subsequent alignment calls.
-// Use this before gpu_align_batch_execute() to switch between pipeline slots.
-void gpu_align_select_slot(int slot_id);
-
 #endif

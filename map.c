@@ -1537,25 +1537,34 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             }
  
             // 调用mm_update_extra更新统计信息
+            // P2/P3 optimisation: GPU already ran fix_cigar+stats for most tasks.
+            // Use GPU results unless leading I/D remains (pass 3b needed) or EQX mode.
             if (r->p && r->p->n_cigar > 0) {
-                uint8_t *qseq;
-                if(!rev || (opt->flag & MM_F_QSTRAND)) {
-                    qseq = ctx->qseq0[0] + qs1;
+                int use_gpu_stats = task->gpu_stats_valid &&
+                                    !(opt->flag & MM_F_EQX);
+                if (use_gpu_stats) {
+                    // GPU fix_cigar (passes 1/2/3a) already applied to CIGAR in-place.
+                    // Precision note: dp_max may differ +/-1 vs CPU (integer vs float log2).
+                    r->blen       = task->blen;
+                    r->mlen       = task->mlen;
+                    r->p->n_ambi  = task->n_ambi;
+                    r->p->dp_max  = task->dp_max;
+                    if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
                 } else {
-					qseq = ctx->qseq0[1] + qs1;  // Fix: use qs1, not qlen-qe1
+                    // CPU fallback: leading-I/D coordinate fix (pass 3b) or EQX mode.
+                    uint8_t *qseq;
+                    if (!rev || (opt->flag & MM_F_QSTRAND)) {
+                        qseq = ctx->qseq0[0] + qs1;
+                    } else {
+                        qseq = ctx->qseq0[1] + qs1;
+                    }
+                    uint8_t *tseq = (uint8_t*)kmalloc(km, re1 - rs1);
+                    mm_idx_getseq(mi, task->task_ctx.rid, rs1, re1, tseq);
+                    mm_update_extra(r, qseq, tseq, mat, opt->q, opt->e,
+                                   opt->flag & MM_F_EQX, !(opt->flag & MM_F_SR));
+                    if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
+                    kfree(km, tseq);
                 }
-                uint8_t *tseq = (uint8_t*)kmalloc(km, re1 - rs1);
-                mm_idx_getseq(mi, task->task_ctx.rid, rs1, re1, tseq);
-                
-                mm_update_extra(r, qseq, tseq, mat, opt->q, opt->e, 
-                               opt->flag & MM_F_EQX, !(opt->flag & MM_F_SR));
-                
-                // 处理trans_strand（splicing）
-                if (rev && r->p->trans_strand) {
-                    r->p->trans_strand ^= 3;
-                }
-                
-                kfree(km, tseq);
             }
         }
     }

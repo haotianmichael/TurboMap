@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
+#include <cub/device/device_scan.cuh>
 #include "plmem.cuh"
 #include "plrange.cuh"
 #include "plscore.cuh"
@@ -295,6 +296,38 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_align_cigar_buffer, cigar_buf_bytes);
     cudaMalloc(&dev_mem->d_align_cigar_lengths, cigar_len_bytes);
 
+    // P1: Compact CIGAR buffers
+    // compact_cigar: worst-case same size as stride buffer (all tasks have max CIGAR length)
+    // compact_offsets: (max_align_tasks + 1) entries so CUB ExclusiveSum output fits
+    cudaMalloc(&dev_mem->d_align_compact_cigar, cigar_buf_bytes);
+    cudaMalloc(&dev_mem->d_align_compact_offsets,
+               (dev_mem->max_align_tasks + 1) * sizeof(uint32_t));
+
+    // Query CUB DeviceScan::ExclusiveSum temp size (cast int* input, uint32_t* output)
+    // Use ExclusiveSum on cigar_lengths (int) → compact_offsets (uint32_t).
+    // CUB requires type match; we cast to (uint32_t*) for both since lengths are non-negative.
+    dev_mem->d_align_cub_tmp = nullptr;
+    dev_mem->align_cub_tmp_size = 0;
+    {
+        size_t tmp_bytes = 0;
+        // Use (int*) cast for both pointers so CUB deduces type=int consistently.
+        // d_align_compact_offsets is uint32_t* but same size as int; values are non-negative.
+        cub::DeviceScan::ExclusiveSum(nullptr, tmp_bytes,
+                                      dev_mem->d_align_cigar_lengths,
+                                      (int*)dev_mem->d_align_compact_offsets,
+                                      (int)dev_mem->max_align_tasks);
+        dev_mem->align_cub_tmp_size = tmp_bytes;
+        cudaMalloc(&dev_mem->d_align_cub_tmp, tmp_bytes);
+    }
+
+    // P2: GPU alignment statistics buffers (one entry per task slot)
+    size_t stats_bytes = dev_mem->max_align_tasks * sizeof(int32_t);
+    cudaMalloc(&dev_mem->d_align_blen,            stats_bytes);
+    cudaMalloc(&dev_mem->d_align_mlen,            stats_bytes);
+    cudaMalloc(&dev_mem->d_align_n_ambi,          stats_bytes);
+    cudaMalloc(&dev_mem->d_align_dp_max,          stats_bytes);
+    cudaMalloc(&dev_mem->d_align_gpu_stats_valid, stats_bytes);
+
     // Result structures
     cudaMalloc(&dev_mem->d_align_device_res, sizeof(gasal_res_t));
     cudaMalloc(&dev_mem->d_align_ez_array, sizeof(ksw_extz_t) * short_task_batch_size);
@@ -416,6 +449,14 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     if (dev_mem->d_align_backtrack_n_col) cudaFree(dev_mem->d_align_backtrack_n_col);
     if (dev_mem->d_align_cigar_buffer) cudaFree(dev_mem->d_align_cigar_buffer);
     if (dev_mem->d_align_cigar_lengths) cudaFree(dev_mem->d_align_cigar_lengths);
+    if (dev_mem->d_align_compact_cigar)   cudaFree(dev_mem->d_align_compact_cigar);
+    if (dev_mem->d_align_compact_offsets) cudaFree(dev_mem->d_align_compact_offsets);
+    if (dev_mem->d_align_cub_tmp)         cudaFree(dev_mem->d_align_cub_tmp);
+    if (dev_mem->d_align_blen)            cudaFree(dev_mem->d_align_blen);
+    if (dev_mem->d_align_mlen)            cudaFree(dev_mem->d_align_mlen);
+    if (dev_mem->d_align_n_ambi)          cudaFree(dev_mem->d_align_n_ambi);
+    if (dev_mem->d_align_dp_max)          cudaFree(dev_mem->d_align_dp_max);
+    if (dev_mem->d_align_gpu_stats_valid) cudaFree(dev_mem->d_align_gpu_stats_valid);
     if (dev_mem->d_align_device_res) cudaFree(dev_mem->d_align_device_res);
     if (dev_mem->d_align_ez_array) cudaFree(dev_mem->d_align_ez_array);
     if (dev_mem->d_align_scores) cudaFree(dev_mem->d_align_scores);

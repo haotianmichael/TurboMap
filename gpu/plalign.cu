@@ -2,6 +2,7 @@
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
+#include <cub/device/device_scan.cuh>
 
 
 #define CHECKCUDAERROR(error) \
@@ -104,6 +105,267 @@ __global__ void init_gasal_res(gasal_res_t *res,
         res->n_cigar_ops = NULL;
     }
 }
+// ============================================================
+// P1: Compact CIGAR kernel
+// Copies stride-layout CIGAR (d_cigar_buffer[task * max_len + i])
+// into compact layout (d_compact_cigar[offsets[task] + i]).
+// Launch: <<<batch_size, 256, 0, stream>>>
+// ============================================================
+__global__ void compact_cigar_kernel(
+    const uint32_t * __restrict__ src,     // stride layout (task * max_len)
+    uint32_t       * __restrict__ dst,     // compact layout (offsets[task])
+    const uint32_t * __restrict__ offsets, // exclusive prefix-sum of lengths
+    const int      * __restrict__ lengths, // n_cigar per task
+    int              max_len               // stride width
+) {
+    int task_id = blockIdx.x;
+    int n = lengths[task_id];
+    if (n <= 0) return;
+    uint32_t dst_base = offsets[task_id];
+    uint32_t src_base = (uint32_t)task_id * (uint32_t)max_len;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        dst[dst_base + i] = src[src_base + i];
+}
+
+// ============================================================
+// P3/P2: gpu_fix_cigar device function (called by thread 0 only)
+//
+// Performs:
+//   Pass 1 – left-align indels (shift indel earlier if sequence allows)
+//   Pass 2 – consolidate runs like 5I6D7I → single I + single D
+//   Pass 3a – squeeze zero-length ops + merge adjacent same-op
+//   Pass 3b – SKIPPED (leading I/D removal adjusts coordinates; handled by CPU)
+//
+// Returns true if a leading I or D still exists (signals CPU fallback needed).
+//
+// Precision note: identical logic to CPU mm_fix_cigar; no precision difference.
+// ============================================================
+#define GPU_CIGAR_MATCH  0u
+#define GPU_CIGAR_INS    1u
+#define GPU_CIGAR_DEL    2u
+#define GPU_CIGAR_N_SKIP 3u
+
+__device__ static bool gpu_fix_cigar(
+    uint32_t *cigar, int32_t *n_cigar_p,
+    const uint8_t *qseq, const uint8_t *tseq
+) {
+    int32_t nc = *n_cigar_p;
+    if (nc == 0) return false;
+    if (nc == 1) {
+        uint32_t op0 = cigar[0] & 0xfu;
+        return (op0 == GPU_CIGAR_INS || op0 == GPU_CIGAR_DEL);
+    }
+
+    int toff = 0, qoff = 0, to_shrink = 0;
+
+    // Pass 1: left-align indels
+    for (int k = 0; k < nc; ++k) {
+        uint32_t op  = cigar[k] & 0xfu;
+        uint32_t len = cigar[k] >> 4;
+        if (len == 0) to_shrink = 1;
+        if (op == GPU_CIGAR_MATCH) {
+            toff += (int)len; qoff += (int)len;
+        } else if (op == GPU_CIGAR_INS || op == GPU_CIGAR_DEL) {
+            if (k > 0 && k < nc - 1 &&
+                (cigar[k-1] & 0xfu) == GPU_CIGAR_MATCH &&
+                (cigar[k+1] & 0xfu) == GPU_CIGAR_MATCH)
+            {
+                int prev_len = (int)(cigar[k-1] >> 4);
+                int l = 0;
+                if (op == GPU_CIGAR_INS) {
+                    for (l = 0; l < prev_len; ++l)
+                        if (qseq[qoff - 1 - l] != qseq[qoff + (int)len - 1 - l]) break;
+                } else {
+                    for (l = 0; l < prev_len; ++l)
+                        if (tseq[toff - 1 - l] != tseq[toff + (int)len - 1 - l]) break;
+                }
+                if (l > 0) {
+                    cigar[k-1] -= (uint32_t)l << 4;
+                    cigar[k+1] += (uint32_t)l << 4;
+                    qoff -= l; toff -= l;
+                }
+                if (l == prev_len) to_shrink = 1;
+            }
+            if (op == GPU_CIGAR_INS) qoff += (int)len;
+            else                     toff += (int)len;
+        } else if (op == GPU_CIGAR_N_SKIP) {
+            toff += (int)len;
+        }
+    }
+
+    // Pass 2: consolidate I+D runs (e.g. 5I6D7I → 12I6D)
+    for (int k = 0; k < nc - 2; ++k) {
+        uint32_t op_k = cigar[k] & 0xfu;
+        if (op_k > 0u && op_k + (cigar[k+1] & 0xfu) == 3u) {
+            uint32_t s1 = 0, s2 = 0;
+            int l;
+            for (l = k; l < nc; ++l) {
+                uint32_t op2 = cigar[l] & 0xfu;
+                if (op2 == GPU_CIGAR_INS)      s1 += cigar[l] >> 4;
+                else if (op2 == GPU_CIGAR_DEL) s2 += cigar[l] >> 4;
+                else if (cigar[l] >> 4 == 0)   { /* zero-length: skip */ }
+                else break;
+            }
+            if (s1 > 0 && s2 > 0 && l - k > 2) {
+                cigar[k]   = (s1 << 4) | GPU_CIGAR_INS;
+                cigar[k+1] = (s2 << 4) | GPU_CIGAR_DEL;
+                for (int m = k + 2; m < l; ++m) cigar[m] &= 0xfu; // zero lengths
+                to_shrink = 1;
+            }
+            k = l - 1; // outer loop will ++k → skip to l
+        }
+    }
+
+    // Pass 3a: squeeze zero-length ops + merge adjacent same-op
+    if (to_shrink) {
+        // Squeeze zeros
+        int32_t l = 0;
+        for (int k = 0; k < nc; ++k)
+            if (cigar[k] >> 4 != 0u) cigar[l++] = cigar[k];
+        nc = l;
+        // Merge adjacent same-op
+        l = 0;
+        for (int k = 0; k < nc; ++k) {
+            if (k == nc - 1 || (cigar[k] & 0xfu) != (cigar[k+1] & 0xfu))
+                cigar[l++] = cigar[k];
+            else
+                cigar[k+1] += cigar[k] >> 4 << 4; // accumulate length into next
+        }
+        nc = l;
+    }
+
+    *n_cigar_p = nc;
+    // Pass 3b skipped: return whether leading I/D remains (CPU must handle it)
+    return nc > 0 && ((cigar[0] & 0xfu) == GPU_CIGAR_INS || (cigar[0] & 0xfu) == GPU_CIGAR_DEL);
+}
+
+// ============================================================
+// P2/P3: gpu_fix_cigar_and_stats kernel
+//
+// One block per task (blockIdx.x = batch slot / align_id).
+// Thread 0 runs gpu_fix_cigar() then computes alignment stats.
+// Other threads are unused (1 thread per block launch for simplicity).
+//
+// Writes: updated cigar_lengths, blen, mlen, n_ambi, dp_max, gpu_stats_valid.
+//
+// Precision notes vs CPU mm_update_extra:
+//   - dp_max: uses integer log2 (31-__clz(1+len)) vs CPU float mg_log2 → ±1 in dp_max
+//   - EQX mode: not handled here; caller checks gpu_stats_valid before using stats
+//   - Leading I/D (pass 3b): sets gpu_stats_valid=0, CPU mm_update_extra handles it
+// ============================================================
+__global__ void gpu_fix_cigar_and_stats(
+    uint32_t       *compact_cigar,         // in/out: compact CIGAR (writable)
+    const uint32_t * __restrict__ offsets, // per-task start in compact_cigar
+    int32_t        *cigar_lengths,         // in/out: n_cigar (updated by fix)
+    const uint8_t  * __restrict__ d_query, // unpacked query sequences
+    const uint8_t  * __restrict__ d_target,// unpacked target sequences
+    const uint32_t * __restrict__ d_query_offsets,  // byte offsets into d_query
+    const uint32_t * __restrict__ d_target_offsets, // byte offsets into d_target
+    const int8_t   * __restrict__ d_mat,   // 5×5 scoring matrix
+    int32_t         q_open,                // gap open penalty
+    int32_t         e_ext,                 // gap extend penalty
+    int             log_gap,               // 1 = use log-gap scoring
+    int32_t        *d_blen,
+    int32_t        *d_mlen,
+    int32_t        *d_n_ambi,
+    int32_t        *d_dp_max,
+    int32_t        *d_gpu_stats_valid,
+    int             batch_size
+) {
+    int task_id = blockIdx.x;
+    if (task_id >= batch_size) return;
+
+    // Only thread 0 does work (single-threaded sequential logic per task)
+    if (threadIdx.x != 0) return;
+
+    int32_t nc = cigar_lengths[task_id];
+    if (nc <= 0) {
+        d_blen[task_id]            = 0;
+        d_mlen[task_id]            = 0;
+        d_n_ambi[task_id]          = 0;
+        d_dp_max[task_id]          = 0;
+        d_gpu_stats_valid[task_id] = 1;
+        return;
+    }
+
+    uint32_t cigar_base         = offsets[task_id];
+    uint32_t *cigar             = compact_cigar + cigar_base;
+    const uint8_t *qseq         = d_query  + d_query_offsets[task_id];
+    const uint8_t *tseq         = d_target + d_target_offsets[task_id];
+
+    // Pass 1/2/3a: fix CIGAR in-place
+    bool has_leading_indel = gpu_fix_cigar(cigar, &nc, qseq, tseq);
+    cigar_lengths[task_id] = nc;
+
+    if (has_leading_indel) {
+        // Pass 3b would adjust coordinates — CPU must handle this task
+        d_gpu_stats_valid[task_id] = 0;
+        return;
+    }
+
+    // Compute blen, mlen, n_ambi, dp_max via sequential scan
+    int8_t mat[25];
+    for (int i = 0; i < 25; i++) mat[i] = d_mat[i];
+
+    int32_t blen = 0, mlen = 0, n_ambi = 0;
+    double s = 0.0, max_s = 0.0;
+    int toff = 0, qoff = 0;
+
+    for (int k = 0; k < nc; ++k) {
+        uint32_t op  = cigar[k] & 0xfu;
+        uint32_t len = cigar[k] >> 4;
+
+        if (op == GPU_CIGAR_MATCH) {
+            int na = 0, nd = 0;
+            for (uint32_t l = 0; l < len; ++l) {
+                int cq = (int)qseq[qoff + l];
+                int ct = (int)tseq[toff + l];
+                if (ct > 3 || cq > 3) { na++; }
+                else if (ct != cq)    { nd++; }
+                s += (double)mat[ct * 5 + cq];
+                if (s < 0.0)      s = 0.0;
+                else if (s > max_s) max_s = s;
+            }
+            blen   += (int)len - na;
+            mlen   += (int)len - (na + nd);
+            n_ambi += na;
+            toff   += (int)len;
+            qoff   += (int)len;
+        } else if (op == GPU_CIGAR_INS) {
+            int na = 0;
+            for (uint32_t l = 0; l < len; ++l)
+                if (qseq[qoff + l] > 3) na++;
+            blen   += (int)len - na;
+            n_ambi += na;
+            // log_gap: penalty = q + e * floor(log2(1+len))
+            // Integer approximation: 31 - __clz(1u + len) = floor(log2(1+len))
+            // Precision note: differs from CPU float mg_log2 at most by ±1 in integer part
+            if (log_gap) s -= (double)q_open + (double)e_ext * (double)(31 - __clz(1u + len));
+            else         s -= (double)q_open + (double)e_ext;
+            if (s < 0.0) s = 0.0;
+            qoff += (int)len;
+        } else if (op == GPU_CIGAR_DEL) {
+            int na = 0;
+            for (uint32_t l = 0; l < len; ++l)
+                if (tseq[toff + l] > 3) na++;
+            blen   += (int)len - na;
+            n_ambi += na;
+            if (log_gap) s -= (double)q_open + (double)e_ext * (double)(31 - __clz(1u + len));
+            else         s -= (double)q_open + (double)e_ext;
+            if (s < 0.0) s = 0.0;
+            toff += (int)len;
+        } else if (op == GPU_CIGAR_N_SKIP) {
+            toff += (int)len;
+        }
+    }
+
+    d_blen[task_id]            = blen;
+    d_mlen[task_id]            = mlen;
+    d_n_ambi[task_id]          = n_ambi;
+    d_dp_max[task_id]          = (int32_t)(max_s + 0.499);
+    d_gpu_stats_valid[task_id] = 1;
+}
+
 extern "C" void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                             uint8_t *seq_buffer, uint32_t *cigar_buffer);
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
@@ -191,6 +453,16 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int  *d_task_counter = dev_mem->d_align_task_counter;
     int   n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
     cudaStream_t align_stream = dev_mem->align_stream;
+    // P1/P2/P3 device buffers
+    uint32_t *d_compact_cigar   = dev_mem->d_align_compact_cigar;
+    uint32_t *d_compact_offsets = dev_mem->d_align_compact_offsets;
+    void     *d_cub_tmp         = dev_mem->d_align_cub_tmp;
+    size_t    cub_tmp_size      = dev_mem->align_cub_tmp_size;
+    int32_t  *d_blen            = dev_mem->d_align_blen;
+    int32_t  *d_mlen            = dev_mem->d_align_mlen;
+    int32_t  *d_n_ambi          = dev_mem->d_align_n_ambi;
+    int32_t  *d_dp_max          = dev_mem->d_align_dp_max;
+    int32_t  *d_gpu_stats_valid = dev_mem->d_align_gpu_stats_valid;
 
     // Host buffers for CIGAR and results
     // Note: Device buffer is sized for 10000 short tasks OR 200 long tasks (same total size)
@@ -204,10 +476,17 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t long_batch_persistent   = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;  // 2400
     size_t max_batch_size = (short_batch_persistent > long_batch_persistent) ?
                              short_batch_persistent : long_batch_persistent;  // 120000
-    // CIGAR host buffer covers the largest phase (short: 120000×2000×4=960MB)
-    size_t cigar_buffer_size = max_batch_size * max_cigar_len;  // 240M uint32_t entries = 960MB
-    uint32_t *h_cigar_buffer = (uint32_t*)calloc(cigar_buffer_size, sizeof(uint32_t));
+    // P1: Compact CIGAR host buffer (worst-case same total elements, but D2H transfers only real data)
+    size_t cigar_buffer_size = max_batch_size * max_cigar_len;  // 240M uint32_t entries = 960MB worst-case
+    uint32_t *h_compact_cigar   = (uint32_t*)malloc(cigar_buffer_size * sizeof(uint32_t));
+    uint32_t *h_compact_offsets = (uint32_t*)calloc(max_batch_size, sizeof(uint32_t));
     int *h_cigar_lengths = (int*)calloc(max_batch_size, sizeof(int));
+    // P2: GPU stats host buffers
+    int32_t *h_blen            = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
+    int32_t *h_mlen            = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
+    int32_t *h_n_ambi          = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
+    int32_t *h_dp_max          = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
+    int32_t *h_gpu_stats_valid = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
     int32_t *h_scores = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
     int32_t *h_query_ends = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
     int32_t *h_target_ends = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
@@ -469,51 +748,54 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         cudaGetErrorString(kernel_err));
             }
 
-            // Queue D2H transfers after kernel on align_stream — no global sync needed.
-            // Chain stream remains free to process the next batch concurrently.
+            // P1/P2/P3: GPU compaction + fix_cigar + stats before D2H
+            // This eliminates the 960MB stride CIGAR D2H transfer and the CPU mm_fix_cigar/mm_update_extra loop.
             if (cigar_buffer) {
-                cudaMemcpyAsync(h_cigar_buffer,
-                                d_cigar_buffer,
-                                batch_size * current_max_cigar_len * sizeof(uint32_t),
-                                cudaMemcpyDeviceToHost, align_stream);
-                cudaMemcpyAsync(h_cigar_lengths,
-                                d_cigar_lengths,
-                                batch_size * sizeof(int),
-                                cudaMemcpyDeviceToHost, align_stream);
+                // Step A: compute per-task compact offsets via exclusive prefix sum
+                cub::DeviceScan::ExclusiveSum(d_cub_tmp, cub_tmp_size,
+                                              d_cigar_lengths, (int*)d_compact_offsets,
+                                              batch_size, align_stream);
+
+                // Step B: scatter stride CIGAR → compact CIGAR
+                compact_cigar_kernel<<<batch_size, 256, 0, align_stream>>>(
+                    d_cigar_buffer, d_compact_cigar, d_compact_offsets,
+                    d_cigar_lengths, (int)current_max_cigar_len
+                );
+
+                // Step C: fix CIGAR in-place + compute alignment stats (one thread per task block)
+                // Sequences still valid in d_unpacked_query/target (same stream, not yet overwritten)
+                gpu_fix_cigar_and_stats<<<batch_size, 1, 0, align_stream>>>(
+                    d_compact_cigar, d_compact_offsets, d_cigar_lengths,
+                    d_unpacked_query, d_unpacked_target,
+                    d_query_offsets, d_target_offsets,
+                    d_mat, opt->q, opt->e, !(opt->flag & MM_F_SR),
+                    d_blen, d_mlen, d_n_ambi, d_dp_max, d_gpu_stats_valid,
+                    batch_size
+                );
             }
 
-            // Copy results back (async, ordered after kernel via align_stream)
-            cudaMemcpyAsync(h_scores,
-                            d_scores,
-                            batch_size * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost, align_stream);
-            cudaMemcpyAsync(h_query_ends,
-                            d_query_ends,
-                            batch_size * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost, align_stream);
-            cudaMemcpyAsync(h_target_ends,
-                            d_target_ends,
-                            batch_size * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost, align_stream);
-            cudaMemcpyAsync(h_mqe,
-                            d_mqe,
-                            batch_size * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost, align_stream);
-            cudaMemcpyAsync(h_mqe_t,
-                            d_mqe_t,
-                            batch_size * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost, align_stream);
-            cudaMemcpyAsync(h_mte,
-                            d_mte,
-                            batch_size * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost, align_stream);
-            cudaMemcpyAsync(h_mte_q,
-                            d_mte_q,
-                            batch_size * sizeof(int32_t),
-                            cudaMemcpyDeviceToHost, align_stream);
+            // D2H Sync 1: small arrays — CIGAR lengths, scores, endpoints, GPU stats
+            // The compact CIGAR bulk D2H happens after we know total_cigar_ops (see Sync 2 below).
+            if (cigar_buffer) {
+                cudaMemcpyAsync(h_cigar_lengths, d_cigar_lengths,
+                                batch_size * sizeof(int), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_blen,   d_blen,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_mlen,   d_mlen,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_n_ambi, d_n_ambi, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_dp_max, d_dp_max, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_gpu_stats_valid, d_gpu_stats_valid,
+                                batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+            }
+            // Copy score/endpoint results back (async, ordered after kernel via align_stream)
+            cudaMemcpyAsync(h_scores,      d_scores,      batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_query_ends,  d_query_ends,  batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_target_ends, d_target_ends, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_mqe,   d_mqe,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_mqe_t, d_mqe_t, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_mte,   d_mte,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_mte_q, d_mte_q, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
 
-            // Wait only for align_stream — chain stream is free during this sync.
-            // After this point host buffers are valid for CPU result mapping.
+            // Sync 1: wait for small arrays (D2H above) to arrive on host
             cudaStreamSynchronize(align_stream);
             kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
@@ -521,6 +803,21 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         cudaGetErrorString(kernel_err));
             }
             cudaCheck();
+
+            // Sync 2: D2H compact CIGAR (only actual data, no stride padding)
+            // Compute host-side prefix offsets from h_cigar_lengths, then copy only total_cigar_ops entries.
+            int total_cigar_ops = 0;
+            if (cigar_buffer) {
+                for (int i = 0; i < batch_size; i++) {
+                    h_compact_offsets[i] = (uint32_t)total_cigar_ops;
+                    total_cigar_ops += h_cigar_lengths[i];
+                }
+                if (total_cigar_ops > 0) {
+                    // Transfer only the compacted, fixed CIGAR data — typically 10-40× smaller than stride layout
+                    cudaMemcpy(h_compact_cigar, d_compact_cigar,
+                               total_cigar_ops * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+                }
+            }
 
             // Map results back to tasks
             for (int i = 0; i < batch_size; i++) {
@@ -542,15 +839,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 tasks[task_idx].mte = h_mte[align_id];
                 tasks[task_idx].mte_q = h_mte_q[align_id];
 
-                // Copy CIGAR to output buffer
+                // Copy compact CIGAR to output buffer (no stride, direct copy from compact layout)
                 if (cigar_buffer) {
                     int n_cigar = h_cigar_lengths[align_id];
                     tasks[task_idx].n_cigar = n_cigar;
-
-                    // Copy CIGAR operations (check n_cigar doesn't exceed allocated capacity)
                     if (n_cigar > 0 && n_cigar <= tasks[task_idx].max_cigar) {
                         memcpy(cigar_buffer + tasks[task_idx].cigar_offset,
-                               h_cigar_buffer + align_id * current_max_cigar_len,
+                               h_compact_cigar + h_compact_offsets[align_id],
                                n_cigar * sizeof(uint32_t));
                     } else if (n_cigar > tasks[task_idx].max_cigar) {
                         tasks[task_idx].n_cigar = 0;  // Reset to avoid corruption
@@ -558,6 +853,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 } else {
                     tasks[task_idx].n_cigar = 0;
                 }
+
+                // Store GPU-computed alignment stats (used in map.c to skip CPU mm_update_extra)
+                tasks[task_idx].blen            = h_blen[align_id];
+                tasks[task_idx].mlen            = h_mlen[align_id];
+                tasks[task_idx].n_ambi          = h_n_ambi[align_id];
+                tasks[task_idx].dp_max          = h_dp_max[align_id];
+                tasks[task_idx].gpu_stats_valid = h_gpu_stats_valid[align_id];
 
                 // Set completion flags
                 // In approx_max mode, use backtrack endpoints (h_query_ends/h_target_ends) to check reach_end
@@ -619,8 +921,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     free(h_target_lens);
     free(h_flag);
     free(h_task_to_align_id);
-    free(h_cigar_buffer);
+    free(h_compact_cigar);
+    free(h_compact_offsets);
     free(h_cigar_lengths);
+    free(h_blen);
+    free(h_mlen);
+    free(h_n_ambi);
+    free(h_dp_max);
+    free(h_gpu_stats_valid);
     free(h_scores);
     free(h_query_ends);
     free(h_target_ends);

@@ -136,6 +136,19 @@ typedef struct {
     size_t max_align_backtrack_size; // per task
     size_t max_align_cigar_len;      // per task
 
+    // P1: Compact CIGAR buffers (GPU compaction eliminates stride padding)
+    uint32_t *d_align_compact_cigar;   // compact CIGAR (no padding), same max size as stride buffer
+    uint32_t *d_align_compact_offsets; // per-task start offset in compact buffer (exclusive prefix sum)
+    void     *d_align_cub_tmp;         // CUB DeviceScan temporary storage
+    size_t    align_cub_tmp_size;      // size of CUB temporary storage
+
+    // P2: GPU alignment statistics (computed by gpu_fix_cigar_and_stats kernel)
+    int32_t *d_align_blen;            // blen per task
+    int32_t *d_align_mlen;            // mlen per task
+    int32_t *d_align_n_ambi;          // n_ambi per task
+    int32_t *d_align_dp_max;          // dp_max per task
+    int32_t *d_align_gpu_stats_valid; // 1 if GPU stats valid (no leading I/D), 0 = CPU fallback
+
     // Result buffers
     void *d_align_device_res;        // gasal_res_t structure
     void *d_align_ez_array;          // ksw_extz_t array

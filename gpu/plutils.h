@@ -131,6 +131,15 @@ typedef struct {
     uint8_t zdropped;       // whether zdropped
     uint8_t reach_end;      // whether reached end
 
+    // P2/P3: GPU-computed alignment statistics (gpu_fix_cigar_and_stats kernel)
+    // Precision note: dp_max uses integer log2 (31-__clz) vs CPU float polynomial → ±1 difference
+    // gpu_stats_valid=0 when CIGAR starts with leading I/D (rare) → CPU mm_update_extra fallback
+    int32_t blen;            // aligned block length (excl. ambiguous bases)
+    int32_t mlen;            // match length (excl. mismatches + ambiguous)
+    int32_t n_ambi;          // ambiguous base count
+    int32_t dp_max;          // max local DP score (rounded from double)
+    int32_t gpu_stats_valid; // 1 = GPU stats valid; 0 = use CPU mm_update_extra
+
     task_ctx_t task_ctx;    // coor
 } gpu_align_task_t;
 

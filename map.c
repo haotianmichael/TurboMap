@@ -1923,219 +1923,276 @@ static void deep_copy_read_to_batch(mm_batch_trbuf_t *dst, const chain_read_t *s
 static void* gpu_batch_consumer(void *data) {
     step_t *s = (step_t*)data;
     mm_tbuf_t *b = s->buf[0];
+    
+    mm_batch_trbuf_t acc_batch, launched_batch, pending_batch;
 
-    /*
-     * Double-buffer pipeline: buf[0] and buf[1] alternate roles.
-     *
-     *   buf[cur]  — currently accumulating reads from the queue
-     *   buf[prev] — chain kernels launched on GPU; KSW runs while next chain launches
-     *
-     * Timeline (per flush):
-     *   GPU chain stream:  ... chain[N-1] done | chain[N] running ...
-     *   GPU align stream:                      | KSW[N-1] running ...
-     *   CPU:               collect chain[N-1] → submit KSW[N-1] → wait KSW done
-     *
-     * chain[N] and KSW[N-1] run concurrently on different CUDA streams → true overlap.
-     */
-    mm_batch_trbuf_t buf[2];
+    // fallback_batch: collects reads that overflowed GPU capacity during the main loop.
+    // After the main loop they are submitted together to the GPU chain pipeline,
+    // avoiding inline single-threaded CPU chaining.
     mm_batch_trbuf_t fallback_batch;
 
-    for (int i = 0; i < 2; i++) {
-        buf[i].km    = km_init();
-        buf[i].count = 0;
-        buf[i].total_n = 0;
-        buf[i].reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
-        memset(buf[i].reads, 0, s->batch_max_reads * sizeof(chain_read_t));
-        buf[i].batchid = i;
-    }
+    acc_batch.km = km_init();
+    acc_batch.count = 0;
+    acc_batch.total_n = 0;
+    acc_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
+	memset(acc_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
+    acc_batch.batchid = 0;
 
-    fallback_batch.km    = km_init();
+    launched_batch.km = km_init();
+    launched_batch.count = 0;
+    launched_batch.total_n = 0;
+    launched_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
+	memset(launched_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
+    launched_batch.batchid = 2;
+
+    pending_batch.km = km_init();
+    pending_batch.count = 0;
+    pending_batch.total_n = 0;
+    pending_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
+	memset(pending_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
+    pending_batch.batchid = 1;
+
+    fallback_batch.km = km_init();
     fallback_batch.count = 0;
     fallback_batch.total_n = 0;
     fallback_batch.reads = (chain_read_t*)malloc(s->batch_max_reads * sizeof(chain_read_t));
     memset(fallback_batch.reads, 0, s->batch_max_reads * sizeof(chain_read_t));
     fallback_batch.batchid = -1;
 
-    int cur  = 0;   /* buf index being accumulated */
-    int prev = -1;  /* buf index of last chain submission (-1 = none) */
+    int is_full = 0;
     int has_launched = 0;
+    int is_pending = 0;
     int queue_finished = 0;
-
+    
     chain_read_t read;
-
-    /* ------------------------------------------------------------------ *
-     * Helper: process a completed chain batch (buf[prev]) through KSW.
-     * Overflow reads are deferred to fallback_batch.
-     * 'result_count' = number of reads chain actually processed (<= buf[prev].count).
-     * ------------------------------------------------------------------ */
-#define PROCESS_PREV_CHAIN(result_count) do {                                   \
-    int _rc = (result_count);                                                   \
-    /* Overflow reads that chain could not fit → fallback */                    \
-    for (int _k = _rc; _k < buf[prev].count; _k++) {                           \
-        fprintf(stderr, "[INFO] Deferring overflow read %d to fallback batch\n", _k); \
-        deep_copy_read_to_batch(&fallback_batch, &buf[prev].reads[_k], s->p->opt); \
-    }                                                                           \
-    /* Update rep_len / frag_gap for reads that completed chaining */           \
-    for (int _ir = 0; _ir < _rc; _ir++) {                                      \
-        int _i = buf[prev].reads[_ir].seq.i;                                   \
-        int _js = buf[prev].reads[_ir].seq.seg_id;                             \
-        int _off = s->seg_off[_i] + _js;                                       \
-        for (int _k = 0; _k < buf[prev].reads[_ir].n_seg; _k++) {             \
-            s->rep_len[_off + _k]  = buf[prev].reads[_ir].rep_len;             \
-            s->frag_gap[_off + _k] = buf[prev].reads[_ir].frag_gap;           \
-        }                                                                       \
-    }                                                                           \
-    if (mm_dbg_flag & MM_DBG_PRINT_QNAME)                                      \
-        fprintf(stderr, "ALIGN_BATCH: count=%d\n", _rc);                       \
-    buf[prev].count = _rc;                                                      \
-    /* GPU alignment — runs concurrently with chain[cur] on a separate stream */\
-    prepare_align_batch_gpu(&buf[prev], b, s);                                  \
-    mm_trbuf_batch_reset(&buf[prev], s->batch_max_reads, s->p->opt);           \
-} while (0)
-
+    
+    // 主循环：累积reads
     while (1) {
-        /* --- Step 1: accumulate one read from the queue --- */
+        // Step 1: 从队列pop一个read（如果队列还没结束）
+        int got_read = 0;
         if (!queue_finished) {
-            if (pop_seeded_read(g_seeded_queue, &read)) {
-                chain_read_t *br = &buf[cur].reads[buf[cur].count];
-                *br = read;
-
+            got_read = pop_seeded_read(g_seeded_queue, &read);
+            
+            if (got_read) {
+                // 深拷贝read到acc_batch（使用acc_batch的km）
+                chain_read_t *batch_read = &acc_batch.reads[acc_batch.count];
+                *batch_read = read;
+                
                 if (s->p->opt->flag & MM_F_INDEPEND_SEG) {
-                    br->qlens = (int*)kmalloc(buf[cur].km, sizeof(int));
-                    br->qseqs = (const char**)kmalloc(buf[cur].km, sizeof(const char*));
-                    br->qlens[0] = read.qlens[0];
-                    br->qseqs[0] = read.qseqs[0];
+                    batch_read->qlens = (int*)kmalloc(acc_batch.km, sizeof(int));
+                    batch_read->qseqs = (const char**)kmalloc(acc_batch.km, sizeof(const char*));
+                    batch_read->qlens[0] = read.qlens[0];
+                    batch_read->qseqs[0] = read.qseqs[0];
                 } else {
-                    br->qlens = (int*)kmalloc(buf[cur].km, sizeof(int) * read.n_seg);
-                    br->qseqs = (const char**)kmalloc(buf[cur].km, sizeof(const char*) * read.n_seg);
-                    memcpy(br->qlens, read.qlens, sizeof(int) * read.n_seg);
-                    memcpy(br->qseqs, read.qseqs, sizeof(const char*) * read.n_seg);
+                    batch_read->qlens = (int*)kmalloc(acc_batch.km, sizeof(int) * read.n_seg);
+                    batch_read->qseqs = (const char**)kmalloc(acc_batch.km, sizeof(const char*) * read.n_seg);
+                    memcpy(batch_read->qlens, read.qlens, sizeof(int) * read.n_seg);
+                    memcpy(batch_read->qseqs, read.qseqs, sizeof(const char*) * read.n_seg);
                 }
-                br->mini_pos = (uint64_t*)kmalloc(buf[cur].km, read.n_mini_pos * sizeof(uint64_t));
-                br->a        = (mm128_t*)kmalloc(buf[cur].km, read.n * sizeof(mm128_t));
-                memcpy(br->mini_pos, read.mini_pos, read.n_mini_pos * sizeof(uint64_t));
-                memcpy(br->a, read.a, read.n * sizeof(mm128_t));
-
-                buf[cur].count++;
-                buf[cur].total_n += read.n;
+                batch_read->mini_pos = (uint64_t*)kmalloc(acc_batch.km, read.n_mini_pos * sizeof(uint64_t));
+                batch_read->a = (mm128_t*)kmalloc(acc_batch.km, read.n * sizeof(mm128_t));
+                memcpy(batch_read->mini_pos, read.mini_pos, read.n_mini_pos * sizeof(uint64_t));
+                memcpy(batch_read->a, read.a, read.n * sizeof(mm128_t));
+                
+                acc_batch.count++;
+                acc_batch.total_n += read.n;
+                
+                // 释放队列中的独立内存
                 free_queue_read(&read);
-
-                /* Not yet full — keep accumulating */
-                if (buf[cur].total_n < s->batch_max_anchors)
-                    continue;
-
-                if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                    fprintf(stderr, "ACC_FULL: count=%d, total_n=%ld\n",
-                            buf[cur].count, buf[cur].total_n);
-                /* fall through to flush */
+                
+                // 检查是否超过batch_max_anchors（复刻mm_trbuf_is_full的逻辑）
+                if (acc_batch.total_n >= s->batch_max_anchors) {
+                    is_full = 1;
+                    if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                        fprintf(stderr, "ACC_FULL: count=%d, total_n=%ld\n", 
+                                acc_batch.count, acc_batch.total_n);
+                    }
+                }
             } else {
+                // 队列结束
                 queue_finished = 1;
-                if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                    fprintf(stderr, "QUEUE_FINISHED: cur_count=%d\n", buf[cur].count);
-                /* fall through to flush remaining reads */
+                is_full = 1; // 相当于i_in == -1，触发最后的处理
+                if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                    fprintf(stderr, "QUEUE_FINISHED: acc_count=%d\n", acc_batch.count);
+                }
             }
         }
-
-        /* --- Step 2: flush buf[cur] (if it has reads) --- */
-        if (buf[cur].count > 0) {
-            if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                fprintf(stderr, "LAUNCH_CHAIN: count=%d, total_n=%ld\n",
-                        buf[cur].count, buf[cur].total_n);
-
-            /*
-             * chain_stream_gpu modifies *reads_ and *n_read_ in-place:
-             *   IN : pointer to buf[cur].reads (new batch to launch)
-             *   OUT: pointer to buf[prev].reads (prev batch results, or NULL)
-             * We use temporaries so buf[cur].reads/count are not clobbered.
-             */
-            chain_read_t *tmp_reads = buf[cur].reads;
-            int           tmp_count = buf[cur].count;
-            void         *prev_km   = has_launched ? buf[prev].km : buf[cur].km;
-
-            chain_stream_gpu(s->p->mi, s->p->opt, &tmp_reads, &tmp_count, 0, prev_km);
-            /*
-             * After call:
-             *   tmp_reads = buf[prev].reads (or NULL if first call)
-             *   tmp_count = chain result count for buf[prev]
-             *   chain[cur] is now running on the GPU chain stream
-             */
-
-            if (has_launched) {
-                /* tmp_reads == buf[prev].reads; tmp_count = # reads chain handled */
-                PROCESS_PREV_CHAIN(tmp_count);
-                /* buf[prev].km is now reset — safe to reuse for accumulation */
+        
+        // Step 2: 处理batch（复刻old_worker_for的while循环逻辑）
+        while (is_full || (queue_finished && has_launched)) {
+            
+            if (is_full) {
+                // 提交acc_batch到GPU chain
+                if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                    fprintf(stderr, "LAUNCH_CHAIN: count=%d, total_n=%ld\n", 
+                            acc_batch.count, acc_batch.total_n);
+                }
+                
+                mm_batch_trbuf_t kernel_batch = acc_batch;
+                chain_stream_gpu(s->p->mi, s->p->opt, &kernel_batch.reads, 
+                                &kernel_batch.count, 0, launched_batch.km);
+                
+                // 检查返回值决定如何轮转
+                if (kernel_batch.reads) {
+                    // 返回了上一个launched batch（已完成）
+                    assert(has_launched);
+                    
+                    // Defer overflow reads to fallback_batch for later GPU processing
+                    for (; kernel_batch.count < launched_batch.count; kernel_batch.count++) {
+                        fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", kernel_batch.count);
+                        deep_copy_read_to_batch(&fallback_batch, &launched_batch.reads[kernel_batch.count], s->p->opt);
+                    }
+                    assert(kernel_batch.count == launched_batch.count);
+                    
+                    // 三路轮转：launched→pending, acc→launched, pending→acc
+                    kernel_batch = launched_batch;
+                    launched_batch = acc_batch;
+                    acc_batch = pending_batch;
+                    pending_batch = kernel_batch;
+                    is_pending = 1;
+                } else {
+                    // 第一次调用，没有launched batch返回
+                    assert(!has_launched);
+                    
+                    // 两路轮转：acc→launched, pending→acc
+                    kernel_batch = launched_batch;
+                    launched_batch = acc_batch;
+                    acc_batch = pending_batch;
+                    pending_batch = kernel_batch;
+                    is_pending = 0;
+                }
+                
+                is_full = 0;
+                has_launched = 1;
+                
+            } else if (queue_finished && has_launched) {
+                // 清理最后的launched batch
+                if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                    fprintf(stderr, "FINISH_STREAM: launched_count=%d\n", launched_batch.count);
+                }
+                
+                mm_batch_trbuf_t kernel_batch;
+                finish_stream_gpu(s->p->mi, s->p->opt, &kernel_batch.reads, 
+                                 &kernel_batch.count, 0, launched_batch.km);
+                
+                // Defer overflow reads to fallback_batch for later GPU processing
+                for (; kernel_batch.count < launched_batch.count; kernel_batch.count++) {
+                    fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", kernel_batch.count);
+                    deep_copy_read_to_batch(&fallback_batch, &launched_batch.reads[kernel_batch.count], s->p->opt);
+                }
+                assert(kernel_batch.count == launched_batch.count);
+                
+                // 三路轮转：launched→pending, acc→launched, pending→acc
+                kernel_batch = launched_batch;
+                is_full = 0;
+                is_pending = 1;
+                has_launched = 0;
+                launched_batch = acc_batch;
+                acc_batch = pending_batch;
+                pending_batch = kernel_batch;
             }
-
-            /* Rotate buffers */
-            prev = cur;
-            cur  = 1 - cur;
-            buf[cur].count   = 0;
-            buf[cur].total_n = 0;
-            has_launched = 1;
+            
+            // Step 3: 处理pending_batch（GPU Align）
+            if (is_pending) {
+                if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                    fprintf(stderr, "ALIGN_BATCH: count=%d\n", pending_batch.count);
+                }
+                
+                // Copy rep_len & frag_gap
+                for (int iread = 0; iread < pending_batch.count; iread++) {
+                    int i = pending_batch.reads[iread].seq.i;
+                    int j = pending_batch.reads[iread].seq.seg_id;
+                    int off = s->seg_off[i] + j;
+                    for (int k = 0; k < pending_batch.reads[iread].n_seg; k++) {
+                        s->rep_len[off + k] = pending_batch.reads[iread].rep_len;
+                        s->frag_gap[off + k] = pending_batch.reads[iread].frag_gap;
+                    }
+                }
+                
+                // GPU Align
+                prepare_align_batch_gpu(&pending_batch, b, s);
+                
+                // Reset pending batch
+                mm_trbuf_batch_reset(&pending_batch, s->batch_max_reads, s->p->opt);
+                is_pending = 0;
+                pending_batch.batchid = acc_batch.batchid + 1;
+            }
         }
-
-        /* --- Step 3: drain last launched batch after queue is exhausted --- */
-        if (queue_finished && buf[cur].count == 0 && has_launched) {
-            if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                fprintf(stderr, "FINISH_STREAM: prev_count=%d\n", buf[prev].count);
-
-            chain_read_t *tmp_reads = NULL;
-            int           tmp_count = 0;
-            finish_stream_gpu(s->p->mi, s->p->opt, &tmp_reads, &tmp_count, 0, buf[prev].km);
-            /* tmp_reads == buf[prev].reads (or NULL if stream was idle) */
-
-            PROCESS_PREV_CHAIN(tmp_count);
-            has_launched = 0;
-        }
-
-        /* --- Step 4: exit --- */
-        if (queue_finished && !has_launched)
+        
+        // Step 4: 退出条件
+        if (queue_finished && !has_launched && !is_pending && acc_batch.count == 0) {
+            if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
+                fprintf(stderr, "CONSUMER_FINISHED\n");
+            }
             break;
+        }
     }
-
-#undef PROCESS_PREV_CHAIN
-
-    /* ===== Process deferred fallback reads through GPU chain+align ===== */
+    
+    // ===== Process deferred fallback reads through GPU chaining =====
+    // These reads overflowed the GPU micro-batch capacity during the main loop.
+    // The GPU stream is now idle; submit them in sub-batches so they go through
+    // the same GPU chain → GPU align path as normal reads.
     while (fallback_batch.count > 0) {
         fprintf(stderr, "[Info] Processing %d deferred fallback reads via GPU chain\n",
                 fallback_batch.count);
 
+        // Submit fallback batch to GPU (first call: no previously-launched batch to return)
         chain_read_t *fb_reads = fallback_batch.reads;
-        int           fb_count = fallback_batch.count;
+        int fb_count = fallback_batch.count;
         chain_stream_gpu(s->p->mi, s->p->opt, &fb_reads, &fb_count, 0, fallback_batch.km);
+        // fb_reads == NULL and fb_count == 0 here (no previous batch)
 
-        chain_read_t *fb_res   = NULL;
-        int           fb_n_res = 0;
-        finish_stream_gpu(s->p->mi, s->p->opt, &fb_res, &fb_n_res, 0, fallback_batch.km);
+        // Drain the GPU stream and retrieve chained results
+        chain_read_t *fb_result_reads = NULL;
+        int fb_result_count = 0;
+        finish_stream_gpu(s->p->mi, s->p->opt, &fb_result_reads, &fb_result_count, 0, fallback_batch.km);
+        // fb_result_reads == fallback_batch.reads (same array, now with u/n_u filled)
 
-        /* Safety net: CPU chain for any reads that overflowed again */
-        for (; fb_n_res < fallback_batch.count; fb_n_res++) {
-            fprintf(stderr, "[WARNING] Fallback GPU overflowed, CPU chain for read %d\n", fb_n_res);
-            mm_map_chain(s->p->mi, s->p->opt, &fallback_batch.reads[fb_n_res],
+        // Safety net: if GPU still couldn't chain some reads, fall back to CPU for those
+        for (; fb_result_count < fallback_batch.count; fb_result_count++) {
+            fprintf(stderr, "[WARNING] Fallback GPU also overflowed, running CPU chain for read %d\n",
+                    fb_result_count);
+            mm_map_chain(s->p->mi, s->p->opt, &fallback_batch.reads[fb_result_count],
                          b, fallback_batch.km);
         }
 
-        for (int iread = 0; iread < fallback_batch.count; iread++) {
-            int i   = fallback_batch.reads[iread].seq.i;
-            int j   = fallback_batch.reads[iread].seq.seg_id;
+        // Send all fallback reads through GPU alignment (same as normal pending_batch)
+        mm_batch_trbuf_t fb_align_batch;
+        fb_align_batch.reads    = fallback_batch.reads;
+        fb_align_batch.count    = fallback_batch.count;
+        fb_align_batch.total_n  = fallback_batch.total_n;
+        fb_align_batch.km       = fallback_batch.km;
+        fb_align_batch.batchid  = -1;
+
+        for (int iread = 0; iread < fb_align_batch.count; iread++) {
+            int i   = fb_align_batch.reads[iread].seq.i;
+            int j   = fb_align_batch.reads[iread].seq.seg_id;
             int off = s->seg_off[i] + j;
-            for (int k = 0; k < fallback_batch.reads[iread].n_seg; k++) {
-                s->rep_len[off + k]  = fallback_batch.reads[iread].rep_len;
-                s->frag_gap[off + k] = fallback_batch.reads[iread].frag_gap;
+            for (int k = 0; k < fb_align_batch.reads[iread].n_seg; k++) {
+                s->rep_len[off + k] = fb_align_batch.reads[iread].rep_len;
+                s->frag_gap[off + k] = fb_align_batch.reads[iread].frag_gap;
             }
         }
-        prepare_align_batch_gpu(&fallback_batch, b, s);
+        prepare_align_batch_gpu(&fb_align_batch, b, s);
+
+        // Reset so the while-condition exits (all reads processed in one pass)
         mm_trbuf_batch_reset(&fallback_batch, s->batch_max_reads, s->p->opt);
     }
 
-    /* Cleanup */
-    for (int i = 0; i < 2; i++) {
-        mm_trbuf_batch_reset(&buf[i], s->batch_max_reads, s->p->opt);
-        free(buf[i].reads);
-        km_destroy(buf[i].km);
-    }
-    free(fallback_batch.reads);
-    km_destroy(fallback_batch.km);
+    // Cleanup
+	mm_trbuf_batch_reset(&acc_batch, s->batch_max_reads, s->p->opt);
+	mm_trbuf_batch_reset(&launched_batch, s->batch_max_reads, s->p->opt);
+	mm_trbuf_batch_reset(&pending_batch, s->batch_max_reads, s->p->opt);
+
+	free(acc_batch.reads);
+	free(launched_batch.reads);
+	free(pending_batch.reads);
+	free(fallback_batch.reads);
+
+	km_destroy(acc_batch.km);
+	km_destroy(launched_batch.km);
+	km_destroy(pending_batch.km);
+	km_destroy(fallback_batch.km);
 
     return NULL;
 }

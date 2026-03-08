@@ -5,7 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <assert.h>
-#include <cub/device/device_scan.cuh>
+#include <cub/cub.cuh>
 #include "plmem.cuh"
 #include "plrange.cuh"
 #include "plscore.cuh"

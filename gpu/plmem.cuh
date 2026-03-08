@@ -97,8 +97,34 @@ typedef struct {
     int32_t *d_f_long;  // score, size: buffer_size_long * sizeof(int32_t)
     uint16_t *d_p_long;  // predecessor, size: buffer_size_long * sizeof(uint16_t)
 
-    // Note: Backtrack buffers are allocated dynamically per-call to avoid
-    // pre-allocating huge buffers (would use 28GB+ for max_anchors=500M)
+    // ========== Chain Backtrack Pre-allocated Buffers ==========
+    // Pre-allocated to eliminate hot-path cudaMalloc/cudaFree in plbacktrack_gpu.
+    // Sized to anchor_per_batch (max micro-batch anchors) and max_reads.
+    // Anchor-sized (int64_t × anchor_per_batch):
+    int64_t  *d_bt_zx;       // z-scores x (filter output + sort in-place)
+    int64_t  *d_bt_zy;       // z-scores y (sort key)
+    int64_t  *d_bt_v;        // w_y scratch (sort value), then w array y
+    int64_t  *d_bt_p_abs;    // expanded int64 predecessors; reused as w_x
+    // Anchor-sized (other types):
+    int32_t  *d_bt_t;        // track array (anchor filter)
+    uint64_t *d_bt_u;        // chain u-array output (per-anchor)
+    int32_t  *d_bt_ax_out;   // compacted anchor x
+    int32_t  *d_bt_ay_out;   // compacted anchor y
+    int32_t  *d_bt_xrev_out; // compacted xrev
+    int32_t  *d_bt_yrev_out; // compacted yrev
+    // Read-sized (int × max_reads):
+    int      *d_bt_n_a;          // anchors per read
+    int      *d_bt_offset;       // read anchor start offset
+    int      *d_bt_ofs_end;      // read filter endpoint
+    int      *d_bt_num_elements; // per-read count scratch
+    int      *d_bt_n_v;          // # valid anchors per read
+    int      *d_bt_n_u;          // # chains per read
+    // CUB segmented-sort temp:
+    void     *d_bt_cub_tmp;
+    size_t    d_bt_cub_tmp_size;
+    // Capacities stored for assertions:
+    size_t    d_bt_max_total_n;  // anchor capacity of d_bt_* anchor arrays
+    size_t    d_bt_max_n_reads;  // read capacity of d_bt_* read arrays
 
     // ========== Alignment Buffers (unified allocation) ==========
     size_t max_align_tasks;       // max number of alignment tasks

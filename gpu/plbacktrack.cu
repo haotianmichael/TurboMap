@@ -325,7 +325,8 @@ __global__ void expand_p_to_int64(uint16_t* p_rel, int64_t* p_expanded, int* off
     }
 }
 
-// Host function to orchestrate backtracking
+// Host function to orchestrate backtracking.
+// Uses pre-allocated device buffers from dev_mem->d_bt_* — no cudaMalloc in hot path.
 void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
                      chain_read_t *reads, Misc misc,
                      void* km, cudaStream_t stream)
@@ -334,238 +335,150 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     if (n_reads == 0) return;
 
     size_t total_n = host_mem->total_n;
-    int min_sc = misc.min_score;
+    assert(total_n     <= dev_mem->d_bt_max_total_n);
+    assert((size_t)n_reads <= dev_mem->d_bt_max_n_reads);
+
+    int min_sc  = misc.min_score;
     int min_cnt = misc.min_cnt;
     int max_drop = misc.bw;
-    int is_qstrand = 0;
-    uint32_t hash = 11; // Default seed hash
 
-    // Allocate temporary buffers + output buffers for compacted anchors
-    int64_t *d_zx, *d_zy, *d_v, *d_p_abs;
-    int32_t *d_t, *d_ax_out, *d_ay_out, *d_xrev_out, *d_yrev_out;
-    uint64_t *d_u;
-    int *d_n_a, *d_offset, *d_ofs_end, *d_num_elements, *d_n_v, *d_n_u;
-    void *d_temp_storage = nullptr;
+    // Use pre-allocated device buffers (no cudaMalloc/cudaFree in hot path)
+    int64_t  *d_zx          = dev_mem->d_bt_zx;
+    int64_t  *d_zy          = dev_mem->d_bt_zy;
+    int64_t  *d_v           = dev_mem->d_bt_v;
+    int64_t  *d_p_abs       = dev_mem->d_bt_p_abs;
+    int32_t  *d_t           = dev_mem->d_bt_t;
+    uint64_t *d_u           = dev_mem->d_bt_u;
+    int32_t  *d_ax_out      = dev_mem->d_bt_ax_out;
+    int32_t  *d_ay_out      = dev_mem->d_bt_ay_out;
+    int32_t  *d_xrev_out    = dev_mem->d_bt_xrev_out;
+    int32_t  *d_yrev_out    = dev_mem->d_bt_yrev_out;
+    int      *d_n_a         = dev_mem->d_bt_n_a;
+    int      *d_offset      = dev_mem->d_bt_offset;
+    int      *d_ofs_end     = dev_mem->d_bt_ofs_end;
+    int      *d_num_elements= dev_mem->d_bt_num_elements;
+    int      *d_n_v         = dev_mem->d_bt_n_v;
+    int      *d_n_u         = dev_mem->d_bt_n_u;
+    void     *d_cub_tmp     = dev_mem->d_bt_cub_tmp;
+    size_t    cub_tmp_size  = dev_mem->d_bt_cub_tmp_size;
 
-    cudaMalloc(&d_zx, sizeof(int64_t) * total_n);
-    cudaMalloc(&d_zy, sizeof(int64_t) * total_n);
-    cudaMalloc(&d_v, sizeof(int64_t) * total_n);
-    cudaMalloc(&d_p_abs, sizeof(int64_t) * total_n);
-    cudaMalloc(&d_t, sizeof(int32_t) * total_n);
-    cudaMalloc(&d_u, sizeof(uint64_t) * total_n);
-    cudaMalloc(&d_ax_out, sizeof(int32_t) * total_n);
-    cudaMalloc(&d_ay_out, sizeof(int32_t) * total_n);
-    cudaMalloc(&d_xrev_out, sizeof(int32_t) * total_n);
-    cudaMalloc(&d_yrev_out, sizeof(int32_t) * total_n);
-
-    // Initialize output buffers to zero to avoid reading garbage data
-    // CRITICAL: Use the same stream as kernels to ensure proper ordering
-    cudaMemsetAsync(d_ax_out, 0, sizeof(int32_t) * total_n, stream);
-    cudaMemsetAsync(d_ay_out, 0, sizeof(int32_t) * total_n, stream);
+    // Zero output buffers (async, same stream — no sync needed before kernels)
+    cudaMemsetAsync(d_ax_out,   0, sizeof(int32_t) * total_n, stream);
+    cudaMemsetAsync(d_ay_out,   0, sizeof(int32_t) * total_n, stream);
     cudaMemsetAsync(d_xrev_out, 0, sizeof(int32_t) * total_n, stream);
     cudaMemsetAsync(d_yrev_out, 0, sizeof(int32_t) * total_n, stream);
-    cudaStreamSynchronize(stream);  // Ensure initialization completes before proceeding
 
-    cudaMalloc(&d_n_a, sizeof(int) * n_reads);
-    cudaMalloc(&d_offset, sizeof(int) * n_reads);
-    cudaMalloc(&d_ofs_end, sizeof(int) * n_reads);
-    cudaMalloc(&d_num_elements, sizeof(int) * n_reads);
-    cudaMalloc(&d_n_v, sizeof(int) * n_reads);
-    cudaMalloc(&d_n_u, sizeof(int) * n_reads);
-
-    // Set up offset array
+    // Build per-read offset and anchor-count arrays on host, then H2D
     int *h_offset = (int*)malloc(sizeof(int) * n_reads);
-    int *h_n_a = (int*)malloc(sizeof(int) * n_reads);
+    int *h_n_a    = (int*)malloc(sizeof(int) * n_reads);
     int ofs = 0;
     for (int i = 0; i < n_reads; i++) {
         h_offset[i] = ofs;
-        h_n_a[i] = reads[i].n;
+        h_n_a[i]    = reads[i].n;
         ofs += reads[i].n;
     }
-    cudaMemcpy(d_offset, h_offset, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_n_a, h_n_a, sizeof(int) * n_reads, cudaMemcpyHostToDevice);
+    cudaMemcpyAsync(d_offset, h_offset, sizeof(int) * n_reads, cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_n_a,    h_n_a,    sizeof(int) * n_reads, cudaMemcpyHostToDevice, stream);
 
-
-    // Expand uint16_t predecessors to int64_t (keep relative distance semantics)
-    // One block per read: coalesced uint16_t reads and int64_t writes.
+    // Expand uint16_t predecessors → int64_t
     expand_p_to_int64<<<n_reads, THREAD_NUM_SHORT, 0, stream>>>(
         dev_mem->d_p, d_p_abs, d_offset, d_n_a, n_reads);
 
-    cudaStreamSynchronize(stream);
-
     // Step 1: Filter anchors by score
-    // One block per read; shared memory holds the output index counter (1 int).
     mm_filter_anchors<<<n_reads, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, d_offset, min_sc, dev_mem->d_f, d_zx, d_zy,
         d_ofs_end, d_t, d_num_elements, d_n_v, n_reads);
 
-    cudaStreamSynchronize(stream);
-
-    // Step 2: Sort z arrays by score using CUB (per-read segmented sort)
-    size_t temp_storage_bytes = 0;
-
-    // Determine temporary storage requirements
-    // CRITICAL: Use custom stream to ensure proper ordering with other GPU operations
-    // NOTE: Use ascending sort (SortPairs) to match CPU radix_sort_128x behavior
-    // CPU sorts ascending, then iterates from k=n_z-1 downto 0 (highest to lowest score)
-    // GPU must do the same: ascending sort, then iterate from k=n_z-1 downto 0
+    // Step 2: Segmented sort by score (ascending) using pre-allocated CUB temp
     cub::DeviceSegmentedRadixSort::SortPairs(
-        d_temp_storage, temp_storage_bytes,
+        d_cub_tmp, cub_tmp_size,
         d_zx, d_zx, d_zy, d_zy,
-        total_n, n_reads, d_offset, d_ofs_end, 0, sizeof(int64_t) * 8, stream);
+        (int)total_n, n_reads, d_offset, d_ofs_end,
+        0, (int)(sizeof(int64_t) * 8), stream);
 
-    // Allocate temporary storage
-    cudaMalloc(&d_temp_storage, temp_storage_bytes);
-
-    // Sort ascending by score (to match CPU behavior)
-    // CRITICAL: Use custom stream to ensure proper ordering with other GPU operations
-    cub::DeviceSegmentedRadixSort::SortPairs(
-        d_temp_storage, temp_storage_bytes,
-        d_zx, d_zx, d_zy, d_zy,
-        total_n, n_reads, d_offset, d_ofs_end, 0, sizeof(int64_t) * 8, stream);
-
-    cudaStreamSynchronize(stream);
-
-    // Step 3: Backtrack
+    // Step 3: Backtrack — compute u chains and compacted anchor arrays
     mm_chain_backtrack_parallel<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
-        d_n_a, dev_mem->d_ax, dev_mem->d_ay, dev_mem->d_xrev, dev_mem->d_yrev, dev_mem->d_f, d_p_abs, d_u,
+        d_n_a, dev_mem->d_ax, dev_mem->d_ay, dev_mem->d_xrev, dev_mem->d_yrev,
+        dev_mem->d_f, d_p_abs, d_u,
         d_zx, d_zy, d_t, d_v, d_offset, min_cnt, min_sc, max_drop,
         n_reads, d_n_v, d_n_u, d_num_elements, d_ofs_end);
 
-    cudaStreamSynchronize(stream);
-
-    // Copy n_u values to host for sorting
+    // D2H: n_u per read (needed for per-read w-array sort)
+    // cudaMemcpy (non-async) waits for all prior GPU work to finish
     int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
     cudaMemcpy(h_n_u, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
 
-    // Step 4: Sort w arrays by target position
-    // CRITICAL: w arrays have n_u[i] elements per read, NOT n_a[i]
-    // Cannot use d_offset directly because it's in terms of ANCHORS
-    // Need to sort each read's w segment individually using thrust::sort
-    // Get n_u values to know how many elements to sort per read
-    // Note: h_n_u already allocated above for debug
-
-    // Sort each read's w_x/w_y segment
-    // w arrays start at offset[i] for each read
+    // Step 4: Sort w arrays (d_p_abs = w_x, d_v = w_y) per-read by target position
     for (int i = 0; i < n_reads; i++) {
-        int n_u_val = h_n_u[i];
-        if (n_u_val > 1) {
-            int64_t *w_x_start = d_p_abs + h_offset[i];
-            int64_t *w_y_start = d_v + h_offset[i];
+        if (h_n_u[i] > 1) {
             thrust::sort_by_key(thrust::cuda::par.on(stream),
-                                w_x_start, w_x_start + n_u_val, w_y_start);
+                                d_p_abs + h_offset[i],
+                                d_p_abs + h_offset[i] + h_n_u[i],
+                                d_v     + h_offset[i]);
         }
     }
-    // Note: h_n_u will be freed later after copying results back to host
 
-    cudaStreamSynchronize(stream);
-
-    // Step 5: Set chain information (write to output buffers)
+    // Step 5: Write compacted anchor output
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, n_reads, d_ax_out, d_ay_out, d_xrev_out, d_yrev_out, d_offset, d_ofs_end,
         dev_mem->d_f, d_p_abs, d_u, d_zx, d_zy, d_t, d_v, d_n_v);
 
-    cudaStreamSynchronize(stream);
-
-    // Note: Steps 6-8 (gen_regs) are not needed here
-    // The CPU side will generate regions from the u array
-    // This matches the CPU version in lchain.c
-
-    // Copy results back to host
-    // Note: h_n_u was already allocated and copied during sorting step above
-
-    // Allocate temporary host buffers for compacted anchors
-    int32_t *h_ax = (int32_t*)malloc(sizeof(int32_t) * total_n);
-    int32_t *h_ay = (int32_t*)malloc(sizeof(int32_t) * total_n);
+    // D2H: compacted anchor arrays (cudaMemcpy waits for stream to finish)
+    int32_t *h_ax   = (int32_t*)malloc(sizeof(int32_t) * total_n);
+    int32_t *h_ay   = (int32_t*)malloc(sizeof(int32_t) * total_n);
     int32_t *h_xrev = (int32_t*)malloc(sizeof(int32_t) * total_n);
     int32_t *h_yrev = (int32_t*)malloc(sizeof(int32_t) * total_n);
-
-    // Copy compacted anchors from output buffers
-    cudaMemcpy(h_ax, d_ax_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ay, d_ay_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ax,   d_ax_out,   sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_ay,   d_ay_out,   sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_xrev, d_xrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
     cudaMemcpy(h_yrev, d_yrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
 
-    // Update read structures
+    // Update read structures with chain results
     for (int i = 0; i < n_reads; i++) {
         reads[i].n_u = h_n_u[i];
         if (h_n_u[i] > 0) {
-            // Allocate and copy u array
             KMALLOC(km, reads[i].u, h_n_u[i]);
-            cudaMemcpy(reads[i].u, &d_u[h_offset[i]], sizeof(uint64_t) * h_n_u[i], cudaMemcpyDeviceToHost);
+            cudaMemcpy(reads[i].u, &d_u[h_offset[i]],
+                       sizeof(uint64_t) * h_n_u[i], cudaMemcpyDeviceToHost);
 
-            // Calculate new anchor count (sum of chain lengths)
             int new_n = 0;
-            for (int j = 0; j < h_n_u[i]; j++) {
+            for (int j = 0; j < h_n_u[i]; j++)
                 new_n += (int32_t)reads[i].u[j];
-            }
 
-            // Allocate new array for compacted anchors (like compact_a does)
             mm128_t *old_a = reads[i].a;
             mm128_t *new_a;
             KMALLOC(km, new_a, new_n);
-
-            // Reconstruct complete mm128_t from ax/xrev (x field) and ay/yrev (y field)
             for (int j = 0; j < new_n; j++) {
                 int idx = h_offset[i] + j;
                 new_a[j].x = ((uint64_t)h_xrev[idx] << 32) | (uint32_t)h_ax[idx];
                 new_a[j].y = ((uint64_t)h_yrev[idx] << 32) | (uint32_t)h_ay[idx];
             }
-
-            // Free old oversized array and update pointer to new right-sized array
             kfree(km, old_a);
             reads[i].a = new_a;
         } else {
-            // No chains found for this read
             reads[i].u = NULL;
             reads[i].a = NULL;
         }
     }
 
-    // Backtracking statistics removed to reduce debug output
-
     free(h_ax);
     free(h_ay);
     free(h_xrev);
     free(h_yrev);
-    free(h_n_u);  // Free h_n_u allocated during sorting step
-
-    // Cleanup
+    free(h_n_u);
     free(h_offset);
     free(h_n_a);
-
-    // CRITICAL: Synchronize stream before freeing device buffers
-    // to ensure all GPU operations have completed
-    cudaStreamSynchronize(stream);
-
-    // Free device buffers
-    cudaFree(d_zx);
-    cudaFree(d_zy);
-    cudaFree(d_v);
-    cudaFree(d_p_abs);
-    cudaFree(d_t);
-    cudaFree(d_u);
-    cudaFree(d_ax_out);
-    cudaFree(d_ay_out);
-    cudaFree(d_xrev_out);
-    cudaFree(d_yrev_out);
-    cudaFree(d_n_a);
-    cudaFree(d_offset);
-    cudaFree(d_ofs_end);
-    cudaFree(d_num_elements);
-    cudaFree(d_n_v);
-    cudaFree(d_n_u);
-    cudaFree(d_temp_storage);
+    // No cudaFree — all device buffers are pre-allocated and reused.
 }
 
 void plbacktrack_init_memory(deviceMemPtr *dev_mem, size_t max_anchors)
 {
-    // Memory is allocated per-call in plbacktrack_gpu
-    // This can be optimized to use pre-allocated buffers
+    // Backtrack buffers are now pre-allocated in plmem_malloc_device_mem (d_bt_*).
+    (void)dev_mem; (void)max_anchors;
 }
 
 void plbacktrack_free_memory(deviceMemPtr *dev_mem)
 {
-    // Memory is freed per-call in plbacktrack_gpu
-    // This can be optimized if using pre-allocated buffers
+    // Backtrack buffers are freed in plmem_free_device_mem.
+    (void)dev_mem;
 }

@@ -167,8 +167,57 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     fprintf(stderr, " [Chain] Total long seg buffers: %.2f MB (%.2f GB)\n",
             long_total / (1024.0*1024.0), long_total / (1024.0*1024.0*1024.0)); 
 
-    // Note: Backtrack buffers are allocated dynamically per-call to avoid
-    // pre-allocating huge buffers (would use 28GB+ for max_anchors=500M)
+    // ========== Chain Backtrack Pre-allocated Buffers ==========
+    // Eliminates 17 cudaMalloc + 16 cudaFree per plbacktrack_gpu call.
+    // Each cudaMalloc stalls the entire GPU; pre-allocating removes this bottleneck.
+    // Anchor-sized arrays: anchor_per_batch = 50M → ~3 GB total.
+    // Read-sized arrays:   range_grid_size ≥ max_reads → negligible.
+    {
+        size_t bt_n = anchor_per_batch;
+        size_t bt_r = (size_t)range_grid_size;  // >= max_read; read-sized arrays are tiny
+
+        dev_mem->d_bt_max_total_n = bt_n;
+        dev_mem->d_bt_max_n_reads = bt_r;
+
+        cudaMalloc(&dev_mem->d_bt_zx,          bt_n * sizeof(int64_t));
+        cudaMalloc(&dev_mem->d_bt_zy,          bt_n * sizeof(int64_t));
+        cudaMalloc(&dev_mem->d_bt_v,           bt_n * sizeof(int64_t));
+        cudaMalloc(&dev_mem->d_bt_p_abs,       bt_n * sizeof(int64_t));
+        cudaMalloc(&dev_mem->d_bt_t,           bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_u,           bt_n * sizeof(uint64_t));
+        cudaMalloc(&dev_mem->d_bt_ax_out,      bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_ay_out,      bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_xrev_out,    bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_yrev_out,    bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_n_a,          bt_r * sizeof(int));
+        cudaMalloc(&dev_mem->d_bt_offset,       bt_r * sizeof(int));
+        cudaMalloc(&dev_mem->d_bt_ofs_end,      bt_r * sizeof(int));
+        cudaMalloc(&dev_mem->d_bt_num_elements, bt_r * sizeof(int));
+        cudaMalloc(&dev_mem->d_bt_n_v,          bt_r * sizeof(int));
+        cudaMalloc(&dev_mem->d_bt_n_u,          bt_r * sizeof(int));
+
+        // CUB DeviceSegmentedRadixSort temp storage (size query with max dimensions)
+        dev_mem->d_bt_cub_tmp      = nullptr;
+        dev_mem->d_bt_cub_tmp_size = 0;
+        {
+            size_t tmp_bytes = 0;
+            cub::DeviceSegmentedRadixSort::SortPairs(
+                nullptr, tmp_bytes,
+                dev_mem->d_bt_zx, dev_mem->d_bt_zx,
+                dev_mem->d_bt_zy, dev_mem->d_bt_zy,
+                (int)bt_n, (int)bt_r,
+                dev_mem->d_bt_offset, dev_mem->d_bt_ofs_end,
+                0, (int)(sizeof(int64_t) * 8));
+            dev_mem->d_bt_cub_tmp_size = tmp_bytes;
+            cudaMalloc(&dev_mem->d_bt_cub_tmp, tmp_bytes);
+        }
+
+        size_t bt_total = bt_n * (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
+                        + bt_r * 6 * sizeof(int)
+                        + dev_mem->d_bt_cub_tmp_size;
+        fprintf(stderr, " [Chain] Backtrack pre-alloc buffers: %.2f MB (%.2f GB)\n",
+                bt_total / (1024.0*1024.0), bt_total / (1024.0*1024.0*1024.0));
+    }
 
     // ========== Alignment Buffers ==========
     // Configuration for alignment
@@ -359,43 +408,27 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
 
     fprintf(stderr, " [Align] Total BackTrack buffers: %.2f GB\n", bck_total / (1024.0*1024.0*1024.0));
 
-    // ========== Chain Backtrack (plbacktrack_gpu) Dynamic Allocation ==========
-    // These buffers are allocated per-call in plbacktrack_gpu based on micro-batch total_n
-    // Peak memory estimation based on anchor_per_batch:
-    // - d_zx, d_zy, d_v, d_p_abs: 4 * sizeof(int64_t) * total_n = 32 bytes/anchor
-    // - d_t: sizeof(int32_t) * total_n = 4 bytes/anchor
-    // - d_u: sizeof(uint64_t) * total_n = 8 bytes/anchor
-    // - d_ax_out, d_ay_out, d_xrev_out, d_yrev_out: 4 * sizeof(int32_t) * total_n = 16 bytes/anchor
-    // - d_temp_storage (CUB sort): ~8 bytes/anchor estimated
-    // Total: ~68 bytes per anchor (peak during backtracking)
-    size_t backtrack_per_anchor = 4 * sizeof(int64_t) +  // d_zx, d_zy, d_v, d_p_abs
-                                  sizeof(int32_t) +       // d_t
-                                  sizeof(uint64_t) +      // d_u
-                                  4 * sizeof(int32_t) +   // d_ax_out, d_ay_out, d_xrev_out, d_yrev_out
-                                  8;                      // d_temp_storage estimated
-    size_t chain_backtrack_peak = backtrack_per_anchor * anchor_per_batch;
-    fprintf(stderr, " [Chain] Backtrack buffers (dynamic, peak): %.2f MB (%.2f GB)\n",
-            chain_backtrack_peak / (1024.0*1024.0), chain_backtrack_peak / (1024.0*1024.0*1024.0));
-
     // ========== GRAND TOTAL CALCULATION ==========
-    // Chain total: sum of all chain-related allocations
-    size_t chain_total_all = chain_total +
-                            (idx_total + cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) +
-                            long_total;
+    size_t chain_bt_total = dev_mem->d_bt_max_total_n *
+                            (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
+                          + dev_mem->d_bt_max_n_reads * 6 * sizeof(int)
+                          + dev_mem->d_bt_cub_tmp_size;
 
-    // Align total: DP buffers + BackTrack buffers
-    size_t align_dp_total = (seq_unpacked_size *2 + seq_packed_size*2 +
-                            metadata_size*5 + global_buffer_bytes + ksw_temp_bytes);
+    size_t chain_total_all = chain_total +
+                             (idx_total + cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) +
+                             long_total + chain_bt_total;
+
+    size_t align_dp_total = (seq_unpacked_size*2 + seq_packed_size*2 +
+                             metadata_size*5 + global_buffer_bytes + ksw_temp_bytes);
     size_t align_total_all = align_dp_total + bck_total;
 
-    // Grand total (including chain backtrack peak)
-    size_t grand_total = chain_total_all + align_total_all + chain_backtrack_peak;
+    size_t grand_total = chain_total_all + align_total_all;
 
     fprintf(stderr, " [Chain] Total:       %8.2f MB (%.2f GB)\n",
             chain_total_all / (1024.0*1024.0), chain_total_all / (1024.0*1024.0*1024.0));
     fprintf(stderr, " [Align] Total:       %8.2f MB (%.2f GB)\n",
             align_total_all / (1024.0*1024.0), align_total_all / (1024.0*1024.0*1024.0));
-    fprintf(stderr, "[Info] TuboMap Total GPU Memory (with backtrack peak): %.2f MB (%.2f GB)\n",
+    fprintf(stderr, "[Info] TurboMap Total GPU Memory: %.2f MB (%.2f GB)\n",
             grand_total / (1024.0*1024.0), grand_total / (1024.0*1024.0*1024.0));
 
     cudaCheck();
@@ -429,7 +462,24 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFree(dev_mem->d_range_long);
     cudaFree(dev_mem->d_total_n_long);
 
-    // Note: Backtrack buffers are allocated/freed per-call in plbacktrack_gpu
+    // Chain backtrack pre-allocated buffers
+    cudaFree(dev_mem->d_bt_zx);
+    cudaFree(dev_mem->d_bt_zy);
+    cudaFree(dev_mem->d_bt_v);
+    cudaFree(dev_mem->d_bt_p_abs);
+    cudaFree(dev_mem->d_bt_t);
+    cudaFree(dev_mem->d_bt_u);
+    cudaFree(dev_mem->d_bt_ax_out);
+    cudaFree(dev_mem->d_bt_ay_out);
+    cudaFree(dev_mem->d_bt_xrev_out);
+    cudaFree(dev_mem->d_bt_yrev_out);
+    cudaFree(dev_mem->d_bt_n_a);
+    cudaFree(dev_mem->d_bt_offset);
+    cudaFree(dev_mem->d_bt_ofs_end);
+    cudaFree(dev_mem->d_bt_num_elements);
+    cudaFree(dev_mem->d_bt_n_v);
+    cudaFree(dev_mem->d_bt_n_u);
+    cudaFree(dev_mem->d_bt_cub_tmp);
 
     // Alignment buffers
     if (dev_mem->d_align_unpacked_query) cudaFree(dev_mem->d_align_unpacked_query);

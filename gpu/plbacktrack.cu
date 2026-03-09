@@ -383,11 +383,17 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     // Expand uint16_t predecessors → int64_t
     expand_p_to_int64<<<n_reads, THREAD_NUM_SHORT, 0, stream>>>(
         dev_mem->d_p, d_p_abs, d_offset, d_n_a, n_reads);
+    cudaCheck();
 
     // Step 1: Filter anchors by score
     mm_filter_anchors<<<n_reads, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, d_offset, min_sc, dev_mem->d_f, d_zx, d_zy,
         d_ofs_end, d_t, d_num_elements, d_n_v, n_reads);
+    cudaCheck();
+
+    // Sync and check for any kernel errors before CUB sort
+    cudaStreamSynchronize(stream);
+    cudaCheck();
 
     // Step 2: Segmented sort by score (ascending) using pre-allocated CUB temp
     cub::DeviceSegmentedRadixSort::SortPairs(
@@ -395,6 +401,7 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
         d_zx, d_zx, d_zy, d_zy,
         (int)total_n, n_reads, d_offset, d_ofs_end,
         0, (int)(sizeof(int64_t) * 8), stream);
+    cudaCheck();
 
     // Step 3: Backtrack — compute u chains and compacted anchor arrays
     mm_chain_backtrack_parallel<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(

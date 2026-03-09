@@ -379,6 +379,7 @@ void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_r
 
     // step6: copy back long_segs_og
     cudaStreamSynchronize(stream_setup.streams[stream_id].cudastream);
+    cudaCheck();
     unsigned int num_long_seg;
     cudaMemcpy(&num_long_seg, stream_setup.streams[stream_id].dev_mem.d_long_seg_count, sizeof(unsigned int),
                 cudaMemcpyDeviceToHost);
@@ -395,7 +396,9 @@ void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_r
     pairsort(long_segs_og, map, num_long_seg);
     free(long_segs_og);
 
-    // step8: copy map to device
+    // step8: copy map to device (free previous allocation to avoid leak)
+    if (stream_setup.streams[stream_id].dev_mem.d_map)
+        cudaFree(stream_setup.streams[stream_id].dev_mem.d_map);
     cudaMalloc(&stream_setup.streams[stream_id].dev_mem.d_map, sizeof(unsigned) * num_long_seg);
     cudaMemcpy(stream_setup.streams[stream_id].dev_mem.d_map, map, sizeof(unsigned) * num_long_seg, cudaMemcpyHostToDevice);
     free(map);

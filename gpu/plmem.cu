@@ -143,6 +143,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t long_total = long_ax_size + long_ay_size + long_sid_size + long_range_size +
                         long_f_size + long_p_size + sizeof(size_t);
 
+    dev_mem->d_map = nullptr;  // initialized per-batch in plchain_cal_score_async
     cudaMalloc(&dev_mem->d_ax_long, long_ax_size);
     cudaMalloc(&dev_mem->d_ay_long, long_ay_size);
     cudaMalloc(&dev_mem->d_sid_long, long_sid_size);
@@ -442,6 +443,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFree(dev_mem->d_mid_seg);
     cudaFree(dev_mem->d_mid_seg_count);
 
+    if (dev_mem->d_map) cudaFree(dev_mem->d_map);
     cudaFree(dev_mem->d_ax_long);
     cudaFree(dev_mem->d_ay_long);
     cudaFree(dev_mem->d_sid_long);

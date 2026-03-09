@@ -249,9 +249,6 @@ void plrange_async_range_selection(deviceMemPtr* dev_mem, cudaStream_t* stream) 
         dev_mem->d_ax, dev_mem->d_xrev, dev_mem->d_start_idx, dev_mem->d_read_end_idx,
         dev_mem->d_range, dev_mem->d_cut, dev_mem->d_cut_start_idx, total_n, range_kernel_config);
     cudaCheck();
-#ifdef DEBUG_PRINT
-    // fprintf(stderr, "[Info] %s (%s:%d): Batch total_n %lu, Range Kernel Launched, grid %d cut %d\n", __func__, __FILE__, __LINE__, total_n, DimGrid.x, cut_num);
-#endif
 }
 
 void plrange_sync_range_selection(deviceMemPtr *dev_mem, Misc misc) {
@@ -263,19 +260,12 @@ void plrange_sync_range_selection(deviceMemPtr *dev_mem, Misc misc) {
     plrange_upload_misc(misc);
 
     // Run kernel
-#ifdef DEBUG_PRINT
-        fprintf(stderr, "[Info] %s (%s:%d): Grim Dim: %d Cut: %zu Anchors: %zu\n", __func__, __FILE__, __LINE__, DimGrid.x,
-                cut_num, total_n);
-#endif
     range_selection_kernel_binary<<<DimGrid, DimBlock>>>(
         dev_mem->d_ax, dev_mem->d_xrev, dev_mem->d_start_idx, dev_mem->d_read_end_idx,
         dev_mem->d_range, dev_mem->d_cut, dev_mem->d_cut_start_idx, total_n, range_kernel_config);
     cudaCheck();
     cudaDeviceSynchronize();
     cudaCheck();
-#ifdef DEBUG_PRINT
-    fprintf(stderr, "[Info] %s: range calculation success\n", __func__);
-#endif
 }
 
 #ifdef __cplusplus

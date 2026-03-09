@@ -33,14 +33,6 @@ typedef struct {
 } ksw_extz_t;
 void plmem_malloc_host_mem(hostMemPtr *host_mem, size_t anchor_per_batch,
                            int range_grid_size, size_t buffer_size_long) {
-#ifdef DEBUG_PRINT
-    size_t host_mem_size; 
-    host_mem_size = anchor_per_batch * (sizeof(int32_t) + sizeof(int32_t) + 
-                    sizeof(int8_t) + sizeof(int32_t) + sizeof(int32_t) + sizeof(uint16_t));
-    host_mem_size += range_grid_size * (sizeof(size_t) + sizeof(size_t) + sizeof(size_t));
-    fprintf(stderr, "[Info] Host Malloc Pinned Memory Size %.2f GB\n", (float)host_mem_size / OneG);
-#endif
-
     // data array
     cudaMallocHost((void**)&host_mem->ax, anchor_per_batch * sizeof(int32_t));
     cudaMallocHost((void**)&host_mem->ay, anchor_per_batch * sizeof(int32_t));
@@ -60,12 +52,6 @@ void plmem_malloc_host_mem(hostMemPtr *host_mem, size_t anchor_per_batch,
 }
 
 void plmem_malloc_long_mem(longMemPtr *long_mem, size_t buffer_size_long) {
-#ifdef DEBUG_PRINT
-    size_t host_mem_size; 
-    host_mem_size =  buffer_size_long / (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit) * sizeof(seg_t);
-    host_mem_size += buffer_size_long * (sizeof(int32_t) + sizeof(uint16_t));
-    fprintf(stderr, "[Info] Host Malloc Pinned Memory Size %.2f GB (long seg)\n", (float)host_mem_size / OneG);
-#endif
     // data array
     cudaMallocHost((void**)&long_mem->long_segs_og_idx, buffer_size_long / (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit) * sizeof(seg_t));
     cudaMallocHost((void**)&long_mem->f_long, buffer_size_long * sizeof(int32_t));
@@ -961,28 +947,18 @@ void plmem_stream_initialize(size_t *max_total_n_,
     // assert(num_stream > 1);
 
     stream_setup.streams = new stream_ptr_t[num_stream];
-#ifdef DEBUG_PRINT
-    fprintf(stderr,
-            "[Info] max anchors per stream: %zu, max range grid %zu "
-            "max_num_cut %zu long_seg_buffer_size %zu\n",
-            max_anchors_stream, max_range_grid, max_num_cut,
-            long_seg_buffer_size);
-#endif  // DEBUG_PRINT
 
     for (int i = 0; i < num_stream; i++) {
         stream_setup.streams[i].busy = false;
         cudaStreamCreate(&stream_setup.streams[i].cudastream);
         cudaEventCreate(&stream_setup.streams[i].stopevent);
         cudaEventCreate(&stream_setup.streams[i].startevent);
-        cudaEventCreate(&stream_setup.streams[i].long_kernel_event);
         cudaCheck();
         stream_setup.streams[i].dev_mem.buffer_size_long = long_seg_buffer_size;
         // one stream has multiple host mems
         for (int j = 0; j < score_kernel_config.micro_batch; j++) {
             plmem_malloc_host_mem(&stream_setup.streams[i].host_mems[j], max_anchors_stream,
                               max_range_grid, long_seg_buffer_size);
-            cudaEventCreate(&stream_setup.streams[i].short_kernel_start_event[j]);
-            cudaEventCreate(&stream_setup.streams[i].short_kernel_stop_event[j]);
         }
         // one stream has one long mem and one device mem
         plmem_malloc_long_mem(&stream_setup.streams[i].long_mem, long_seg_buffer_size);
@@ -1018,7 +994,6 @@ void plmem_stream_cleanup() {
         cudaStreamDestroy(stream_setup.streams[i].cudastream);
         cudaEventDestroy(stream_setup.streams[i].stopevent);
         cudaEventDestroy(stream_setup.streams[i].startevent);
-        cudaEventDestroy(stream_setup.streams[i].long_kernel_event);
         cudaCheck();
         // free multiple host mems
         for (int j = 0; j < score_kernel_config.micro_batch; j++) {

@@ -15,10 +15,6 @@
 #include <utility>
 #include <algorithm>
 
-#ifdef DEBUG_CHECK
-#include "planalyze.cuh"
-#include "debug.h"
-#endif // DEBUG_CHECK
 #define CUDA_DEVICE 0
 // utils functions
 struct
@@ -112,15 +108,6 @@ void plchain_backtracking(hostMemPtr *host_mem, deviceMemPtr *dev_mem, chain_rea
         int64_t* p;
         KMALLOC(km, p, reads[i].n);
         p_rel2idx(p_hostmem, p, reads[i].n);
-// print scores
-#if defined(DEBUG_VERBOSE) && 0
-        debug_print_score(p, f, reads[i].n);
-#endif
-// Check score w.r.t to input (MAKE SURE INPUT SCORE EXISTS: search for SCORE CHECK) 
-#if defined(DEBUG_CHECK) && 0
-        debug_check_score(p, f, reads[i].p, reads[i].f, reads[i].n);
-#endif
-
         /* Backtracking*/
         uint64_t* u;
         int32_t *v, *t;
@@ -189,12 +176,6 @@ int plchain_schedule_stream(const streamSetup_t stream_setup, const int batchid)
     return streamid;
 }
 
-
-// Global variable for debug prints. Throughput, runtime & mem usage
-#ifdef DEBUG_PRINT
-    float kernel_mem_usage[MAX_MICRO_BATCH + 1] = {0};
-    float kernel_throughput[MAX_MICRO_BATCH + 1] = {0};
-#endif // DEBUG_PRINT
 
 /*
  * Accepts a stream that has already been synced, and finished processing a batch
@@ -318,24 +299,12 @@ void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_r
         }
     }
 
-#ifdef DEBUG_PRINT
-    for(int uid = 0; uid < score_kernel_config.micro_batch + 1; uid++) {
-        kernel_mem_usage[uid] = 0;
-        kernel_throughput[uid] = 0;
-    }
-#endif // DEBUG_PRINT
-
-
     cudaEventRecord(stream_setup.streams[stream_id].startevent,
                     stream_setup.streams[stream_id].cudastream);
     size_t total_n = 0;
     for (int i = 0; i < n_read; i++) {
         total_n += reads[i].n;
     } // compute total_n first
-#ifdef DEBUG_PRINT
-    fprintf(stderr, "[Info] %s (%s:%d) Launching Batch: n_read %d, total anchors %lu (mem usage: %.2f%%)\n", __func__, __FILE__, __LINE__, n_read, total_n, (float)total_n/stream_setup.max_anchors_stream*100);
-#endif // DEBUG_PRINT
-
      /*int currentDevice;
      cudaGetDevice(&currentDevice);
      fprintf(stderr, "current Device %d\n", currentDevice);
@@ -363,9 +332,6 @@ void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_r
 
     for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) {
         if (read_start == n_read) continue;
-#ifdef USEHIP
-        roctxRangePushA("microbatch");
-#endif
         // decide the size of micro batch
         size_t batch_n = 0;
         int read_end = 0;
@@ -382,57 +348,28 @@ void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_r
             griddim += block_num;
             cut_num += (reads[read_end].n - 1) / an_p_cut + 1;
         }
-#ifdef DEBUG_VERBOSE
-        fprintf(stderr, "[Debug] %s (%s:%d) MICROBATCH#%d batch_n %lu, read_start %d, read_end %d usage %.2f %%\n", __func__, __FILE__, __LINE__, uid, batch_n, read_start, read_end, (float)batch_n/stream_setup.max_anchors_stream*100);
-#endif // DEBUG_VERBOS 
-
-#ifdef DEBUG_PRINT
-        kernel_mem_usage[uid] = (float)batch_n/stream_setup.max_anchors_stream*100;
-#endif // DEBUG_PRINT
 
         // sanity check
         assert(stream_setup.max_anchors_stream >= batch_n);
         assert(stream_setup.max_range_grid >= griddim);
         assert(stream_setup.max_num_cut >= cut_num);
         // work on micro batch
-#ifdef USEHIP
-        roctxRangePushA("reorg");
-#endif
         // step1: reorg input
         plmem_reorg_input_arr(reads + read_start, read_end - read_start,
                           &stream_setup.streams[stream_id].host_mems[uid],
                           range_kernel_config);
         // step2: copy to device
-#ifdef USEHIP
-        roctxRangePop();
-#endif
         plmem_async_h2d_short_memcpy(&stream_setup.streams[stream_id], uid);
         // step3: range selection
-#ifdef DEBUG_PRINT
-        cudaEventRecord(stream_setup.streams[stream_id].short_kernel_start_event[uid],
-                    stream_setup.streams[stream_id].cudastream);
-#endif // DEBUG_PRINT
         plrange_async_range_selection(&stream_setup.streams[stream_id].dev_mem,
                                     &stream_setup.streams[stream_id].cudastream);
         // step4: score generation for short and mid segs
         plscore_async_short_mid_forward_dp(&stream_setup.streams[stream_id].dev_mem,
                                     &stream_setup.streams[stream_id].cudastream);
-#ifdef DEBUG_PRINT
-        cudaEventRecord(stream_setup.streams[stream_id].short_kernel_stop_event[uid],
-                    stream_setup.streams[stream_id].cudastream);
-#endif // DEBUG_PRINT
         // step5: copy short and mid results back
         plmem_async_d2h_short_memcpy(&stream_setup.streams[stream_id], uid);
         // update index
         read_start = read_end;
-
-#ifdef USEHIP
-        roctxRangePop();
-#endif
-
-#ifdef DEBUG_CHECK
-        planalyze_short_kernel(stream_setup.streams[stream_id], uid, kernel_throughput);
-#endif // DEBUG_CHECK
     }
 
 // FIXME: temporary solution for microbatching
@@ -456,17 +393,6 @@ void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_r
     }
 
     pairsort(long_segs_og, map, num_long_seg);
-
-    #ifdef DEBUG_VERBOSE
-    if(num_long_seg != 0) {
-        auto last_length = long_segs_og[map[0]].end_idx - long_segs_og[map[0]].start_idx;
-        for (int i = 1; i < num_long_seg; i++){
-            auto this_length = long_segs_og[map[i]].end_idx - long_segs_og[map[i]].start_idx;
-            if (this_length > last_length)
-                fprintf(stderr, "Failed sort at: %d - %u\n", i, map[i]);
-        }
-    }
-    #endif // DEBUG_VERBOSE
     free(long_segs_og);
 
     // step8: copy map to device
@@ -474,8 +400,6 @@ void plchain_cal_score_async(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_r
     cudaMemcpy(stream_setup.streams[stream_id].dev_mem.d_map, map, sizeof(unsigned) * num_long_seg, cudaMemcpyHostToDevice);
     free(map);
 
-    cudaEventRecord(stream_setup.streams[stream_id].long_kernel_event,
-                    stream_setup.streams[stream_id].cudastream);
     plscore_async_long_forward_dp(&stream_setup.streams[stream_id].dev_mem,
                                    &stream_setup.streams[stream_id].cudastream);
     cudaEventRecord(stream_setup.streams[stream_id].stopevent,
@@ -493,18 +417,6 @@ void init_stream_gpu(size_t* total_n, int* max_reads, int *min_n, char gpu_confi
     plmem_stream_initialize(total_n, max_reads, min_n, gpu_config_file);
     plrange_upload_misc(misc);
     plscore_upload_misc(misc);
-#ifdef DEBUG_PRINT
-    fprintf(stderr, "[Info::%s] gpu initialized for chaining with config %s\n", __func__, gpu_config_file);
-    fprintf(stderr, "[Info::%s] Compile time config: \n", __func__);
-#ifdef USEHIP
-    fprintf(stderr, "\t\t USE HIP\n");
-#else
-    fprintf(stderr, "\t\t USE CUDA\n");
-#endif // USEHIP
-#ifdef MAX_MICRO_BATCH
-    fprintf(stderr, "\t\t MAX MICRO BATCH       \t%d\n", MAX_MICRO_BATCH);
-#endif // MAX_MICRO_BATCH
-#endif  // DEBUG_PRINT
 }
 
 /**
@@ -579,12 +491,6 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t*
 
 void free_stream_gpu(int n_threads){
     plmem_stream_cleanup();
-
-    size_t gpu_free_mem, gpu_total_mem;
-    cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
-#ifdef DEBUG_PRINT
-        fprintf(stderr, "[Info] GPU free mem: %f GB, total mem: %f GB (after cleanup) \n", (float)gpu_free_mem / OneG, (float)gpu_total_mem / OneG);
-#endif
 }
 
 /* gpu_rechain_batch has been superseded by plvoting_rechain_batch (plvoting.cu).

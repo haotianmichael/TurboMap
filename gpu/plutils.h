@@ -50,11 +50,6 @@ typedef struct {
     int *qlens;          // query length for each segment       <- allocated in worker_for, freed in free_read after seeding
     int n_seg;           // number of segs
 
-//DEBUG: for SCORE CHECK after chaining
-#if defined(DEBUG_CHECK) && 0
-    int32_t *f;
-    int64_t *p;
-#endif  // DEBUG_CHECK
     int rep_len;
     int frag_gap;
 
@@ -77,11 +72,6 @@ typedef struct {
 typedef struct seg_t {
     size_t start_idx;
     size_t end_idx;
-//DEBUG: used for debug plchain_cal_long_seg_range_dis LONG_SEG_RANGE_DIS
-#ifdef DEBUG_VERBOSE 
-    size_t start_segid;
-    size_t end_segid;
-#endif // DEBUG_VERBOSE
 } seg_t;
 
 /* Align Options */
@@ -240,12 +230,6 @@ void prepare_rechain_anchors(chain_read_t* read, void *km);
 static inline void free_read(chain_read_t *in, void* km) {
     if (in->qseqs) kfree(km, in->qseqs);
     if (in->qlens) kfree(km, in->qlens);
-//DEBUG: for SCORE CHECK after chaining
-#if defined(DEBUG_CHECK) && 0 
-    if (in->f) kfree(km, in->f);
-    if (in->p) kfree(km, in->p);
-    in->f = 0, in->p = 0;
-#endif
     in->qseqs = 0, in->qlens = 0;
     in->a = 0, in->u = 0;
 }

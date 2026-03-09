@@ -350,11 +350,6 @@ __global__ void score_generation_short(
                     long_seg[long_seg_idx].end_idx = long_seg_start_idx + (end_idx - start_idx);
                     long_seg_og[long_seg_idx].start_idx = start_idx;
                     long_seg_og[long_seg_idx].end_idx = end_idx;
-        //DEBUG: used for debug plchain_cal_long_seg_range_dis LONG_SEG_RANGE_DIS
-        #ifdef DEBUG_VERBOSE
-                    long_seg_og[long_seg_idx].start_segid = segid;
-                    long_seg_og[long_seg_idx].end_segid = end_segid;
-        #endif // DEBUG_VERBOSE
                 }
             }
             // broadcast long_seg_start_idx to all scalar registers
@@ -565,10 +560,6 @@ void plscore_async_short_mid_forward_dp(deviceMemPtr* dev_mem, cudaStream_t* str
     }
     cudaCheck();
 
-#ifdef DEBUG_PRINT
-    // fprintf(stderr, "[Info] %s (%s:%d) short mid score kernel launched\n", __func__, __FILE__, __LINE__);
-#endif
-    
     cudaCheck();
 }
 
@@ -577,11 +568,6 @@ void plscore_async_long_forward_dp(deviceMemPtr* dev_mem, cudaStream_t* stream) 
     size_t cut_num = dev_mem->num_cut;
     size_t buffer_size_long = dev_mem->buffer_size_long;
     dim3 longDimGrid(score_kernel_config.long_griddim, 1, 1);
-
-#ifdef DEBUG_VERBOSE
-    fprintf(stderr, "[Debug] %s (%s:%d) Long Grid Dim = %d\n", __func__, __FILE__, __LINE__, longDimGrid.x);
-#endif // DEBUG_VERBOSE
-
 
     if (score_kernel_config.long_blockdim == 1024){
     score_generation_long_map<1024><<<longDimGrid, dim3(1024, 1, 1), 0, *stream>>>(
@@ -596,10 +582,6 @@ void plscore_async_long_forward_dp(deviceMemPtr* dev_mem, cudaStream_t* stream) 
 
     cudaCheck();
 
-#ifdef DEBUG_PRINT
-    // fprintf(stderr, "[Info] %s (%s:%d) long score generation launched\n", __func__, __FILE__, __LINE__);
-#endif
-    
     cudaCheck();
 }
 
@@ -616,11 +598,6 @@ void plscore_async_naive_forward_dp(deviceMemPtr* dev_mem,
     score_generation_naive<<<shortDimGrid, DimBlock, 0, *stream>>>(
         dev_mem->d_ax, dev_mem->d_ay, dev_mem->d_sid, dev_mem->d_range, dev_mem->d_cut,
         dev_mem->d_f, dev_mem->d_p, total_n, cut_num);
-    cudaCheck();
-#ifdef DEBUG_VERBOSE
-    fprintf(stderr, "[M::%s] score generation kernel launch success\n", __func__);
-#endif
-
     cudaCheck();
 }
 

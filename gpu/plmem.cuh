@@ -204,9 +204,7 @@ typedef struct stream_ptr_t{
     longMemPtr long_mem;
     deviceMemPtr dev_mem;
     cudaStream_t cudastream;
-    cudaEvent_t stopevent, startevent, long_kernel_event;
-    cudaEvent_t short_kernel_start_event[MAX_MICRO_BATCH];
-    cudaEvent_t short_kernel_stop_event[MAX_MICRO_BATCH];
+    cudaEvent_t stopevent, startevent;
     bool busy = false;
 } stream_ptr_t;
 

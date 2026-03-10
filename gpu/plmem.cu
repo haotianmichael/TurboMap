@@ -94,14 +94,20 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     // data array
     cudaSetDevice(CUDA_DEVICE);
 
-    size_t chain_ax_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_ay_size = anchor_per_batch * sizeof(int32_t);
+    // For merged backtrack: ax/ay/xrev/yrev/f/p need micro_batch * anchor_per_batch
+    // to hold all micro-batches concatenated. sid/range stay at anchor_per_batch
+    // (only used in forward pass, overwritten each micro-batch).
+    int mb = score_kernel_config.micro_batch;
+    size_t bt_anchor_total = anchor_per_batch * mb;
+
+    size_t chain_ax_size = bt_anchor_total * sizeof(int32_t);
+    size_t chain_ay_size = bt_anchor_total * sizeof(int32_t);
     size_t chain_sid_size = anchor_per_batch * sizeof(int8_t);
-    size_t chain_xrev_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_yrev_size = anchor_per_batch * sizeof(int32_t);
+    size_t chain_xrev_size = bt_anchor_total * sizeof(int32_t);
+    size_t chain_yrev_size = bt_anchor_total * sizeof(int32_t);
     size_t chain_range_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_f_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_p_size = anchor_per_batch * sizeof(uint16_t);
+    size_t chain_f_size = bt_anchor_total * sizeof(int32_t);
+    size_t chain_p_size = bt_anchor_total * sizeof(uint16_t);
     size_t chain_total = chain_ax_size + chain_ay_size + chain_sid_size + chain_xrev_size + chain_yrev_size +
                          chain_range_size + chain_f_size + chain_p_size;
 
@@ -155,13 +161,11 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
             long_total / (1024.0*1024.0), long_total / (1024.0*1024.0*1024.0)); 
 
     // ========== Chain Backtrack Pre-allocated Buffers ==========
-    // Eliminates 17 cudaMalloc + 16 cudaFree per plbacktrack_gpu call.
-    // Each cudaMalloc stalls the entire GPU; pre-allocating removes this bottleneck.
-    // Anchor-sized arrays: anchor_per_batch = 50M → ~3 GB total.
-    // Read-sized arrays:   range_grid_size ≥ max_reads → negligible.
+    // Sized for ALL micro-batches combined (anchor_per_batch * micro_batch)
+    // so that backtracking can be done in a single merged call.
     {
-        size_t bt_n = anchor_per_batch;
-        size_t bt_r = (size_t)range_grid_size;  // >= max_read; read-sized arrays are tiny
+        size_t bt_n = bt_anchor_total;  // all micro-batches combined
+        size_t bt_r = (size_t)range_grid_size * mb;  // reads across all micro-batches
 
         dev_mem->d_bt_max_total_n = bt_n;
         dev_mem->d_bt_max_n_reads = bt_r;

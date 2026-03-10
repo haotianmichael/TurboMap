@@ -327,14 +327,12 @@ __global__ void expand_p_to_int64(uint16_t* p_rel, int64_t* p_expanded, int* off
 
 // Host function to orchestrate backtracking.
 // Uses pre-allocated device buffers from dev_mem->d_bt_* — no cudaMalloc in hot path.
-void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
+void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
                      chain_read_t *reads, Misc misc,
                      void* km, cudaStream_t stream)
 {
-    int n_reads = host_mem->size;
     if (n_reads == 0) return;
 
-    size_t total_n = host_mem->total_n;
     assert(total_n     <= dev_mem->d_bt_max_total_n);
     assert((size_t)n_reads <= dev_mem->d_bt_max_n_reads);
 
@@ -389,10 +387,6 @@ void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
     mm_filter_anchors<<<n_reads, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, d_offset, min_sc, dev_mem->d_f, d_zx, d_zy,
         d_ofs_end, d_t, d_num_elements, d_n_v, n_reads);
-    cudaCheck();
-
-    // Sync and check for any kernel errors before CUB sort
-    cudaStreamSynchronize(stream);
     cudaCheck();
 
     // Step 2: Segmented sort by score (ascending) using pre-allocated CUB temp

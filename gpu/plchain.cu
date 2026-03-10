@@ -182,23 +182,20 @@ int plchain_schedule_stream(const streamSetup_t stream_setup, const int batchid)
  * Finish and cleanup the stream, save primary chain results to unpinned CPU memory.  
  * RETURN: number of reads in last batch 
 */
-int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id, 
+int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id,
                             Misc misc, void* km)
 {
-    int n_reads = 0;
-    
+    deviceMemPtr *dev_mem = &stream_setup.streams[stream_id].dev_mem;
+    cudaStream_t curr_stream = stream_setup.streams[stream_id].cudastream;
     seg_t* long_segs = stream_setup.streams[stream_id].long_mem.long_segs_og_idx;
     size_t long_seg_idx = 0;
     size_t long_i = 0;
-    
+
+    // Phase 1: Merge long segment results into host f[]/p[] (CPU)
     for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) {
         if (stream_setup.streams[stream_id].host_mems[uid].size == 0) continue;
-        
-        unsigned int long_segs_num = 
+        unsigned int long_segs_num =
             stream_setup.streams[stream_id].host_mems[uid].long_segs_num[0];
-        size_t total_n_long_segs = 0;
-        
-        // Copy long segment results back
         for (; long_seg_idx < long_segs_num; long_seg_idx++) {
             for (size_t i = long_segs[long_seg_idx].start_idx;
                  i < long_segs[long_seg_idx].end_idx; i++, long_i++) {
@@ -207,50 +204,38 @@ int plchain_post_gpu_helper(streamSetup_t stream_setup, int stream_id,
                 stream_setup.streams[stream_id].host_mems[uid].p[i] =
                     stream_setup.streams[stream_id].long_mem.p_long[long_i];
             }
-            total_n_long_segs += 
-                long_segs[long_seg_idx].end_idx - long_segs[long_seg_idx].start_idx;
         }
-
-        // CRITICAL FIX: Restore correct micro-batch anchors before GPU backtracking
-        // Problem: During forward pass, each micro-batch overwrites dev_mem->d_ax/d_ay
-        // After all micro-batches complete, dev_mem contains ONLY the last micro-batch's anchors
-        // Solution: Copy this micro-batch's anchors from host_mem back to dev_mem before backtracking
-        hostMemPtr *curr_host_mem = &stream_setup.streams[stream_id].host_mems[uid];
-        deviceMemPtr *dev_mem = &stream_setup.streams[stream_id].dev_mem;
-        cudaStream_t curr_stream = stream_setup.streams[stream_id].cudastream;
-
-        cudaMemcpyAsync(dev_mem->d_ax, curr_host_mem->ax,
-                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
-                        curr_stream);
-        cudaMemcpyAsync(dev_mem->d_ay, curr_host_mem->ay,
-                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
-                        curr_stream);
-        cudaMemcpyAsync(dev_mem->d_xrev, curr_host_mem->xrev,
-                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
-                        curr_stream);
-        cudaMemcpyAsync(dev_mem->d_yrev, curr_host_mem->yrev,
-                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
-                        curr_stream);
-        // CRITICAL FIX: Also copy score (f) and predecessor (p) arrays
-        // These contain the chaining results from forward pass + long segments
-        // Without this, GPU backtracking uses stale/incorrect data
-        cudaMemcpyAsync(dev_mem->d_f, curr_host_mem->f,
-                        sizeof(int32_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
-                        curr_stream);
-        cudaMemcpyAsync(dev_mem->d_p, curr_host_mem->p,
-                        sizeof(uint16_t) * curr_host_mem->total_n, cudaMemcpyHostToDevice,
-                        curr_stream);
-        cudaStreamSynchronize(curr_stream);  // Ensure all data is copied before backtracking
-
-        // Use GPU backtracking instead of CPU
-        plbacktrack_gpu(curr_host_mem, dev_mem,
-                       stream_setup.streams[stream_id].reads + n_reads, misc, km,
-                       curr_stream);
-
-        n_reads += curr_host_mem->size;
     }
-    
-    return n_reads;
+
+    // Phase 2: Concatenate all micro-batches' data to device at offsets (one batch of H2D)
+    size_t combined_total_n = 0;
+    int combined_n_reads = 0;
+    for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) {
+        hostMemPtr *hm = &stream_setup.streams[stream_id].host_mems[uid];
+        if (hm->size == 0) continue;
+        size_t n = hm->total_n;
+        cudaMemcpyAsync(dev_mem->d_ax   + combined_total_n, hm->ax,
+                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, curr_stream);
+        cudaMemcpyAsync(dev_mem->d_ay   + combined_total_n, hm->ay,
+                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, curr_stream);
+        cudaMemcpyAsync(dev_mem->d_xrev + combined_total_n, hm->xrev,
+                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, curr_stream);
+        cudaMemcpyAsync(dev_mem->d_yrev + combined_total_n, hm->yrev,
+                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, curr_stream);
+        cudaMemcpyAsync(dev_mem->d_f    + combined_total_n, hm->f,
+                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, curr_stream);
+        cudaMemcpyAsync(dev_mem->d_p    + combined_total_n, hm->p,
+                        sizeof(uint16_t) * n, cudaMemcpyHostToDevice, curr_stream);
+        combined_total_n += n;
+        combined_n_reads += hm->size;
+    }
+
+    // Phase 3: Single merged backtrack call for all reads
+    // No explicit sync needed — stream ordering guarantees H2D completes before kernels
+    plbacktrack_gpu(combined_n_reads, combined_total_n, dev_mem,
+                    stream_setup.streams[stream_id].reads, misc, km, curr_stream);
+
+    return combined_n_reads;
 }
 
 /* 

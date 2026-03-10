@@ -12,19 +12,18 @@ extern "C" {
 /**
  * @brief GPU kernel wrapper for chain backtracking
  *
- * This function performs chain backtracking on the GPU, converting
- * forward chaining scores into actual chains. It filters anchors,
- * sorts them by score, performs backtracking, and generates final
- * chain regions.
+ * Performs chain backtracking on the GPU for all reads in a batch.
+ * Filters anchors, sorts by score, backtrack, and generates chain regions.
  *
- * @param host_mem Host memory structure containing scores and predecessors
- * @param dev_mem Device memory structure
+ * @param n_reads Number of reads to backtrack
+ * @param total_n Total number of anchors across all reads
+ * @param dev_mem Device memory (d_ax/d_ay/d_f/d_p must contain concatenated data)
  * @param reads Array of chain reads
  * @param misc Chaining parameters
  * @param km Memory pool
  * @param stream CUDA stream for async execution
  */
-void plbacktrack_gpu(hostMemPtr *host_mem, deviceMemPtr *dev_mem,
+void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
                      chain_read_t *reads, Misc misc,
                      void* km, cudaStream_t stream);
 

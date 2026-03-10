@@ -378,14 +378,14 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
     cudaMemcpyAsync(d_offset, h_offset, sizeof(int) * n_reads, cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_n_a,    h_n_a,    sizeof(int) * n_reads, cudaMemcpyHostToDevice, stream);
 
-    // Expand uint16_t predecessors → int64_t
+    // Expand uint16_t predecessors → int64_t (reads from d_bt_p_in)
     expand_p_to_int64<<<n_reads, THREAD_NUM_SHORT, 0, stream>>>(
-        dev_mem->d_p, d_p_abs, d_offset, d_n_a, n_reads);
+        dev_mem->d_bt_p_in, d_p_abs, d_offset, d_n_a, n_reads);
     cudaCheck();
 
-    // Step 1: Filter anchors by score
+    // Step 1: Filter anchors by score (reads from d_bt_f_in)
     mm_filter_anchors<<<n_reads, THREAD_NUM_SHORT, 0, stream>>>(
-        d_n_a, d_offset, min_sc, dev_mem->d_f, d_zx, d_zy,
+        d_n_a, d_offset, min_sc, dev_mem->d_bt_f_in, d_zx, d_zy,
         d_ofs_end, d_t, d_num_elements, d_n_v, n_reads);
     cudaCheck();
 
@@ -398,16 +398,20 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
     cudaCheck();
 
     // Step 3: Backtrack — compute u chains and compacted anchor arrays
+    //         Reads from d_bt_*_in (separate from d_ax used by chain forward pass)
     mm_chain_backtrack_parallel<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
-        d_n_a, dev_mem->d_ax, dev_mem->d_ay, dev_mem->d_xrev, dev_mem->d_yrev,
-        dev_mem->d_f, d_p_abs, d_u,
+        d_n_a, dev_mem->d_bt_ax_in, dev_mem->d_bt_ay_in,
+        dev_mem->d_bt_xrev_in, dev_mem->d_bt_yrev_in,
+        dev_mem->d_bt_f_in, d_p_abs, d_u,
         d_zx, d_zy, d_t, d_v, d_offset, min_cnt, min_sc, max_drop,
         n_reads, d_n_v, d_n_u, d_num_elements, d_ofs_end);
 
     // D2H: n_u per read (needed for per-read w-array sort)
-    // cudaMemcpy (non-async) waits for all prior GPU work to finish
+    // Use async + stream sync to only wait on backtrack_stream, not all streams
     int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
-    cudaMemcpy(h_n_u, d_n_u, sizeof(int) * n_reads, cudaMemcpyDeviceToHost);
+    cudaMemcpyAsync(h_n_u, d_n_u, sizeof(int) * n_reads,
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
 
     // Step 4: Sort w arrays (d_p_abs = w_x, d_v = w_y) per-read by target position
     for (int i = 0; i < n_reads; i++) {
@@ -419,28 +423,31 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
         }
     }
 
-    // Step 5: Write compacted anchor output
+    // Step 5: Write compacted anchor output (reads d_bt_f_in for scores)
     mm_set_chain<<<BLOCK_NUM_SHORT, THREAD_NUM_SHORT, 0, stream>>>(
         d_n_a, n_reads, d_ax_out, d_ay_out, d_xrev_out, d_yrev_out, d_offset, d_ofs_end,
-        dev_mem->d_f, d_p_abs, d_u, d_zx, d_zy, d_t, d_v, d_n_v);
+        dev_mem->d_bt_f_in, d_p_abs, d_u, d_zx, d_zy, d_t, d_v, d_n_v);
 
-    // D2H: compacted anchor arrays (cudaMemcpy waits for stream to finish)
-    int32_t *h_ax   = (int32_t*)malloc(sizeof(int32_t) * total_n);
-    int32_t *h_ay   = (int32_t*)malloc(sizeof(int32_t) * total_n);
-    int32_t *h_xrev = (int32_t*)malloc(sizeof(int32_t) * total_n);
-    int32_t *h_yrev = (int32_t*)malloc(sizeof(int32_t) * total_n);
-    cudaMemcpy(h_ax,   d_ax_out,   sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_ay,   d_ay_out,   sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_xrev, d_xrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
-    cudaMemcpy(h_yrev, d_yrev_out, sizeof(int32_t) * total_n, cudaMemcpyDeviceToHost);
+    // D2H: compacted anchor arrays + u array — all in one async batch
+    // Only sync backtrack_stream, so chain on cudastream keeps running
+    int32_t  *h_ax   = (int32_t*)malloc(sizeof(int32_t) * total_n);
+    int32_t  *h_ay   = (int32_t*)malloc(sizeof(int32_t) * total_n);
+    int32_t  *h_xrev = (int32_t*)malloc(sizeof(int32_t) * total_n);
+    int32_t  *h_yrev = (int32_t*)malloc(sizeof(int32_t) * total_n);
+    uint64_t *h_u_all = (uint64_t*)malloc(sizeof(uint64_t) * total_n);
+    cudaMemcpyAsync(h_ax,    d_ax_out,   sizeof(int32_t)  * total_n, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_ay,    d_ay_out,   sizeof(int32_t)  * total_n, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_xrev,  d_xrev_out, sizeof(int32_t)  * total_n, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_yrev,  d_yrev_out, sizeof(int32_t)  * total_n, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_u_all, d_u,        sizeof(uint64_t) * total_n, cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
 
-    // Update read structures with chain results
+    // Update read structures with chain results (all data is now on host)
     for (int i = 0; i < n_reads; i++) {
         reads[i].n_u = h_n_u[i];
         if (h_n_u[i] > 0) {
             KMALLOC(km, reads[i].u, h_n_u[i]);
-            cudaMemcpy(reads[i].u, &d_u[h_offset[i]],
-                       sizeof(uint64_t) * h_n_u[i], cudaMemcpyDeviceToHost);
+            memcpy(reads[i].u, &h_u_all[h_offset[i]], sizeof(uint64_t) * h_n_u[i]);
 
             int new_n = 0;
             for (int j = 0; j < h_n_u[i]; j++)
@@ -462,6 +469,7 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
         }
     }
 
+    free(h_u_all);
     free(h_ax);
     free(h_ay);
     free(h_xrev);

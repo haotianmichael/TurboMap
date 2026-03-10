@@ -91,23 +91,20 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
             anchor_per_batch, range_grid_size, num_cut);
     fprintf(stderr, "buffer_size_long=%zu\n", dev_mem->buffer_size_long);
 
-    // data array
+    // data array — forward chain pass only (overwritten per micro-batch)
     cudaSetDevice(CUDA_DEVICE);
 
-    // For merged backtrack: ax/ay/xrev/yrev/f/p need micro_batch * anchor_per_batch
-    // to hold all micro-batches concatenated. sid/range stay at anchor_per_batch
-    // (only used in forward pass, overwritten each micro-batch).
     int mb = score_kernel_config.micro_batch;
-    size_t bt_anchor_total = anchor_per_batch * mb;
+    size_t bt_anchor_total = anchor_per_batch * mb;  // for backtrack buffers below
 
-    size_t chain_ax_size = bt_anchor_total * sizeof(int32_t);
-    size_t chain_ay_size = bt_anchor_total * sizeof(int32_t);
+    size_t chain_ax_size = anchor_per_batch * sizeof(int32_t);
+    size_t chain_ay_size = anchor_per_batch * sizeof(int32_t);
     size_t chain_sid_size = anchor_per_batch * sizeof(int8_t);
-    size_t chain_xrev_size = bt_anchor_total * sizeof(int32_t);
-    size_t chain_yrev_size = bt_anchor_total * sizeof(int32_t);
+    size_t chain_xrev_size = anchor_per_batch * sizeof(int32_t);
+    size_t chain_yrev_size = anchor_per_batch * sizeof(int32_t);
     size_t chain_range_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_f_size = bt_anchor_total * sizeof(int32_t);
-    size_t chain_p_size = bt_anchor_total * sizeof(uint16_t);
+    size_t chain_f_size = anchor_per_batch * sizeof(int32_t);
+    size_t chain_p_size = anchor_per_batch * sizeof(uint16_t);
     size_t chain_total = chain_ax_size + chain_ay_size + chain_sid_size + chain_xrev_size + chain_yrev_size +
                          chain_range_size + chain_f_size + chain_p_size;
 
@@ -161,8 +158,9 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
             long_total / (1024.0*1024.0), long_total / (1024.0*1024.0*1024.0)); 
 
     // ========== Chain Backtrack Pre-allocated Buffers ==========
-    // Sized for ALL micro-batches combined (anchor_per_batch * micro_batch)
-    // so that backtracking can be done in a single merged call.
+    // Sized for ALL micro-batches combined (anchor_per_batch * micro_batch).
+    // d_bt_*_in: SEPARATE input buffers so backtrack(B_{N-1}) on backtrack_stream
+    //   does not conflict with chain(B_N) on cudastream using d_ax/d_ay/d_f/d_p.
     {
         size_t bt_n = bt_anchor_total;  // all micro-batches combined
         size_t bt_r = (size_t)range_grid_size * mb;  // reads across all micro-batches
@@ -170,6 +168,15 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
         dev_mem->d_bt_max_total_n = bt_n;
         dev_mem->d_bt_max_n_reads = bt_r;
 
+        // Backtrack input buffers (separate from d_ax etc.)
+        cudaMalloc(&dev_mem->d_bt_ax_in,       bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_ay_in,       bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_xrev_in,     bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_yrev_in,     bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_f_in,        bt_n * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_bt_p_in,        bt_n * sizeof(uint16_t));
+
+        // Working buffers
         cudaMalloc(&dev_mem->d_bt_zx,          bt_n * sizeof(int64_t));
         cudaMalloc(&dev_mem->d_bt_zy,          bt_n * sizeof(int64_t));
         cudaMalloc(&dev_mem->d_bt_v,           bt_n * sizeof(int64_t));
@@ -203,11 +210,17 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
             cudaMalloc(&dev_mem->d_bt_cub_tmp, tmp_bytes);
         }
 
-        size_t bt_total = bt_n * (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
+        // Backtrack-dedicated stream
+        cudaStreamCreate(&dev_mem->backtrack_stream);
+
+        size_t bt_input = bt_n * (4*sizeof(int32_t) + sizeof(int32_t) + sizeof(uint16_t));
+        size_t bt_work  = bt_n * (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
                         + bt_r * 6 * sizeof(int)
                         + dev_mem->d_bt_cub_tmp_size;
-        fprintf(stderr, " [Chain] Backtrack pre-alloc buffers: %.2f MB (%.2f GB)\n",
-                bt_total / (1024.0*1024.0), bt_total / (1024.0*1024.0*1024.0));
+        fprintf(stderr, " [Chain] Backtrack input buffers: %.2f MB (%.2f GB)\n",
+                bt_input / (1024.0*1024.0), bt_input / (1024.0*1024.0*1024.0));
+        fprintf(stderr, " [Chain] Backtrack working buffers: %.2f MB (%.2f GB)\n",
+                bt_work / (1024.0*1024.0), bt_work / (1024.0*1024.0*1024.0));
     }
 
     // ========== Alignment Buffers ==========
@@ -400,10 +413,13 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     fprintf(stderr, " [Align] Total BackTrack buffers: %.2f GB\n", bck_total / (1024.0*1024.0*1024.0));
 
     // ========== GRAND TOTAL CALCULATION ==========
-    size_t chain_bt_total = dev_mem->d_bt_max_total_n *
+    size_t chain_bt_input = dev_mem->d_bt_max_total_n *
+                            (4*sizeof(int32_t) + sizeof(int32_t) + sizeof(uint16_t));
+    size_t chain_bt_work  = dev_mem->d_bt_max_total_n *
                             (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
                           + dev_mem->d_bt_max_n_reads * 6 * sizeof(int)
                           + dev_mem->d_bt_cub_tmp_size;
+    size_t chain_bt_total = chain_bt_input + chain_bt_work;
 
     size_t chain_total_all = chain_total +
                              (idx_total + cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) +
@@ -455,6 +471,12 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFree(dev_mem->d_total_n_long);
 
     // Chain backtrack pre-allocated buffers
+    cudaFree(dev_mem->d_bt_ax_in);
+    cudaFree(dev_mem->d_bt_ay_in);
+    cudaFree(dev_mem->d_bt_xrev_in);
+    cudaFree(dev_mem->d_bt_yrev_in);
+    cudaFree(dev_mem->d_bt_f_in);
+    cudaFree(dev_mem->d_bt_p_in);
     cudaFree(dev_mem->d_bt_zx);
     cudaFree(dev_mem->d_bt_zy);
     cudaFree(dev_mem->d_bt_v);
@@ -472,6 +494,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFree(dev_mem->d_bt_n_v);
     cudaFree(dev_mem->d_bt_n_u);
     cudaFree(dev_mem->d_bt_cub_tmp);
+    cudaStreamDestroy(dev_mem->backtrack_stream);
 
     // Alignment buffers
     if (dev_mem->d_align_unpacked_query) cudaFree(dev_mem->d_align_unpacked_query);

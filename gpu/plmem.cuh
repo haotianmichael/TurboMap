@@ -99,8 +99,20 @@ typedef struct {
 
     // ========== Chain Backtrack Pre-allocated Buffers ==========
     // Pre-allocated to eliminate hot-path cudaMalloc/cudaFree in plbacktrack_gpu.
-    // Sized to anchor_per_batch (max micro-batch anchors) and max_reads.
-    // Anchor-sized (int64_t × anchor_per_batch):
+    // d_bt_*_in: SEPARATE input buffers for backtrack (sized: anchor_per_batch * micro_batch)
+    //   Enables chain(B_N) on cudastream to overlap with backtrack(B_{N-1}) on backtrack_stream
+    //   without conflicting on d_ax/d_ay/d_f/d_p (which chain uses).
+    // d_bt_* working buffers: also sized anchor_per_batch * micro_batch.
+
+    // Backtrack input (read from host, separate from d_ax so chain can overlap)
+    int32_t  *d_bt_ax_in;    // anchor x
+    int32_t  *d_bt_ay_in;    // anchor y
+    int32_t  *d_bt_xrev_in;  // anchor xrev
+    int32_t  *d_bt_yrev_in;  // anchor yrev
+    int32_t  *d_bt_f_in;     // chain score
+    uint16_t *d_bt_p_in;     // predecessor
+
+    // Anchor-sized working (int64_t × anchor_per_batch * micro_batch):
     int64_t  *d_bt_zx;       // z-scores x (filter output + sort in-place)
     int64_t  *d_bt_zy;       // z-scores y (sort key)
     int64_t  *d_bt_v;        // w_y scratch (sort value), then w array y
@@ -112,7 +124,7 @@ typedef struct {
     int32_t  *d_bt_ay_out;   // compacted anchor y
     int32_t  *d_bt_xrev_out; // compacted xrev
     int32_t  *d_bt_yrev_out; // compacted yrev
-    // Read-sized (int × max_reads):
+    // Read-sized (int × max_reads * micro_batch):
     int      *d_bt_n_a;          // anchors per read
     int      *d_bt_offset;       // read anchor start offset
     int      *d_bt_ofs_end;      // read filter endpoint
@@ -125,6 +137,10 @@ typedef struct {
     // Capacities stored for assertions:
     size_t    d_bt_max_total_n;  // anchor capacity of d_bt_* anchor arrays
     size_t    d_bt_max_n_reads;  // read capacity of d_bt_* read arrays
+
+    // Dedicated stream for backtrack+voting (separate from chain cudastream)
+    // Enables chain(B_N) GPU kernels to overlap with backtrack(B_{N-1}).
+    cudaStream_t backtrack_stream;
 
     // ========== Alignment Buffers (unified allocation) ==========
     size_t max_align_tasks;       // max number of alignment tasks

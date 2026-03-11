@@ -1925,17 +1925,16 @@ static void deep_copy_read_to_batch(mm_batch_trbuf_t *dst, const chain_read_t *s
  *
  * Timeline (steady state):
  *
- *   GPU cudastream:   ████ chain(B_N) ████████████████████████████
- *   GPU bt_stream:    ████ backtrack(B_{N-1}) ████
+ *   GPU cudastream:   ████ chain(B_N) ██████████████████████████████████
  *   CPU/GPU KSW:      ████ align(B_{N-2}) ████████████████████████
- *                     ↑ all three overlap ↑
+ *                     ↑ chain overlaps KSW ↑
  *
- * Per cycle:
+ * Per cycle (single-buffered host_mems — backtrack before chain launch):
  *   1. sync_chain_gpu(chain_batch)           — wait for prev chain + long-seg
- *   2. launch_chain_gpu(acc_batch)           — async on cudastream
- *   3. start_backtrack_gpu(chain_batch)      — async on bt_stream (overlaps chain!)
- *   4. prepare_align_batch_gpu(ksw_batch)    — KSW (overlaps chain + backtrack!)
- *   5. finish_backtrack_gpu(chain_batch)     — sync bt_stream + voting + post_chain
+ *   2. start_backtrack_gpu(chain_batch)      — H2D + backtrack (blocking)
+ *   3. launch_chain_gpu(acc_batch)           — async on cudastream (host_mems free)
+ *   4. prepare_align_batch_gpu(ksw_batch)    — KSW (overlaps chain!)
+ *   5. finish_backtrack_gpu(chain_batch)     — voting + post_chain (bt already synced)
  *   6. rotate: chain→ksw, acc→chain, ksw→acc
  */
 static void* gpu_batch_consumer(void *data) {
@@ -1982,7 +1981,6 @@ static void* gpu_batch_consumer(void *data) {
     int has_ksw = 0;        // ksw_batch is ready for alignment
     int queue_finished = 0;
     int is_full = 0;
-    int hm_idx = 0;         // current host_mem buffer index for chain
 
     chain_read_t read;
 
@@ -2038,17 +2036,23 @@ static void* gpu_batch_consumer(void *data) {
                 // ── Phase 1: sync previous chain ─────────────────────────
                 chain_read_t *prev_reads = NULL;
                 int prev_n_read = 0;
-                int prev_hm = hm_idx;
                 if (has_chain) {
-                    sync_chain_gpu(hm_idx, stream_id);
+                    sync_chain_gpu(stream_id);
                     prev_reads = chain_batch.reads;
                     prev_n_read = chain_batch.count;
                 }
 
-                // ── Phase 2: launch new chain [async cudastream] ─────────
-                int new_hm = has_chain ? (1 - hm_idx) : 0;
+                // ── Phase 2: backtrack prev batch (blocking — frees host_mems)
+                int bt_n = 0;
+                if (prev_reads) {
+                    start_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
+                                       stream_id, chain_batch.km, &bt_n);
+                }
+
+                // ── Phase 3: launch new chain [async cudastream] ─────────
+                // Safe: backtrack H2D is done, host_mems are free
                 int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count,
-                                                new_hm, stream_id);
+                                                stream_id);
                 // Defer overflow reads to fallback_batch and shrink count
                 if (overflow > 0) {
                     int fit = acc_batch.count - overflow;
@@ -2059,14 +2063,7 @@ static void* gpu_batch_consumer(void *data) {
                     acc_batch.count = fit;
                 }
 
-                // ── Phase 3: start backtrack of prev [async bt_stream] ───
-                if (prev_reads) {
-                    int bt_n;
-                    start_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
-                                       prev_hm, stream_id, chain_batch.km, &bt_n);
-                }
-
-                // ── Phase 4: KSW on ksw_batch [overlaps chain+backtrack!] ─
+                // ── Phase 4: KSW on ksw_batch [overlaps chain!] ──────────
                 if (has_ksw) {
                     if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
                         fprintf(stderr, "ALIGN_BATCH: count=%d\n", ksw_batch.count);
@@ -2075,10 +2072,10 @@ static void* gpu_batch_consumer(void *data) {
                     mm_trbuf_batch_reset(&ksw_batch, s->batch_max_reads, s->p->opt);
                 }
 
-                // ── Phase 5: finish backtrack [sync bt_stream + voting] ──
+                // ── Phase 5: finish backtrack [voting + post_chain] ──────
                 if (prev_reads) {
                     finish_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
-                                        prev_n_read, stream_id, chain_batch.km);
+                                        bt_n, stream_id, chain_batch.km);
                 }
 
                 // ── Rotate ────────────────────────────────────────────────
@@ -2099,7 +2096,6 @@ static void* gpu_batch_consumer(void *data) {
                 }
                 acc_batch.count = 0;
                 acc_batch.total_n = 0;
-                hm_idx = new_hm;
                 has_chain = 1;
                 is_full = 0;
 
@@ -2108,14 +2104,14 @@ static void* gpu_batch_consumer(void *data) {
                 if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
                     fprintf(stderr, "FINISH_STREAM: chain_count=%d\n", chain_batch.count);
 
-                sync_chain_gpu(hm_idx, stream_id);
+                sync_chain_gpu(stream_id);
 
                 chain_read_t *prev_reads = chain_batch.reads;
 
-                // No new chain to launch — just backtrack + KSW overlap
+                // Backtrack (blocking — no new chain to launch after)
                 int bt_n;
                 start_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
-                                   hm_idx, stream_id, chain_batch.km, &bt_n);
+                                   stream_id, chain_batch.km, &bt_n);
 
                 // Defer overflow reads that didn't fit in micro-batches
                 for (int r_ = bt_n; r_ < chain_batch.count; r_++) {
@@ -2124,7 +2120,7 @@ static void* gpu_batch_consumer(void *data) {
                 }
                 chain_batch.count = bt_n;
 
-                // KSW on previous ksw_batch while backtrack runs
+                // KSW on previous ksw_batch
                 if (has_ksw) {
                     if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
                         fprintf(stderr, "ALIGN_BATCH: count=%d\n", ksw_batch.count);

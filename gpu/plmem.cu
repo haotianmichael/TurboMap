@@ -591,8 +591,8 @@ void plmem_reorg_input_arr(chain_read_t *reads, int n_read,
     host_mem->griddim = griddim;
 }
 
-void plmem_async_h2d_short_memcpy(stream_ptr_t* stream_ptrs, int hm, size_t uid) {
-    hostMemPtr *host_mem = &stream_ptrs->host_mems[hm][uid];
+void plmem_async_h2d_short_memcpy(stream_ptr_t* stream_ptrs, size_t uid) {
+    hostMemPtr *host_mem = &stream_ptrs->host_mems[uid];
     deviceMemPtr *dev_mem = &stream_ptrs->dev_mem;
     cudaStream_t *stream = &stream_ptrs->cudastream;
     cudaMemcpyAsync(dev_mem->d_ax, host_mem->ax,
@@ -634,7 +634,7 @@ void plmem_async_h2d_short_memcpy(stream_ptr_t* stream_ptrs, int hm, size_t uid)
 
 void plmem_async_h2d_memcpy(stream_ptr_t* stream_ptrs) {
     size_t uid = 0;
-    hostMemPtr *host_mem = &stream_ptrs->host_mems[0][uid];
+    hostMemPtr *host_mem = &stream_ptrs->host_mems[uid];
     deviceMemPtr *dev_mem = &stream_ptrs->dev_mem;
     cudaStream_t *stream = &stream_ptrs->cudastream;
     cudaMemcpyAsync(dev_mem->d_ax, host_mem->ax,
@@ -699,7 +699,7 @@ void plmem_sync_h2d_memcpy(hostMemPtr *host_mem, deviceMemPtr *dev_mem) {
 
 void plmem_async_d2h_memcpy(stream_ptr_t *stream_ptrs) {
     size_t uid = 0;
-    hostMemPtr *host_mem = &stream_ptrs->host_mems[0][uid];
+    hostMemPtr *host_mem = &stream_ptrs->host_mems[uid];
     longMemPtr *long_mem = &stream_ptrs->long_mem;
     deviceMemPtr *dev_mem = &stream_ptrs->dev_mem;
     cudaStream_t *stream = &stream_ptrs->cudastream;
@@ -721,8 +721,8 @@ void plmem_async_d2h_memcpy(stream_ptr_t *stream_ptrs) {
     cudaCheck();
 }
 
-void plmem_async_d2h_short_memcpy(stream_ptr_t *stream_ptrs, int hm, size_t uid) {
-    hostMemPtr *host_mem = &stream_ptrs->host_mems[hm][uid];
+void plmem_async_d2h_short_memcpy(stream_ptr_t *stream_ptrs, size_t uid) {
+    hostMemPtr *host_mem = &stream_ptrs->host_mems[uid];
     deviceMemPtr *dev_mem = &stream_ptrs->dev_mem;
     cudaStream_t *stream = &stream_ptrs->cudastream;
     cudaMemcpyAsync(host_mem->f, dev_mem->d_f,
@@ -984,14 +984,11 @@ void plmem_stream_initialize(size_t *max_total_n_,
         cudaEventCreate(&stream_setup.streams[i].startevent);
         cudaCheck();
         stream_setup.streams[i].dev_mem.buffer_size_long = long_seg_buffer_size;
-        // one stream has double-buffered host mems (2 sets × micro_batch)
-        for (int b = 0; b < 2; b++) {
-            for (int j = 0; j < score_kernel_config.micro_batch; j++) {
-                plmem_malloc_host_mem(&stream_setup.streams[i].host_mems[b][j], max_anchors_stream,
-                                  max_range_grid, long_seg_buffer_size);
-            }
+        // one stream has multiple host mems
+        for (int j = 0; j < score_kernel_config.micro_batch; j++) {
+            plmem_malloc_host_mem(&stream_setup.streams[i].host_mems[j], max_anchors_stream,
+                              max_range_grid, long_seg_buffer_size);
         }
-        stream_setup.streams[i].cur_hm = 0;
         // one stream has one long mem and one device mem
         plmem_malloc_long_mem(&stream_setup.streams[i].long_mem, long_seg_buffer_size);
         plmem_malloc_device_mem(&stream_setup.streams[i].dev_mem, max_anchors_stream,
@@ -1027,11 +1024,9 @@ void plmem_stream_cleanup() {
         cudaEventDestroy(stream_setup.streams[i].stopevent);
         cudaEventDestroy(stream_setup.streams[i].startevent);
         cudaCheck();
-        // free double-buffered host mems
-        for (int b = 0; b < 2; b++) {
-            for (int j = 0; j < score_kernel_config.micro_batch; j++) {
-                plmem_free_host_mem(&stream_setup.streams[i].host_mems[b][j]);
-            }
+        // free multiple host mems
+        for (int j = 0; j < score_kernel_config.micro_batch; j++) {
+            plmem_free_host_mem(&stream_setup.streams[i].host_mems[j]);
         }
         plmem_free_long_mem(&stream_setup.streams[i].long_mem);
         plmem_free_device_mem(&stream_setup.streams[i].dev_mem);

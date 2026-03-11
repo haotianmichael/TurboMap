@@ -2049,13 +2049,14 @@ static void* gpu_batch_consumer(void *data) {
                 int new_hm = has_chain ? (1 - hm_idx) : 0;
                 int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count,
                                                 new_hm, stream_id);
-                // Defer overflow reads to fallback_batch
+                // Defer overflow reads to fallback_batch and shrink count
                 if (overflow > 0) {
                     int fit = acc_batch.count - overflow;
                     for (int r_ = fit; r_ < acc_batch.count; r_++) {
                         fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", r_);
                         deep_copy_read_to_batch(&fallback_batch, &acc_batch.reads[r_], s->p->opt);
                     }
+                    acc_batch.count = fit;
                 }
 
                 // ── Phase 3: start backtrack of prev [async bt_stream] ───
@@ -2080,17 +2081,22 @@ static void* gpu_batch_consumer(void *data) {
                                         prev_n_read, stream_id, chain_batch.km);
                 }
 
-                // ── Rotate: chain→ksw, acc→chain, ksw→acc ───────────────
-                mm_batch_trbuf_t tmp = ksw_batch;
+                // ── Rotate ────────────────────────────────────────────────
+                mm_batch_trbuf_t tmp;
                 if (prev_reads) {
+                    // 3-way rotate: chain→ksw, acc→chain, ksw→acc
+                    tmp = ksw_batch;
                     ksw_batch = chain_batch;
+                    chain_batch = acc_batch;
+                    acc_batch = tmp;
                     has_ksw = 1;
                 } else {
-                    // First launch — no batch ready for KSW yet
+                    // First launch: 2-way swap: acc→chain, chain→acc
+                    tmp = chain_batch;
+                    chain_batch = acc_batch;
+                    acc_batch = tmp;
                     has_ksw = 0;
                 }
-                chain_batch = acc_batch;
-                acc_batch = tmp;
                 acc_batch.count = 0;
                 acc_batch.total_n = 0;
                 hm_idx = new_hm;
@@ -2105,12 +2111,18 @@ static void* gpu_batch_consumer(void *data) {
                 sync_chain_gpu(hm_idx, stream_id);
 
                 chain_read_t *prev_reads = chain_batch.reads;
-                int prev_n_read = chain_batch.count;
 
                 // No new chain to launch — just backtrack + KSW overlap
                 int bt_n;
                 start_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
                                    hm_idx, stream_id, chain_batch.km, &bt_n);
+
+                // Defer overflow reads that didn't fit in micro-batches
+                for (int r_ = bt_n; r_ < chain_batch.count; r_++) {
+                    fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", r_);
+                    deep_copy_read_to_batch(&fallback_batch, &chain_batch.reads[r_], s->p->opt);
+                }
+                chain_batch.count = bt_n;
 
                 // KSW on previous ksw_batch while backtrack runs
                 if (has_ksw) {
@@ -2122,13 +2134,7 @@ static void* gpu_batch_consumer(void *data) {
                 }
 
                 finish_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
-                                    prev_n_read, stream_id, chain_batch.km);
-
-                // Defer overflow
-                for (int r_ = bt_n; r_ < chain_batch.count; r_++) {
-                    fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", r_);
-                    deep_copy_read_to_batch(&fallback_batch, &chain_batch.reads[r_], s->p->opt);
-                }
+                                    bt_n, stream_id, chain_batch.km);
 
                 // chain_batch → ksw_batch for final KSW
                 mm_batch_trbuf_t tmp = ksw_batch;

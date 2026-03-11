@@ -500,9 +500,9 @@ void chain_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t *
         size_t bt_total_n;
         start_backtrack_impl(sp, hm_idx, prev_reads, misc, km,
                              &bt_n_reads, &bt_total_n);
-        finish_backtrack_impl(mi, opt, sp, prev_reads, prev_n_read, misc, km);
+        finish_backtrack_impl(mi, opt, sp, prev_reads, bt_n_reads, misc, km);
         *in_arr_ = prev_reads;
-        *n_read_ = prev_n_read;
+        *n_read_ = bt_n_reads;
     }
 }
 
@@ -528,9 +528,8 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t 
     size_t bt_total_n;
     Misc misc = build_misc(mi, opt, 0, 1);
     chain_read_t *reads = sp->reads;
-    int n_read = (int)sp->n_read;
     start_backtrack_impl(sp, hm_idx, reads, misc, km, &bt_n_reads, &bt_total_n);
-    finish_backtrack_impl(mi, opt, sp, reads, n_read, misc, km);
+    finish_backtrack_impl(mi, opt, sp, reads, bt_n_reads, misc, km);
 
     *reads_ = reads;
     *n_read_ = bt_n_reads;

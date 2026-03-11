@@ -216,7 +216,8 @@ typedef struct {
 typedef struct stream_ptr_t{
     chain_read_t *reads;
     size_t n_read;
-    hostMemPtr host_mems[MAX_MICRO_BATCH];
+    hostMemPtr host_mems[2][MAX_MICRO_BATCH]; // double-buffered for pipeline overlap
+    int cur_hm = 0;                           // active host_mem buffer index (0 or 1)
     longMemPtr long_mem;
     deviceMemPtr dev_mem;
     cudaStream_t cudastream;
@@ -254,10 +255,10 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem);
 void plmem_reorg_input_arr(chain_read_t *reads, int n_read,
                            hostMemPtr *host_mem, range_kernel_config_t config);
 void plmem_async_h2d_memcpy(stream_ptr_t *stream_ptrs);
-void plmem_async_h2d_short_memcpy(stream_ptr_t *stream_ptrs, size_t uid);
+void plmem_async_h2d_short_memcpy(stream_ptr_t *stream_ptrs, int hm, size_t uid);
 void plmem_sync_h2d_memcpy(hostMemPtr *host_mem, deviceMemPtr *dev_mem);
 void plmem_async_d2h_memcpy(stream_ptr_t *stream_ptrs);
-void plmem_async_d2h_short_memcpy(stream_ptr_t *stream_ptrs, size_t uid);
+void plmem_async_d2h_short_memcpy(stream_ptr_t *stream_ptrs, int hm, size_t uid);
 void plmem_async_d2h_long_memcpy(stream_ptr_t *stream_ptrs);
 void plmem_sync_d2h_memcpy(hostMemPtr *host_mem, deviceMemPtr *dev_mem);
 #endif  // _PLMEM_CUH_

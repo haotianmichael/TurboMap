@@ -335,6 +335,7 @@ static void sync_chain_impl(stream_ptr_t *sp, int hm_idx) {
  *   Returns (combined_n_reads, combined_total_n) through out-params.
  */
 static void start_backtrack_impl(stream_ptr_t *sp, int hm_idx,
+                                  Misc misc, void *km,
                                   int *out_n_reads, size_t *out_total_n) {
     deviceMemPtr *dev_mem = &sp->dev_mem;
     cudaStream_t bt_stream = dev_mem->backtrack_stream;
@@ -364,7 +365,7 @@ static void start_backtrack_impl(stream_ptr_t *sp, int hm_idx,
 
     // Backtrack kernels on bt_stream (H2D completes first by stream ordering)
     plbacktrack_gpu(combined_n_reads, combined_total_n, dev_mem,
-                    sp->reads, Misc{}, NULL, bt_stream);
+                    sp->reads, misc, km, bt_stream);
 
     *out_n_reads = combined_n_reads;
     *out_total_n = combined_total_n;
@@ -440,11 +441,14 @@ void sync_chain_gpu(int hm_idx, int stream_id) {
  *   because double-buffered host_mems ensures no conflict.
  *   Returns n_reads actually processed through out-param.
  */
-void start_backtrack_gpu(int hm_idx, int stream_id, int *out_n_reads) {
+void start_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                         int hm_idx, int stream_id, void *km, int *out_n_reads) {
     cudaSetDevice(CUDA_DEVICE);
+    assert(opt->max_frag_len <= 0);
+    Misc misc = build_misc(mi, opt, 0, 1);
     size_t total_n;
     start_backtrack_impl(&stream_setup.streams[stream_id], hm_idx,
-                         out_n_reads, &total_n);
+                         misc, km, out_n_reads, &total_n);
 }
 
 /**
@@ -482,7 +486,8 @@ void chain_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t *
         // Start backtrack async
         int bt_n_reads;
         size_t bt_total_n;
-        start_backtrack_impl(sp, hm_idx, &bt_n_reads, &bt_total_n);
+        Misc misc = build_misc(mi, opt, 0, 1);
+        start_backtrack_impl(sp, hm_idx, misc, km, &bt_n_reads, &bt_total_n);
     }
 
     // Launch new chain on the OTHER buffer
@@ -526,9 +531,8 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t 
 
     int bt_n_reads;
     size_t bt_total_n;
-    start_backtrack_impl(sp, hm_idx, &bt_n_reads, &bt_total_n);
-
     Misc misc = build_misc(mi, opt, 0, 1);
+    start_backtrack_impl(sp, hm_idx, misc, km, &bt_n_reads, &bt_total_n);
     finish_backtrack_impl(mi, opt, sp, misc, km);
 
     *reads_ = sp->reads;

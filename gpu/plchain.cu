@@ -376,12 +376,9 @@ static void start_backtrack_impl(stream_ptr_t *sp, int hm_idx,
  *   Blocking — waits for backtrack to complete, then does CPU work.
  */
 static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                                   stream_ptr_t *sp, Misc misc, void *km) {
-    deviceMemPtr *dev_mem = &sp->dev_mem;
-    // plbacktrack_gpu already syncs bt_stream internally — no extra sync needed
-
-    chain_read_t *reads = sp->reads;
-    int n_read = (int)sp->n_read;
+                                   stream_ptr_t *sp,
+                                   chain_read_t *reads, int n_read,
+                                   Misc misc, void *km) {
 
     // Voting: collect reads needing re-chain
     int *rechain_indices = (int *)malloc(sizeof(int) * n_read);
@@ -456,11 +453,13 @@ void start_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
  *   Blocking. After return, reads[] have u/n_u/rep_len/frag_gap set.
  */
 void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                          chain_read_t *reads, int n_read,
                           int stream_id, void *km) {
     cudaSetDevice(CUDA_DEVICE);
     assert(opt->max_frag_len <= 0);
     Misc misc = build_misc(mi, opt, 0, 1);
-    finish_backtrack_impl(mi, opt, &stream_setup.streams[stream_id], misc, km);
+    finish_backtrack_impl(mi, opt, &stream_setup.streams[stream_id],
+                          reads, n_read, misc, km);
 }
 
 /**
@@ -502,10 +501,7 @@ void chain_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t *
     // Finish backtrack of previous batch
     if (prev_reads) {
         Misc misc = build_misc(mi, opt, 0, 1);
-        finish_backtrack_impl(mi, opt, sp, misc, km);
-        // Return previous batch to caller
-        // Note: sp->reads/n_read were already overwritten by launch_chain_impl
-        // so we use the saved prev_reads/prev_n_read
+        finish_backtrack_impl(mi, opt, sp, prev_reads, prev_n_read, misc, km);
         *in_arr_ = prev_reads;
         *n_read_ = prev_n_read;
     }
@@ -532,10 +528,12 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t 
     int bt_n_reads;
     size_t bt_total_n;
     Misc misc = build_misc(mi, opt, 0, 1);
+    chain_read_t *reads = sp->reads;
+    int n_read = (int)sp->n_read;
     start_backtrack_impl(sp, hm_idx, misc, km, &bt_n_reads, &bt_total_n);
-    finish_backtrack_impl(mi, opt, sp, misc, km);
+    finish_backtrack_impl(mi, opt, sp, reads, n_read, misc, km);
 
-    *reads_ = sp->reads;
+    *reads_ = reads;
     *n_read_ = bt_n_reads;
 }
 

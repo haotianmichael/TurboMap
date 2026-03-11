@@ -335,6 +335,7 @@ static void sync_chain_impl(stream_ptr_t *sp, int hm_idx) {
  *   Returns (combined_n_reads, combined_total_n) through out-params.
  */
 static void start_backtrack_impl(stream_ptr_t *sp, int hm_idx,
+                                  chain_read_t *reads,
                                   Misc misc, void *km,
                                   int *out_n_reads, size_t *out_total_n) {
     deviceMemPtr *dev_mem = &sp->dev_mem;
@@ -365,7 +366,7 @@ static void start_backtrack_impl(stream_ptr_t *sp, int hm_idx,
 
     // Backtrack kernels on bt_stream (H2D completes first by stream ordering)
     plbacktrack_gpu(combined_n_reads, combined_total_n, dev_mem,
-                    sp->reads, misc, km, bt_stream);
+                    reads, misc, km, bt_stream);
 
     *out_n_reads = combined_n_reads;
     *out_total_n = combined_total_n;
@@ -439,13 +440,14 @@ void sync_chain_gpu(int hm_idx, int stream_id) {
  *   Returns n_reads actually processed through out-param.
  */
 void start_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                         int hm_idx, int stream_id, void *km, int *out_n_reads) {
+                         chain_read_t *reads, int hm_idx, int stream_id,
+                         void *km, int *out_n_reads) {
     cudaSetDevice(CUDA_DEVICE);
     assert(opt->max_frag_len <= 0);
     Misc misc = build_misc(mi, opt, 0, 1);
     size_t total_n;
     start_backtrack_impl(&stream_setup.streams[stream_id], hm_idx,
-                         misc, km, out_n_reads, &total_n);
+                         reads, misc, km, out_n_reads, &total_n);
 }
 
 /**
@@ -475,32 +477,29 @@ void chain_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t *
     int prev_hm = 1 - hm_idx;
     chain_read_t *prev_reads = NULL;
     int prev_n_read = 0;
+    Misc misc = build_misc(mi, opt, 0, 1);
 
     if (sp->busy) {
         // Sync + long-seg for previous chain
         sync_chain_impl(sp, hm_idx);
         prev_reads = sp->reads;
         prev_n_read = (int)sp->n_read;
-
-        // Start backtrack async
-        int bt_n_reads;
-        size_t bt_total_n;
-        Misc misc = build_misc(mi, opt, 0, 1);
-        start_backtrack_impl(sp, hm_idx, misc, km, &bt_n_reads, &bt_total_n);
     }
 
-    // Launch new chain on the OTHER buffer
+    // ── Launch new chain FIRST [async on cudastream] ──────────────────────
     int new_hm = sp->busy ? prev_hm : hm_idx;
     chain_read_t *new_reads = *in_arr_;
     int new_n_read = *n_read_;
     *in_arr_ = NULL;
     *n_read_ = 0;
-
     launch_chain_impl(new_reads, new_n_read, new_hm, sp);
 
-    // Finish backtrack of previous batch
+    // ── Then backtrack previous batch [on bt_stream, overlaps with chain!] ─
     if (prev_reads) {
-        Misc misc = build_misc(mi, opt, 0, 1);
+        int bt_n_reads;
+        size_t bt_total_n;
+        start_backtrack_impl(sp, hm_idx, prev_reads, misc, km,
+                             &bt_n_reads, &bt_total_n);
         finish_backtrack_impl(mi, opt, sp, prev_reads, prev_n_read, misc, km);
         *in_arr_ = prev_reads;
         *n_read_ = prev_n_read;
@@ -530,7 +529,7 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t 
     Misc misc = build_misc(mi, opt, 0, 1);
     chain_read_t *reads = sp->reads;
     int n_read = (int)sp->n_read;
-    start_backtrack_impl(sp, hm_idx, misc, km, &bt_n_reads, &bt_total_n);
+    start_backtrack_impl(sp, hm_idx, reads, misc, km, &bt_n_reads, &bt_total_n);
     finish_backtrack_impl(mi, opt, sp, reads, n_read, misc, km);
 
     *reads_ = reads;

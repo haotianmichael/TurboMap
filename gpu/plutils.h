@@ -197,6 +197,15 @@ void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t 
 void free_stream_gpu(int n_threads); // for stream_gpu free pinned memory
 // chaining method
 void chain_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t **in_arr_ptr, int *n_read_ptr, int thread_id, void* km);
+// fine-grained pipeline API
+int  launch_chain_gpu(chain_read_t *reads, int n_read, int hm_idx, int stream_id);
+void sync_chain_gpu(int hm_idx, int stream_id);
+void start_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                         chain_read_t *reads, int hm_idx, int stream_id,
+                         void *km, int *out_n_reads);
+void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                          chain_read_t *reads, int n_read,
+                          int stream_id, void *km);
 /* GPU voting-based re-chaining (replaces gpu_rechain_batch / mg_lchain_rmq).
  * Declared here so map.c and plchain.cu can share the same header.
  * Implemented in gpu/plvoting.cu. */

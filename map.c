@@ -1988,7 +1988,8 @@ static void* gpu_batch_consumer(void *data) {
     chain_read_t read;
 
     // ── Helper: wait for a stream, process its results ───────────────────
-    // Runs sync_chain → backtrack → voting → alignment on the given stream.
+    // All GPU ops (chain → backtrack → align) run on ONE cudastream per slot.
+    // Two slots alternate: while draining slot[N], slot[N±1]'s GPU work runs.
     #define DRAIN_STREAM(sid) do { \
         stream_slot_t *ss_ = &slots[(sid)]; \
         if (!ss_->busy) break; \

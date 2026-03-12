@@ -100,8 +100,7 @@ typedef struct {
     // ========== Chain Backtrack Pre-allocated Buffers ==========
     // Pre-allocated to eliminate hot-path cudaMalloc/cudaFree in plbacktrack_gpu.
     // d_bt_*_in: SEPARATE input buffers for backtrack (sized: anchor_per_batch * micro_batch)
-    //   Enables chain(B_N) on cudastream to overlap with backtrack(B_{N-1}) on backtrack_stream
-    //   without conflicting on d_ax/d_ay/d_f/d_p (which chain uses).
+    //   Separate from d_ax/d_ay/d_f/d_p so host_mems can be reused across batches.
     // d_bt_* working buffers: also sized anchor_per_batch * micro_batch.
 
     // Backtrack input (read from host, separate from d_ax so chain can overlap)
@@ -137,10 +136,6 @@ typedef struct {
     // Capacities stored for assertions:
     size_t    d_bt_max_total_n;  // anchor capacity of d_bt_* anchor arrays
     size_t    d_bt_max_n_reads;  // read capacity of d_bt_* read arrays
-
-    // Dedicated stream for backtrack+voting (separate from chain cudastream)
-    // Enables chain(B_N) GPU kernels to overlap with backtrack(B_{N-1}).
-    cudaStream_t backtrack_stream;
 
     // ========== Alignment Buffers (unified allocation) ==========
     size_t max_align_tasks;       // max number of alignment tasks
@@ -208,9 +203,6 @@ typedef struct {
     int   n_align_concurrent_blocks; // number of slots for persistent kernel
     int  *d_align_task_counter;      // atomic task counter (reset before each kernel launch)
 
-    // Dedicated stream for alignment kernels (separate from chaining stream 0)
-    // so that chain(N+1) can overlap with align(N) on the GPU.
-    cudaStream_t align_stream;
 } deviceMemPtr;
 
 typedef struct stream_ptr_t{
@@ -234,6 +226,7 @@ typedef struct gputSetup_t {
 
 extern streamSetup_t stream_setup;
 extern deviceMemPtr *g_current_dev_mem;
+extern cudaStream_t g_current_cudastream;  // unified stream for current slot
 
 /* memory management methods */
 // initialization and cleanup

@@ -159,8 +159,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
 
     // ========== Chain Backtrack Pre-allocated Buffers ==========
     // Sized for ALL micro-batches combined (anchor_per_batch * micro_batch).
-    // d_bt_*_in: SEPARATE input buffers so backtrack(B_{N-1}) on backtrack_stream
-    //   does not conflict with chain(B_N) on cudastream using d_ax/d_ay/d_f/d_p.
+    // d_bt_*_in: SEPARATE input buffers for backtrack H2D (separate from d_ax/d_ay/d_f/d_p).
     {
         size_t bt_n = bt_anchor_total;  // all micro-batches combined
         size_t bt_r = (size_t)range_grid_size * mb;  // reads across all micro-batches
@@ -209,9 +208,6 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
             dev_mem->d_bt_cub_tmp_size = tmp_bytes;
             cudaMalloc(&dev_mem->d_bt_cub_tmp, tmp_bytes);
         }
-
-        // Backtrack-dedicated stream
-        cudaStreamCreate(&dev_mem->backtrack_stream);
 
         size_t bt_input = bt_n * (4*sizeof(int32_t) + sizeof(int32_t) + sizeof(uint16_t));
         size_t bt_work  = bt_n * (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
@@ -402,7 +398,6 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     int max_blocks_per_sm = 32;  // limited by shared memory (3072 bytes/block, 98304/SM)
     dev_mem->n_align_concurrent_blocks = numSMs * max_blocks_per_sm;
     cudaMalloc(&dev_mem->d_align_task_counter, sizeof(int));
-    cudaStreamCreate(&dev_mem->align_stream);
 
     // Calculate total memory allocated for alignment backtrack
     size_t bck_total = bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes +
@@ -494,7 +489,6 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFree(dev_mem->d_bt_n_v);
     cudaFree(dev_mem->d_bt_n_u);
     cudaFree(dev_mem->d_bt_cub_tmp);
-    cudaStreamDestroy(dev_mem->backtrack_stream);
 
     // Alignment buffers
     if (dev_mem->d_align_unpacked_query) cudaFree(dev_mem->d_align_unpacked_query);
@@ -530,7 +524,6 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     if (dev_mem->d_align_task_to_align_id) cudaFree(dev_mem->d_align_task_to_align_id);
     if (dev_mem->d_align_mat) cudaFree(dev_mem->d_align_mat);
     if (dev_mem->d_align_task_counter) cudaFree(dev_mem->d_align_task_counter);
-    cudaStreamDestroy(dev_mem->align_stream);
 
     cudaCheck();
 }
@@ -1009,6 +1002,7 @@ cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
     stream_setup.max_num_cut = max_num_cut;
     stream_setup.long_seg_buffer_size_stream = long_seg_buffer_size;
     g_current_dev_mem = &stream_setup.streams[0].dev_mem;
+    g_current_cudastream = stream_setup.streams[0].cudastream;
     cudaCheck();
 }
 

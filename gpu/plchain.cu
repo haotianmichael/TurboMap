@@ -179,25 +179,17 @@ int plchain_schedule_stream(const streamSetup_t stream_setup, const int batchid)
 
 /*
  * ════════════════════════════════════════════════════════════════════════
- *  Three-stage pipeline API for map.c scheduling:
+ *  Unified-stream pipeline: ALL ops (chain → backtrack → align) run on
+ *  a single cudastream per stream slot.  Two slots alternate so that
+ *  stream[0] GPU work overlaps with stream[1] GPU work.
  *
- *    ┌─────────────────┐  ┌──────────────────────┐  ┌──────────┐
- *    │ launch_chain_gpu │  │ start_backtrack_gpu + │  │ KSW      │
- *    │  (cudastream)    │  │ finish_backtrack_gpu  │  │ (align)  │
- *    │  batch B_N       │  │  (backtrack_stream)   │  │ B_{N-2}  │
- *    │                  │  │  batch B_{N-1}        │  │          │
- *    └─────────────────┘  └──────────────────────┘  └──────────┘
- *         ↑ overlap on GPU ↑
+ *    stream[0]: [chain_0][bt_0][align_0]          [chain_2][bt_2][align_2] ...
+ *    stream[1]:          [chain_1][bt_1][align_1]          [chain_3] ...
  *
- *  Per cycle in map.c:
- *    sync_chain_gpu(B_{N-1})           // wait for prev chain + long-seg
- *    start_backtrack_gpu(B_{N-1})      // async H2D + backtrack on bt_stream
- *    launch_chain_gpu(B_N)             // async chain on cudastream (overlaps!)
- *    finish_backtrack_gpu(B_{N-1})     // sync bt_stream + voting + post_chain
- *    do_ksw(B_{N-2})                   // KSW alignment
- *
- *  Single-buffered host_mems: backtrack H2D must complete before chain
- *  launch to avoid host_mems conflict (backtrack reads, chain writes).
+ *  Per cycle in map.c gpu_batch_consumer:
+ *    1. Dispatch batch B_N to stream[N%2] (async launch)
+ *    2. Drain stream[(N-1)%2] results (sync + CPU post-processing)
+ *    → GPU on both streams can overlap.
  * ════════════════════════════════════════════════════════════════════════
  */
 
@@ -336,7 +328,7 @@ static void sync_chain_impl(stream_ptr_t *sp) {
 
 /**
  * start_backtrack_gpu: Queue H2D from host_mems[] to d_bt_*_in,
- *   then launch backtrack kernels — all on backtrack_stream (async).
+ *   then launch backtrack kernels — all on cudastream (unified stream).
  *   Returns (combined_n_reads, combined_total_n) through out-params.
  */
 static void start_backtrack_impl(stream_ptr_t *sp,
@@ -344,11 +336,11 @@ static void start_backtrack_impl(stream_ptr_t *sp,
                                   Misc misc, void *km,
                                   int *out_n_reads, size_t *out_total_n) {
     deviceMemPtr *dev_mem = &sp->dev_mem;
-    cudaStream_t bt_stream = dev_mem->backtrack_stream;
+    cudaStream_t bt_stream = sp->cudastream;  // unified: all ops on one stream
     size_t combined_total_n = 0;
     int combined_n_reads = 0;
 
-    // H2D: host_mems → d_bt_*_in on backtrack_stream
+    // H2D: host_mems → d_bt_*_in on cudastream
     for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) {
         hostMemPtr *hm = &sp->host_mems[uid];
         if (hm->size == 0) continue;
@@ -378,8 +370,8 @@ static void start_backtrack_impl(stream_ptr_t *sp,
 }
 
 /**
- * finish_backtrack_gpu: Sync backtrack_stream, then run voting + post_chaining.
- *   Blocking — waits for backtrack to complete, then does CPU work.
+ * finish_backtrack_gpu: Run voting + post_chaining (CPU work).
+ *   Note: backtrack kernels already completed on cudastream (synced internally).
  */
 static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
                                    stream_ptr_t *sp,
@@ -395,8 +387,7 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
     }
     if (n_rechain > 0) {
         // TODO: plvoting uses null stream (cudaMalloc/cudaMemcpy inside).
-        // This serializes with cudastream, briefly stalling chain overlap.
-        // Fix: pre-allocate voting buffers + use explicit backtrack_stream.
+        // This may briefly serialize with other streams on the default stream.
         plvoting_rechain_batch(mi, opt, reads, rechain_indices, n_rechain, misc, km);
     }
     free(rechain_indices);
@@ -438,11 +429,9 @@ void sync_chain_gpu(int stream_id) {
 }
 
 /**
- * start_backtrack_gpu: H2D from host_mems + backtrack kernels on backtrack_stream.
+ * start_backtrack_gpu: H2D from host_mems + backtrack kernels on cudastream.
  *   NOTE: plbacktrack_gpu has internal cudaStreamSynchronize calls, so this is
- *   effectively BLOCKING — bt_stream is fully synced when this returns.
- *   Must be called BEFORE launch_chain_gpu to avoid host_mems conflict
- *   (single-buffered host_mems shared between chain and backtrack).
+ *   effectively BLOCKING — stream is fully synced when this returns.
  *   Returns n_reads actually processed through out-param.
  */
 void start_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
@@ -457,8 +446,8 @@ void start_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 }
 
 /**
- * finish_backtrack_gpu: Sync backtrack_stream + voting + post_chaining.
- *   Blocking. After return, reads[] have u/n_u/rep_len/frag_gap set.
+ * finish_backtrack_gpu: Voting + post_chaining (CPU work).
+ *   After return, reads[] have u/n_u/rep_len/frag_gap set.
  */
 void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
                           chain_read_t *reads, int n_read,
@@ -472,6 +461,7 @@ void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
 void gpu_align_set_stream(int stream_id) {
     g_current_dev_mem = &stream_setup.streams[stream_id].dev_mem;
+    g_current_cudastream = stream_setup.streams[stream_id].cudastream;
 }
 
 int gpu_get_num_streams(void) {

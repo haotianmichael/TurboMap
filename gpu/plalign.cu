@@ -28,9 +28,10 @@ static align_config_t g_config = {
     .gap_extend_long = 1
 };
 
-// Global pointer to current stream's device memory
-// Set by gpu_align_set_device_mem() before calling gpu_align_batch_execute()
+// Global pointer to current stream's device memory and CUDA stream
+// Set by gpu_align_set_stream() before calling gpu_align_batch_execute()
 deviceMemPtr *g_current_dev_mem = NULL;
+cudaStream_t g_current_cudastream = 0;  // unified stream (chain+bt+align)
 static bool g_subst_scores_uploaded = false;
 
 static void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi)
@@ -452,7 +453,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *d_mte_q = dev_mem->d_align_mte_q;
     int  *d_task_counter = dev_mem->d_align_task_counter;
     int   n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
-    cudaStream_t align_stream = dev_mem->align_stream;
+    cudaStream_t align_stream = g_current_cudastream;
     // P1/P2/P3 device buffers
     uint32_t *d_compact_cigar   = dev_mem->d_align_compact_cigar;
     uint32_t *d_compact_offsets = dev_mem->d_align_compact_offsets;

@@ -407,7 +407,6 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
         n_reads, d_n_v, d_n_u, d_num_elements, d_ofs_end);
 
     // D2H: n_u per read (needed for per-read w-array sort)
-    // Use async + stream sync to only wait on backtrack_stream, not all streams
     int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
     cudaMemcpyAsync(h_n_u, d_n_u, sizeof(int) * n_reads,
                     cudaMemcpyDeviceToHost, stream);
@@ -429,7 +428,6 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
         dev_mem->d_bt_f_in, d_p_abs, d_u, d_zx, d_zy, d_t, d_v, d_n_v);
 
     // D2H: compacted anchor arrays + u array — all in one async batch
-    // Only sync backtrack_stream, so chain on cudastream keeps running
     int32_t  *h_ax   = (int32_t*)malloc(sizeof(int32_t) * total_n);
     int32_t  *h_ay   = (int32_t*)malloc(sizeof(int32_t) * total_n);
     int32_t  *h_xrev = (int32_t*)malloc(sizeof(int32_t) * total_n);

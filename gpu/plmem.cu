@@ -256,7 +256,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t global_buffer_bytes = global_buffer_size * sizeof(short2);
     cudaMalloc(&dev_mem->d_align_global_buffer, global_buffer_bytes);
 
-    size_t short_task_batch_size = 7000; // For tasks with max(qlen, tlen) <= 1000bp
+    size_t short_task_batch_size = 4000; // For tasks with max(qlen, tlen) <= 1000bp (reduced for 32GB GPU)
     size_t long_task_batch_size = 128;    // For tasks with max(qlen, tlen) > 1000bp
     size_t short_task_max_len = 1000;     // Max qlen or tlen for short tasks
 
@@ -314,10 +314,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
    
     // Allocate buffers for SHORT tasks (most common case, optimized for throughput)
     // alloc_slots: backtrack buffer is slot-indexed (persistent kernel reuses slots).
-    // Keep 7000 slots so both phases fit:
-    //   Short: 7000 × 1.5MB = 10.5GB  (hardware runs ≤2560 concurrently)
-    //   Long:  140 × 75MB  = 10.5GB  (same buffer, capped by plalign.cu)
-    size_t alloc_slots = short_task_batch_size;  // 7000
+    // Keep alloc_slots so both phases fit:
+    //   Short: 4000 × 1.5MB = 6.0GB  (hardware runs ≤2560 concurrently)
+    //   Long:  80 × 75MB   = 6.0GB  (same buffer, capped by plalign.cu)
+    size_t alloc_slots = short_task_batch_size;  // 4000
 
     // Calculate max_antidiag based on SHORT task length (1000bp per sequence)
     size_t max_antidiag_short = 2 * short_task_max_len;  // 2000 antidiagonals for 1000+1000bp

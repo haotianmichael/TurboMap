@@ -241,6 +241,7 @@ void plrange_upload_misc(Misc misc){
 void plrange_async_range_selection(deviceMemPtr* dev_mem, cudaStream_t* stream) {
     size_t total_n = dev_mem->total_n, cut_num = dev_mem->num_cut;
     int griddim = dev_mem->griddim;
+    if (griddim == 0 || total_n == 0) return;
     dim3 DimBlock(range_kernel_config.blockdim, 1, 1);
     dim3 DimGrid(griddim, 1, 1);
 
@@ -254,6 +255,7 @@ void plrange_async_range_selection(deviceMemPtr* dev_mem, cudaStream_t* stream) 
 void plrange_sync_range_selection(deviceMemPtr *dev_mem, Misc misc) {
     size_t total_n = dev_mem->total_n, cut_num = dev_mem->num_cut;
     int griddim = dev_mem->griddim;
+    if (griddim == 0 || total_n == 0) return;
     dim3 DimBlock(range_kernel_config.blockdim, 1, 1);
     dim3 DimGrid(griddim,1,1);
 

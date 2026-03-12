@@ -247,6 +247,12 @@ static int launch_chain_impl(chain_read_t *reads, int n_read,
             cut_num += (reads[read_end].n - 1) / an_p_cut + 1;
         }
 
+        if (read_end == read_start) {
+            // No reads fit in this micro-batch (single read exceeds buffer)
+            // Skip kernel launches, will be reported as overflow below
+            break;
+        }
+
         assert(stream_setup.max_anchors_stream >= batch_n);
         assert(stream_setup.max_range_grid >= griddim);
         assert(stream_setup.max_num_cut >= cut_num);

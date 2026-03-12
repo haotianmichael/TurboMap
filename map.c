@@ -1921,26 +1921,25 @@ static void deep_copy_read_to_batch(mm_batch_trbuf_t *dst, const chain_read_t *s
 }
 
 /*
- * Three-stage pipelined GPU batch consumer.
+ * Multi-stream task-parallel GPU batch consumer.
  *
- * Timeline (steady state):
+ * Each CUDA stream runs the full pipeline independently:
+ *   chain → sync → backtrack → voting → alignment
  *
- *   GPU cudastream:   ████ chain(B_N) ██████████████████████████████████
- *   CPU/GPU KSW:      ████ align(B_{N-2}) ████████████████████████
- *                     ↑ chain overlaps KSW ↑
+ * Parallelism: while the CPU processes stream N's results (backtrack/voting/
+ * alignment), stream N+1's chain kernels run concurrently on the GPU.
  *
- * Per cycle (single-buffered host_mems — backtrack before chain launch):
- *   1. sync_chain_gpu(chain_batch)           — wait for prev chain + long-seg
- *   2. start_backtrack_gpu(chain_batch)      — H2D + backtrack (blocking)
- *   3. launch_chain_gpu(acc_batch)           — async on cudastream (host_mems free)
- *   4. prepare_align_batch_gpu(ksw_batch)    — KSW (overlaps chain!)
- *   5. finish_backtrack_gpu(chain_batch)     — voting + post_chain (bt already synced)
- *   6. rotate: chain→ksw, acc→chain, ksw→acc
+ * Timeline (2 streams, steady state):
+ *
+ *   GPU stream 0:  ████ chain(A) ████████████  bt(A)  align(A)  ████ chain(C) ████
+ *   GPU stream 1:       ████ chain(B) ████████████  bt(B)  align(B)  ████ chain(D) ███
+ *   CPU:           launch(A) accum launch(B) accum wait(A) process(A) wait(B) process(B) ...
+ *                                                   ↑ chain(B) still running on GPU ↑
  */
 static void* gpu_batch_consumer(void *data) {
     step_t *s = (step_t*)data;
     mm_tbuf_t *b = s->buf[0];
-    const int stream_id = 0;
+    const int num_streams = gpu_get_num_streams();
 
     // Helper: copy rep_len/frag_gap from batch reads back to step arrays
     #define COPY_REP_FRAG(batch) do { \
@@ -1955,13 +1954,6 @@ static void* gpu_batch_consumer(void *data) {
         } \
     } while (0)
 
-    // ── Batch buffers ────────────────────────────────────────────────────
-    // acc_batch:   accumulating reads from queue
-    // chain_batch: chain launched on GPU, not yet synced
-    // ksw_batch:   backtrack done, ready for KSW alignment
-    mm_batch_trbuf_t acc_batch, chain_batch, ksw_batch;
-    mm_batch_trbuf_t fallback_batch;
-
     #define INIT_BATCH(b_, id_) do { \
         (b_).km = km_init(); \
         (b_).count = 0; \
@@ -1971,25 +1963,72 @@ static void* gpu_batch_consumer(void *data) {
         (b_).batchid = (id_); \
     } while (0)
 
-    INIT_BATCH(acc_batch, 0);
-    INIT_BATCH(chain_batch, 1);
-    INIT_BATCH(ksw_batch, 2);
+    // ── Per-stream state ─────────────────────────────────────────────────
+    // Each stream owns a batch that is currently being processed on the GPU.
+    typedef struct {
+        mm_batch_trbuf_t batch;
+        int busy;           // 1 = chain launched, not yet collected
+    } stream_slot_t;
+
+    stream_slot_t *slots = (stream_slot_t*)calloc(num_streams, sizeof(stream_slot_t));
+    for (int i = 0; i < num_streams; i++) {
+        INIT_BATCH(slots[i].batch, i);
+        slots[i].busy = 0;
+    }
+
+    mm_batch_trbuf_t acc_batch;
+    mm_batch_trbuf_t fallback_batch;
+    INIT_BATCH(acc_batch, -1);
     INIT_BATCH(fallback_batch, -1);
     #undef INIT_BATCH
 
-    int has_chain = 0;      // chain_batch is on GPU
-    int has_ksw = 0;        // ksw_batch is ready for alignment
+    int next_stream = 0;   // round-robin stream selection
     int queue_finished = 0;
     int is_full = 0;
-
     chain_read_t read;
+
+    // ── Helper: wait for a stream, process its results ───────────────────
+    // Runs sync_chain → backtrack → voting → alignment on the given stream.
+    #define DRAIN_STREAM(sid) do { \
+        stream_slot_t *ss_ = &slots[(sid)]; \
+        if (!ss_->busy) break; \
+        \
+        if (mm_dbg_flag & MM_DBG_PRINT_QNAME) \
+            fprintf(stderr, "DRAIN_STREAM(%d): count=%d\n", (sid), ss_->batch.count); \
+        \
+        /* 1. Sync chain (blocks until chain kernels finish) */ \
+        sync_chain_gpu((sid)); \
+        \
+        /* 2. Backtrack (H2D + backtrack kernels) */ \
+        int bt_n_ = 0; \
+        start_backtrack_gpu(s->p->mi, s->p->opt, ss_->batch.reads, \
+                            (sid), ss_->batch.km, &bt_n_); \
+        \
+        /* 3. Defer overflow reads */ \
+        for (int r_ = bt_n_; r_ < ss_->batch.count; r_++) { \
+            fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", r_); \
+            deep_copy_read_to_batch(&fallback_batch, &ss_->batch.reads[r_], s->p->opt); \
+        } \
+        ss_->batch.count = bt_n_; \
+        \
+        /* 4. Finish backtrack (voting + post_chain) */ \
+        finish_backtrack_gpu(s->p->mi, s->p->opt, ss_->batch.reads, \
+                             bt_n_, (sid), ss_->batch.km); \
+        \
+        /* 5. Alignment (KSW) — uses this stream's device memory */ \
+        gpu_align_set_stream((sid)); \
+        COPY_REP_FRAG(ss_->batch); \
+        prepare_align_batch_gpu(&ss_->batch, b, s); \
+        mm_trbuf_batch_reset(&ss_->batch, s->batch_max_reads, s->p->opt); \
+        \
+        ss_->busy = 0; \
+    } while (0)
 
     // ── Main loop ────────────────────────────────────────────────────────
     while (1) {
-        // Step 1: Pop a read from the queue
-        int got_read = 0;
+        // Step 1: Pop reads and accumulate into acc_batch
         if (!queue_finished) {
-            got_read = pop_seeded_read(g_seeded_queue, &read);
+            int got_read = pop_seeded_read(g_seeded_queue, &read);
             if (got_read) {
                 chain_read_t *batch_read = &acc_batch.reads[acc_batch.count];
                 *batch_read = read;
@@ -2014,148 +2053,68 @@ static void* gpu_batch_consumer(void *data) {
                 if (acc_batch.total_n >= s->batch_max_anchors) {
                     is_full = 1;
                     if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                        fprintf(stderr, "ACC_FULL: count=%d, total_n=%ld\n",
+                        fprintf(stderr, "ACC_FULL: count=%d, total_n=%zu\n",
                                 acc_batch.count, acc_batch.total_n);
                 }
             } else {
                 queue_finished = 1;
-                is_full = 1;
+                is_full = (acc_batch.count > 0) ? 1 : 0;
                 if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
                     fprintf(stderr, "QUEUE_FINISHED: acc_count=%d\n", acc_batch.count);
             }
         }
 
-        // Step 2: Process batches when full or draining
-        while (is_full || (queue_finished && has_chain)) {
+        // Step 2: When batch is full, dispatch to the next stream
+        if (is_full && acc_batch.count > 0) {
+            int sid = next_stream;
+            stream_slot_t *slot = &slots[sid];
 
-            if (is_full) {
-                if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                    fprintf(stderr, "LAUNCH_CHAIN: count=%d, total_n=%ld\n",
-                            acc_batch.count, acc_batch.total_n);
+            // If this stream is busy, wait for it and process its results
+            if (slot->busy) {
+                DRAIN_STREAM(sid);
+            }
 
-                // ── Phase 1: sync previous chain ─────────────────────────
-                chain_read_t *prev_reads = NULL;
-                int prev_n_read = 0;
-                if (has_chain) {
-                    sync_chain_gpu(stream_id);
-                    prev_reads = chain_batch.reads;
-                    prev_n_read = chain_batch.count;
-                }
+            if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
+                fprintf(stderr, "LAUNCH_CHAIN(stream=%d): count=%d, total_n=%zu\n",
+                        sid, acc_batch.count, acc_batch.total_n);
 
-                // ── Phase 2: backtrack prev batch (blocking — frees host_mems)
-                int bt_n = 0;
-                if (prev_reads) {
-                    start_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
-                                       stream_id, chain_batch.km, &bt_n);
-                }
+            // Launch chain on this stream (async)
+            int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count, sid);
 
-                // ── Phase 3: launch new chain [async cudastream] ─────────
-                // Safe: backtrack H2D is done, host_mems are free
-                int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count,
-                                                stream_id);
-                // Defer overflow reads to fallback_batch and shrink count
-                if (overflow > 0) {
-                    int fit = acc_batch.count - overflow;
-                    for (int r_ = fit; r_ < acc_batch.count; r_++) {
-                        fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", r_);
-                        deep_copy_read_to_batch(&fallback_batch, &acc_batch.reads[r_], s->p->opt);
-                    }
-                    acc_batch.count = fit;
-                }
-
-                // ── Phase 4: KSW on ksw_batch [overlaps chain!] ──────────
-                if (has_ksw) {
-                    if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                        fprintf(stderr, "ALIGN_BATCH: count=%d\n", ksw_batch.count);
-                    COPY_REP_FRAG(ksw_batch);
-                    prepare_align_batch_gpu(&ksw_batch, b, s);
-                    mm_trbuf_batch_reset(&ksw_batch, s->batch_max_reads, s->p->opt);
-                }
-
-                // ── Phase 5: finish backtrack [voting + post_chain] ──────
-                if (prev_reads) {
-                    finish_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
-                                        bt_n, stream_id, chain_batch.km);
-                }
-
-                // ── Rotate ────────────────────────────────────────────────
-                mm_batch_trbuf_t tmp;
-                if (prev_reads) {
-                    // 3-way rotate: chain→ksw, acc→chain, ksw→acc
-                    tmp = ksw_batch;
-                    ksw_batch = chain_batch;
-                    chain_batch = acc_batch;
-                    acc_batch = tmp;
-                    has_ksw = 1;
-                } else {
-                    // First launch: 2-way swap: acc→chain, chain→acc
-                    tmp = chain_batch;
-                    chain_batch = acc_batch;
-                    acc_batch = tmp;
-                    has_ksw = 0;
-                }
-                acc_batch.count = 0;
-                acc_batch.total_n = 0;
-                has_chain = 1;
-                is_full = 0;
-
-            } else if (queue_finished && has_chain) {
-                // ── Drain final chain batch ──────────────────────────────
-                if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                    fprintf(stderr, "FINISH_STREAM: chain_count=%d\n", chain_batch.count);
-
-                sync_chain_gpu(stream_id);
-
-                chain_read_t *prev_reads = chain_batch.reads;
-
-                // Backtrack (blocking — no new chain to launch after)
-                int bt_n;
-                start_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
-                                   stream_id, chain_batch.km, &bt_n);
-
-                // Defer overflow reads that didn't fit in micro-batches
-                for (int r_ = bt_n; r_ < chain_batch.count; r_++) {
+            // Defer overflow reads
+            if (overflow > 0) {
+                int fit = acc_batch.count - overflow;
+                for (int r_ = fit; r_ < acc_batch.count; r_++) {
                     fprintf(stderr, "[INFO] Deferring read %d to fallback GPU batch\n", r_);
-                    deep_copy_read_to_batch(&fallback_batch, &chain_batch.reads[r_], s->p->opt);
+                    deep_copy_read_to_batch(&fallback_batch, &acc_batch.reads[r_], s->p->opt);
                 }
-                chain_batch.count = bt_n;
-
-                // KSW on previous ksw_batch
-                if (has_ksw) {
-                    if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                        fprintf(stderr, "ALIGN_BATCH: count=%d\n", ksw_batch.count);
-                    COPY_REP_FRAG(ksw_batch);
-                    prepare_align_batch_gpu(&ksw_batch, b, s);
-                    mm_trbuf_batch_reset(&ksw_batch, s->batch_max_reads, s->p->opt);
-                }
-
-                finish_backtrack_gpu(s->p->mi, s->p->opt, prev_reads,
-                                    bt_n, stream_id, chain_batch.km);
-
-                // chain_batch → ksw_batch for final KSW
-                mm_batch_trbuf_t tmp = ksw_batch;
-                ksw_batch = chain_batch;
-                chain_batch = tmp;
-                has_chain = 0;
-                has_ksw = 1;
-                is_full = 0;
+                acc_batch.count = fit;
             }
 
-            // Final KSW for the last batch (when no more chain to launch)
-            if (!has_chain && has_ksw) {
-                if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                    fprintf(stderr, "ALIGN_BATCH(final): count=%d\n", ksw_batch.count);
-                COPY_REP_FRAG(ksw_batch);
-                prepare_align_batch_gpu(&ksw_batch, b, s);
-                mm_trbuf_batch_reset(&ksw_batch, s->batch_max_reads, s->p->opt);
-                has_ksw = 0;
-            }
+            // Move acc_batch into the stream slot, give slot's old batch to acc
+            mm_batch_trbuf_t tmp = slot->batch;
+            slot->batch = acc_batch;
+            acc_batch = tmp;
+            acc_batch.count = 0;
+            acc_batch.total_n = 0;
+            slot->busy = 1;
+
+            next_stream = (next_stream + 1) % num_streams;
+            is_full = 0;
         }
 
-        // Step 3: Exit condition
-        if (queue_finished && !has_chain && !has_ksw && acc_batch.count == 0)
+        // Step 3: When queue is done and nothing to accumulate, drain all streams
+        if (queue_finished && acc_batch.count == 0) {
+            for (int i = 0; i < num_streams; i++) {
+                // Drain in launch order starting from next_stream
+                int sid = (next_stream + i) % num_streams;
+                DRAIN_STREAM(sid);
+            }
             break;
+        }
     }
+
+    #undef DRAIN_STREAM
 
     // ── Process deferred fallback reads ──────────────────────────────────
     while (fallback_batch.count > 0) {
@@ -2183,6 +2142,7 @@ static void* gpu_batch_consumer(void *data) {
         fb_align_batch.total_n = fallback_batch.total_n;
         fb_align_batch.km      = fallback_batch.km;
         fb_align_batch.batchid = -1;
+        gpu_align_set_stream(0);
         COPY_REP_FRAG(fb_align_batch);
         prepare_align_batch_gpu(&fb_align_batch, b, s);
         mm_trbuf_batch_reset(&fallback_batch, s->batch_max_reads, s->p->opt);
@@ -2192,17 +2152,17 @@ static void* gpu_batch_consumer(void *data) {
 
     // Cleanup
     mm_trbuf_batch_reset(&acc_batch, s->batch_max_reads, s->p->opt);
-    mm_trbuf_batch_reset(&chain_batch, s->batch_max_reads, s->p->opt);
-    mm_trbuf_batch_reset(&ksw_batch, s->batch_max_reads, s->p->opt);
+    for (int i = 0; i < num_streams; i++) {
+        mm_trbuf_batch_reset(&slots[i].batch, s->batch_max_reads, s->p->opt);
+        free(slots[i].batch.reads);
+        km_destroy(slots[i].batch.km);
+    }
+    free(slots);
 
     free(acc_batch.reads);
-    free(chain_batch.reads);
-    free(ksw_batch.reads);
     free(fallback_batch.reads);
 
     km_destroy(acc_batch.km);
-    km_destroy(chain_batch.km);
-    km_destroy(ksw_batch.km);
     km_destroy(fallback_batch.km);
 
     return NULL;

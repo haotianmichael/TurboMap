@@ -470,6 +470,14 @@ void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
                           reads, n_read, misc, km);
 }
 
+void gpu_align_set_stream(int stream_id) {
+    g_current_dev_mem = &stream_setup.streams[stream_id].dev_mem;
+}
+
+int gpu_get_num_streams(void) {
+    return stream_setup.num_stream;
+}
+
 /**
  * chain_stream_gpu: Legacy wrapper — launches chain and returns previous batch.
  *   Single-buffered host_mems: backtrack must complete before chain launch

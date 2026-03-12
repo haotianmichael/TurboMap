@@ -206,6 +206,9 @@ void start_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
                           chain_read_t *reads, int n_read,
                           int stream_id, void *km);
+// multi-stream support
+void gpu_align_set_stream(int stream_id);
+int  gpu_get_num_streams(void);
 /* GPU voting-based re-chaining (replaces gpu_rechain_batch / mg_lchain_rmq).
  * Declared here so map.c and plchain.cu can share the same header.
  * Implemented in gpu/plvoting.cu. */

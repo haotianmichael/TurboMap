@@ -1,6 +1,6 @@
 {
-    "num_streams": 1,
-    "//num_streams": "Must set to 1 for current implementation of mm2-gb",
+    "num_streams": 2,
+    "//num_streams": "Number of independent GPU streams for task parallelism. Each stream has its own buffers.",
     "min_n": 512, 
     "//min_n": "queries with less anchors will be handled on cpu",
     "long_seg_buffer_size": 50000000,

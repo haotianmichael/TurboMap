@@ -212,9 +212,7 @@ int  gpu_get_num_streams(void);
 /* GPU voting-based re-chaining (replaces gpu_rechain_batch / mg_lchain_rmq).
  * Declared here so map.c and plchain.cu can share the same header.
  * Implemented in gpu/plvoting.cu. */
-void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                            chain_read_t *reads, int *rechain_indices,
-                            int n_rechain, Misc misc, void *km);
+// plvoting_rechain_batch declared in plvoting.cuh (needs cudaStream_t)
 
 /* <lchain.c> Chaining backtracking methods */
 uint64_t *mg_chain_backtrack(void *km, int64_t n, const int32_t *f,

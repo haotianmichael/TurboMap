@@ -297,9 +297,8 @@ static void sync_chain_impl(stream_ptr_t *sp) {
     pairsort(long_segs_og, map, num_long_seg);
     free(long_segs_og);
 
-    if (dev_mem->d_map)
-        cudaFree(dev_mem->d_map);
-    cudaMalloc(&dev_mem->d_map, sizeof(unsigned) * num_long_seg);
+    // Use pre-allocated d_map buffer (avoid cudaMalloc/cudaFree which globally sync)
+    assert(num_long_seg <= dev_mem->d_map_capacity);
     cudaMemcpyAsync(dev_mem->d_map, map, sizeof(unsigned) * num_long_seg,
                     cudaMemcpyHostToDevice, cudastream);
     free(map);
@@ -386,9 +385,8 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
             rechain_indices[n_rechain++] = i;
     }
     if (n_rechain > 0) {
-        // TODO: plvoting uses null stream (cudaMalloc/cudaMemcpy inside).
-        // This may briefly serialize with other streams on the default stream.
-        plvoting_rechain_batch(mi, opt, reads, rechain_indices, n_rechain, misc, km);
+        plvoting_rechain_batch(mi, opt, reads, rechain_indices, n_rechain, misc, km,
+                               sp->cudastream);
     }
     free(rechain_indices);
 

@@ -89,6 +89,7 @@ typedef struct {
 
     // long segement buffer
     unsigned *d_map;
+    size_t d_map_capacity;  // pre-allocated capacity (number of elements)
     int32_t *d_ax_long, *d_ay_long;
     int8_t *d_sid_long;
     int32_t *d_range_long;

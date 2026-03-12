@@ -815,8 +815,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
                 if (total_cigar_ops > 0) {
                     // Transfer only the compacted, fixed CIGAR data — typically 10-40× smaller than stride layout
-                    cudaMemcpy(h_compact_cigar, d_compact_cigar,
-                               total_cigar_ops * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+                    // Use async + stream sync to avoid blocking other streams
+                    cudaMemcpyAsync(h_compact_cigar, d_compact_cigar,
+                               total_cigar_ops * sizeof(uint32_t), cudaMemcpyDeviceToHost, align_stream);
+                    cudaStreamSynchronize(align_stream);
                 }
             }
 

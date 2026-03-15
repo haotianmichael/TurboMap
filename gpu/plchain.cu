@@ -291,14 +291,20 @@ static void sync_chain_impl(stream_ptr_t *sp) {
                     cudaMemcpyDeviceToHost, cudastream);
     cudaStreamSynchronize(cudastream);
 
-    unsigned *map = new unsigned[num_long_seg];
+    unsigned *map = (unsigned *)malloc(sizeof(unsigned) * num_long_seg);
     for (unsigned i = 0; i < num_long_seg; i++)
         map[i] = i;
     pairsort(long_segs_og, map, num_long_seg);
     free(long_segs_og);
 
     // Use pre-allocated d_map buffer (avoid cudaMalloc/cudaFree which globally sync)
-    assert(num_long_seg <= dev_mem->d_map_capacity);
+    if (num_long_seg > dev_mem->d_map_capacity) {
+        fprintf(stderr, "[WARNING] num_long_seg=%u exceeds d_map_capacity=%zu, reallocating\n",
+                num_long_seg, dev_mem->d_map_capacity);
+        cudaFree(dev_mem->d_map);
+        cudaMalloc(&dev_mem->d_map, sizeof(unsigned) * num_long_seg);
+        dev_mem->d_map_capacity = num_long_seg;
+    }
     cudaMemcpyAsync(dev_mem->d_map, map, sizeof(unsigned) * num_long_seg,
                     cudaMemcpyHostToDevice, cudastream);
     free(map);

@@ -407,6 +407,14 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
 extern "C" {
 #endif  // __cplusplus
 
+deviceMemPtr* gpu_get_dev_mem(int stream_id) {
+    return &stream_setup.streams[stream_id].dev_mem;
+}
+
+cudaStream_t gpu_get_cudastream(int stream_id) {
+    return stream_setup.streams[stream_id].cudastream;
+}
+
 void init_stream_gpu(size_t *total_n, int *max_reads, int *min_n, char gpu_config_file[], Misc misc) {
     plmem_stream_initialize(total_n, max_reads, min_n, gpu_config_file);
     plrange_upload_misc(misc);
@@ -460,14 +468,6 @@ void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
     Misc misc = build_misc(mi, opt, 0, 1);
     finish_backtrack_impl(mi, opt, &stream_setup.streams[stream_id],
                           reads, n_read, misc, km);
-}
-
-deviceMemPtr* gpu_get_dev_mem(int stream_id) {
-    return &stream_setup.streams[stream_id].dev_mem;
-}
-
-cudaStream_t gpu_get_cudastream(int stream_id) {
-    return stream_setup.streams[stream_id].cudastream;
 }
 
 int gpu_get_num_streams(void) {

@@ -228,8 +228,14 @@ typedef struct gputSetup_t {
 extern streamSetup_t stream_setup;
 
 /* per-stream accessors (defined in plchain.cu) */
+#ifdef __cplusplus
+extern "C" {
+#endif
 deviceMemPtr* gpu_get_dev_mem(int stream_id);
 cudaStream_t  gpu_get_cudastream(int stream_id);
+#ifdef __cplusplus
+}
+#endif
 
 /* memory management methods */
 // initialization and cleanup

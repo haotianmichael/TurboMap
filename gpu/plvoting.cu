@@ -305,18 +305,13 @@ static void run_voting_minibatch(
 {
     const int blk = 256;
 
-    fprintf(stderr, "[DEBUG] run_voting_minibatch: mb_n=%d, mb_total_anchors=%d, mb_total_bins=%d\n",
-            mb_n, mb_total_anchors, mb_total_bins);
-
     /* ---- upload anchors + metadata ---- */
     uint64_t *d_ax = NULL, *d_ay = NULL;
     int32_t  *d_bin_off_d = NULL, *d_anchor_off_d = NULL, *d_ref_min_d = NULL, *d_bin_size_d = NULL;
 
     cudaError_t e;
     e = cudaMalloc(&d_ax,           (size_t)mb_total_anchors * sizeof(uint64_t));
-    if (e != cudaSuccess) fprintf(stderr, "[DEBUG] cudaMalloc d_ax FAILED: %s (size=%zu)\n", cudaGetErrorString(e), (size_t)mb_total_anchors * sizeof(uint64_t));
     e = cudaMalloc(&d_ay,           (size_t)mb_total_anchors * sizeof(uint64_t));
-    if (e != cudaSuccess) fprintf(stderr, "[DEBUG] cudaMalloc d_ay FAILED: %s (size=%zu)\n", cudaGetErrorString(e), (size_t)mb_total_anchors * sizeof(uint64_t));
     cudaMalloc(&d_bin_off_d,    (size_t)(mb_n + 1)       * sizeof(int32_t));
     cudaMalloc(&d_anchor_off_d, (size_t)(mb_n + 1)       * sizeof(int32_t));
     cudaMalloc(&d_ref_min_d,    (size_t)mb_n             * sizeof(int32_t));
@@ -356,16 +351,6 @@ static void run_voting_minibatch(
     cudaMalloc(&d_by,              (size_t)mb_total_anchors * sizeof(uint64_t));
     cudaMalloc(&d_seg_cnt_flat_d,  (size_t)mb_total_bins    * sizeof(int32_t));
     cudaMemsetAsync(d_seg_cnt_flat_d, 0,(size_t)mb_total_bins    * sizeof(int32_t), stream);
-
-    {
-        cudaError_t err_alloc = cudaGetLastError();
-        if (err_alloc != cudaSuccess) {
-            fprintf(stderr, "[DEBUG] run_voting_minibatch: error AFTER allocs: %s\n",
-                    cudaGetErrorString(err_alloc));
-        }
-        fprintf(stderr, "[DEBUG] voting allocs OK: d_ax=%p d_ay=%p d_bx=%p d_by=%p d_votes=%p\n",
-                (void*)d_ax, (void*)d_ay, (void*)d_bx, (void*)d_by, (void*)d_votes);
-    }
 
     /* ---- step 1: voting histogram ---- */
     {

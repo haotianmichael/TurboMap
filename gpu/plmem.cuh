@@ -226,8 +226,10 @@ typedef struct gputSetup_t {
 } streamSetup_t;
 
 extern streamSetup_t stream_setup;
-extern deviceMemPtr *g_current_dev_mem;
-extern cudaStream_t g_current_cudastream;  // unified stream for current slot
+
+/* per-stream accessors (defined in plchain.cu) */
+deviceMemPtr* gpu_get_dev_mem(int stream_id);
+cudaStream_t  gpu_get_cudastream(int stream_id);
 
 /* memory management methods */
 // initialization and cleanup

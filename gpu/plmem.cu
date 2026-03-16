@@ -1003,8 +1003,6 @@ cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
     stream_setup.max_range_grid = max_range_grid;
     stream_setup.max_num_cut = max_num_cut;
     stream_setup.long_seg_buffer_size_stream = long_seg_buffer_size;
-    g_current_dev_mem = &stream_setup.streams[0].dev_mem;
-    g_current_cudastream = stream_setup.streams[0].cudastream;
     cudaCheck();
 }
 

@@ -203,15 +203,6 @@ static int launch_chain_impl(chain_read_t *reads, int n_read,
     deviceMemPtr *dev_mem = &sp->dev_mem;
     cudaStream_t cudastream = sp->cudastream;
 
-    fprintf(stderr, "[DEBUG] launch_chain_impl: n_read=%d, stream=%p, max_anchors=%zu\n",
-            n_read, (void*)cudastream, stream_setup.max_anchors_stream);
-    {
-        cudaError_t err_pre = cudaGetLastError();
-        if (err_pre != cudaSuccess)
-            fprintf(stderr, "[DEBUG] launch_chain_impl: STICKY error on entry: %s\n",
-                    cudaGetErrorString(err_pre));
-    }
-
     cudaEventRecord(sp->startevent, cudastream);
 
     // Reset long seg counters
@@ -287,23 +278,12 @@ static void sync_chain_impl(stream_ptr_t *sp) {
 
     // Sync short+mid micro-batches
     cudaStreamSynchronize(cudastream);
-    cudaError_t err_sync = cudaGetLastError();
-    if (err_sync != cudaSuccess) {
-        fprintf(stderr, "[DEBUG] sync_chain_impl: error BEFORE long-seg: %s\n",
-                cudaGetErrorString(err_sync));
-    }
 
     // Long-seg sort on CPU
     unsigned int num_long_seg;
     cudaMemcpyAsync(&num_long_seg, dev_mem->d_long_seg_count, sizeof(unsigned int),
                     cudaMemcpyDeviceToHost, cudastream);
     cudaStreamSynchronize(cudastream);
-
-    fprintf(stderr, "[DEBUG] sync_chain_impl: num_long_seg=%u, d_map=%p, d_map_capacity=%zu, "
-            "d_long_seg=%p, d_long_seg_count=%p, buffer_size_long=%zu\n",
-            num_long_seg, (void*)dev_mem->d_map, dev_mem->d_map_capacity,
-            (void*)dev_mem->d_long_seg, (void*)dev_mem->d_long_seg_count,
-            dev_mem->buffer_size_long);
 
     seg_t *long_segs_og = (seg_t *)malloc(sizeof(seg_t) * num_long_seg);
     cudaMemcpyAsync(long_segs_og, dev_mem->d_long_seg_og, sizeof(seg_t) * num_long_seg,
@@ -322,8 +302,6 @@ static void sync_chain_impl(stream_ptr_t *sp) {
         if (dev_mem->d_map) cudaFree(dev_mem->d_map);
         cudaMalloc(&dev_mem->d_map, sizeof(unsigned) * num_long_seg);
         dev_mem->d_map_capacity = num_long_seg;
-        fprintf(stderr, "[DEBUG] d_map: grew to capacity=%u (d_map=%p)\n",
-                num_long_seg, (void*)dev_mem->d_map);
     }
     if (num_long_seg > 0) {
         cudaMemcpyAsync(dev_mem->d_map, map, sizeof(unsigned) * num_long_seg,
@@ -332,23 +310,9 @@ static void sync_chain_impl(stream_ptr_t *sp) {
     free(map);
 
     // Launch long-seg kernel + D2H
-    fprintf(stderr, "[DEBUG] sync_chain_impl: launching long-seg kernel, long_griddim=%d\n",
-            score_kernel_config.long_griddim);
     plscore_async_long_forward_dp(&sp->dev_mem, &sp->cudastream);
-    {
-        cudaError_t err_k = cudaGetLastError();
-        if (err_k != cudaSuccess)
-            fprintf(stderr, "[DEBUG] sync_chain_impl: error AFTER long-seg kernel launch: %s\n",
-                    cudaGetErrorString(err_k));
-    }
     plmem_async_d2h_long_memcpy(sp);
     cudaStreamSynchronize(cudastream);
-    {
-        cudaError_t err_k = cudaGetLastError();
-        if (err_k != cudaSuccess)
-            fprintf(stderr, "[DEBUG] sync_chain_impl: error AFTER long-seg sync: %s\n",
-                    cudaGetErrorString(err_k));
-    }
 
     // Merge long segment results into host f[]/p[]
     seg_t *long_segs = sp->long_mem.long_segs_og_idx;
@@ -498,9 +462,12 @@ void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
                           reads, n_read, misc, km);
 }
 
-void gpu_align_set_stream(int stream_id) {
-    g_current_dev_mem = &stream_setup.streams[stream_id].dev_mem;
-    g_current_cudastream = stream_setup.streams[stream_id].cudastream;
+deviceMemPtr* gpu_get_dev_mem(int stream_id) {
+    return &stream_setup.streams[stream_id].dev_mem;
+}
+
+cudaStream_t gpu_get_cudastream(int stream_id) {
+    return stream_setup.streams[stream_id].cudastream;
 }
 
 int gpu_get_num_streams(void) {

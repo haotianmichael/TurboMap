@@ -305,12 +305,18 @@ static void run_voting_minibatch(
 {
     const int blk = 256;
 
-    /* ---- upload anchors + metadata ---- */
-    uint64_t *d_ax, *d_ay;
-    int32_t  *d_bin_off_d, *d_anchor_off_d, *d_ref_min_d, *d_bin_size_d;
+    fprintf(stderr, "[DEBUG] run_voting_minibatch: mb_n=%d, mb_total_anchors=%d, mb_total_bins=%d\n",
+            mb_n, mb_total_anchors, mb_total_bins);
 
-    cudaMalloc(&d_ax,           (size_t)mb_total_anchors * sizeof(uint64_t));
-    cudaMalloc(&d_ay,           (size_t)mb_total_anchors * sizeof(uint64_t));
+    /* ---- upload anchors + metadata ---- */
+    uint64_t *d_ax = NULL, *d_ay = NULL;
+    int32_t  *d_bin_off_d = NULL, *d_anchor_off_d = NULL, *d_ref_min_d = NULL, *d_bin_size_d = NULL;
+
+    cudaError_t e;
+    e = cudaMalloc(&d_ax,           (size_t)mb_total_anchors * sizeof(uint64_t));
+    if (e != cudaSuccess) fprintf(stderr, "[DEBUG] cudaMalloc d_ax FAILED: %s (size=%zu)\n", cudaGetErrorString(e), (size_t)mb_total_anchors * sizeof(uint64_t));
+    e = cudaMalloc(&d_ay,           (size_t)mb_total_anchors * sizeof(uint64_t));
+    if (e != cudaSuccess) fprintf(stderr, "[DEBUG] cudaMalloc d_ay FAILED: %s (size=%zu)\n", cudaGetErrorString(e), (size_t)mb_total_anchors * sizeof(uint64_t));
     cudaMalloc(&d_bin_off_d,    (size_t)(mb_n + 1)       * sizeof(int32_t));
     cudaMalloc(&d_anchor_off_d, (size_t)(mb_n + 1)       * sizeof(int32_t));
     cudaMalloc(&d_ref_min_d,    (size_t)mb_n             * sizeof(int32_t));
@@ -350,6 +356,16 @@ static void run_voting_minibatch(
     cudaMalloc(&d_by,              (size_t)mb_total_anchors * sizeof(uint64_t));
     cudaMalloc(&d_seg_cnt_flat_d,  (size_t)mb_total_bins    * sizeof(int32_t));
     cudaMemsetAsync(d_seg_cnt_flat_d, 0,(size_t)mb_total_bins    * sizeof(int32_t), stream);
+
+    {
+        cudaError_t err_alloc = cudaGetLastError();
+        if (err_alloc != cudaSuccess) {
+            fprintf(stderr, "[DEBUG] run_voting_minibatch: error AFTER allocs: %s\n",
+                    cudaGetErrorString(err_alloc));
+        }
+        fprintf(stderr, "[DEBUG] voting allocs OK: d_ax=%p d_ay=%p d_bx=%p d_by=%p d_votes=%p\n",
+                (void*)d_ax, (void*)d_ay, (void*)d_bx, (void*)d_by, (void*)d_votes);
+    }
 
     /* ---- step 1: voting histogram ---- */
     {
@@ -417,12 +433,28 @@ static void run_voting_minibatch(
     cudaFree(d_ref_min_d); cudaFree(d_bin_size_d);
 
     /* ---- D2H download into caller's full-batch host arrays ---- */
+    {
+        cudaError_t err_k = cudaGetLastError();
+        if (err_k != cudaSuccess) {
+            fprintf(stderr, "[DEBUG] run_voting_minibatch: error AFTER kernels (before D2H): %s\n",
+                    cudaGetErrorString(err_k));
+        }
+    }
     cudaMemcpyAsync(h_bx_base,            d_bx,           (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(h_by_base,            d_by,           (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(h_nsegs_base,         d_nsegs_d,      (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(h_ncompact_base,      d_ncompact_d,   (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost, stream);
     cudaMemcpyAsync(h_seg_cnt_flat_base,  d_seg_cnt_flat_d,(size_t)mb_total_bins   * sizeof(int32_t),  cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
+    {
+        cudaError_t err_d2h = cudaGetLastError();
+        if (err_d2h != cudaSuccess) {
+            fprintf(stderr, "[DEBUG] run_voting_minibatch: error AFTER D2H sync: %s\n",
+                    cudaGetErrorString(err_d2h));
+        } else {
+            fprintf(stderr, "[DEBUG] run_voting_minibatch: completed OK\n");
+        }
+    }
 
     cudaFree(d_bx); cudaFree(d_by);
     cudaFree(d_nsegs_d); cudaFree(d_ncompact_d);
@@ -444,6 +476,15 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                             cudaStream_t stream)
 {
     if (n_rechain == 0) return;
+
+    fprintf(stderr, "[DEBUG] plvoting_rechain_batch: n_rechain=%d, stream=%p\n",
+            n_rechain, (void*)stream);
+    {
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+            fprintf(stderr, "[DEBUG] plvoting_rechain_batch: STICKY error on entry: %s\n",
+                    cudaGetErrorString(err));
+    }
 
     for (int i = 0; i < n_rechain; ++i)
         prepare_rechain_anchors(&reads[rechain_indices[i]], km);

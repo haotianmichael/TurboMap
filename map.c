@@ -1994,6 +1994,8 @@ static void* gpu_batch_consumer(void *data) {
         stream_slot_t *ss_ = &slots[(sid)]; \
         if (!ss_->busy) break; \
         \
+        fprintf(stderr, "[DEBUG] DRAIN_STREAM(%d): count=%d\n", (sid), ss_->batch.count); \
+        \
         if (mm_dbg_flag & MM_DBG_PRINT_QNAME) \
             fprintf(stderr, "DRAIN_STREAM(%d): count=%d\n", (sid), ss_->batch.count); \
         \

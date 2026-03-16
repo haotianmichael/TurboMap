@@ -335,17 +335,19 @@ static void sync_chain_impl(stream_ptr_t *sp) {
     fprintf(stderr, "[DEBUG] sync_chain_impl: launching long-seg kernel, long_griddim=%d\n",
             score_kernel_config.long_griddim);
     plscore_async_long_forward_dp(&sp->dev_mem, &sp->cudastream);
-    err_map = cudaGetLastError();
-    if (err_map != cudaSuccess) {
-        fprintf(stderr, "[DEBUG] sync_chain_impl: error AFTER long-seg kernel launch: %s\n",
-                cudaGetErrorString(err_map));
+    {
+        cudaError_t err_k = cudaGetLastError();
+        if (err_k != cudaSuccess)
+            fprintf(stderr, "[DEBUG] sync_chain_impl: error AFTER long-seg kernel launch: %s\n",
+                    cudaGetErrorString(err_k));
     }
     plmem_async_d2h_long_memcpy(sp);
     cudaStreamSynchronize(cudastream);
-    err_map = cudaGetLastError();
-    if (err_map != cudaSuccess) {
-        fprintf(stderr, "[DEBUG] sync_chain_impl: error AFTER long-seg sync: %s\n",
-                cudaGetErrorString(err_map));
+    {
+        cudaError_t err_k = cudaGetLastError();
+        if (err_k != cudaSuccess)
+            fprintf(stderr, "[DEBUG] sync_chain_impl: error AFTER long-seg sync: %s\n",
+                    cudaGetErrorString(err_k));
     }
 
     // Merge long segment results into host f[]/p[]

@@ -132,9 +132,8 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_long_seg_count, sizeof(unsigned int));
     cudaMalloc(&dev_mem->d_long_seg, long_seg_size);
     cudaMalloc(&dev_mem->d_long_seg_og, long_seg_size);
-    size_t max_long_segs = long_seg_size / sizeof(seg_t);
-    cudaMalloc(&dev_mem->d_map, max_long_segs * sizeof(unsigned));
-    dev_mem->d_map_capacity = max_long_segs;
+    dev_mem->d_map = NULL;          // lazily allocated in sync_chain_impl
+    dev_mem->d_map_capacity = 0;
     cudaMalloc(&dev_mem->d_mid_seg_count, sizeof(unsigned int));
     cudaMalloc(&dev_mem->d_mid_seg, mid_seg_size);
     fprintf(stderr, " [Chain] Total Cut buffers: %.2f MB\n", (idx_total + cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) / (1024.0*1024.0));

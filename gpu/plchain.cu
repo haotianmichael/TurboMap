@@ -316,20 +316,18 @@ static void sync_chain_impl(stream_ptr_t *sp) {
     pairsort(long_segs_og, map, num_long_seg);
     free(long_segs_og);
 
-    // Use pre-allocated d_map buffer (avoid cudaMalloc/cudaFree which globally sync)
+    // Lazy grow-only d_map: only realloc when current buffer is too small.
+    // After the first call stabilizes, no further cudaMalloc/cudaFree occur.
     if (num_long_seg > dev_mem->d_map_capacity) {
-        fprintf(stderr, "[WARNING] num_long_seg=%u exceeds d_map_capacity=%zu, reallocating\n",
-                num_long_seg, dev_mem->d_map_capacity);
-        cudaFree(dev_mem->d_map);
+        if (dev_mem->d_map) cudaFree(dev_mem->d_map);
         cudaMalloc(&dev_mem->d_map, sizeof(unsigned) * num_long_seg);
         dev_mem->d_map_capacity = num_long_seg;
+        fprintf(stderr, "[DEBUG] d_map: grew to capacity=%u (d_map=%p)\n",
+                num_long_seg, (void*)dev_mem->d_map);
     }
-    cudaError_t err_map = cudaMemcpyAsync(dev_mem->d_map, map, sizeof(unsigned) * num_long_seg,
-                    cudaMemcpyHostToDevice, cudastream);
-    if (err_map != cudaSuccess) {
-        fprintf(stderr, "[DEBUG] sync_chain_impl: cudaMemcpyAsync(d_map) FAILED: %s (map=%p, d_map=%p, bytes=%zu)\n",
-                cudaGetErrorString(err_map), (void*)map, (void*)dev_mem->d_map,
-                sizeof(unsigned) * num_long_seg);
+    if (num_long_seg > 0) {
+        cudaMemcpyAsync(dev_mem->d_map, map, sizeof(unsigned) * num_long_seg,
+                        cudaMemcpyHostToDevice, cudastream);
     }
     free(map);
 

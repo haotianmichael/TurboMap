@@ -1989,6 +1989,65 @@ static void copy_rep_frag(step_t *s, mm_batch_trbuf_t *batch) {
     }
 }
 
+// ── Multi-threaded CPU fallback chain ─────────────────────────────────
+// Context for kt_for callback that runs mm_map_chain on fallback reads.
+typedef struct {
+    chain_read_t *reads;
+    const mm_idx_t *mi;
+    const mm_mapopt_t *opt;
+    mm_tbuf_t **tbufs;   // per-thread tbufs (scratch + timers)
+    void **kms;           // per-thread kms (chain allocations)
+} fallback_chain_ctx_t;
+
+// kt_for callback: CPU chain for a single fallback read using per-thread km
+static void fallback_chain_worker(void *data, long i, int tid) {
+    if (i < 0) return;  // sentinel from __AMD_SPLIT_KERNELS__ kt_for
+    fallback_chain_ctx_t *ctx = (fallback_chain_ctx_t*)data;
+    chain_read_t *read = &ctx->reads[i];
+    void *km = ctx->kms[tid];
+
+    // Re-allocate read's a and mini_pos into per-thread km so that
+    // kfree() inside mm_map_chain operates on the correct allocator.
+    // The originals (in fallback_batch.km) become leaked but are
+    // cleaned up when fallback_batch.km is reset after alignment.
+    if (read->a && read->n > 0) {
+        mm128_t *new_a = (mm128_t*)kmalloc(km, read->n * sizeof(mm128_t));
+        memcpy(new_a, read->a, read->n * sizeof(mm128_t));
+        read->a = new_a;
+    }
+    if (read->mini_pos && read->n_mini_pos > 0) {
+        uint64_t *new_mp = (uint64_t*)kmalloc(km, read->n_mini_pos * sizeof(uint64_t));
+        memcpy(new_mp, read->mini_pos, read->n_mini_pos * sizeof(uint64_t));
+        read->mini_pos = new_mp;
+    }
+
+    mm_map_chain(ctx->mi, ctx->opt, read, ctx->tbufs[tid], km);
+}
+
+// After kt_for completes, copy chain results (a, u, mini_pos) from
+// per-thread kms back into the fallback batch km so that alignment's
+// kfree(batch->km, ...) works correctly.
+static void fallback_migrate_to_batch_km(chain_read_t *reads, int count, void *batch_km) {
+    for (int r = 0; r < count; r++) {
+        chain_read_t *read = &reads[r];
+        if (read->a && read->n > 0) {
+            mm128_t *new_a = (mm128_t*)kmalloc(batch_km, read->n * sizeof(mm128_t));
+            memcpy(new_a, read->a, read->n * sizeof(mm128_t));
+            read->a = new_a;
+        }
+        if (read->u && read->n_u > 0) {
+            uint64_t *new_u = (uint64_t*)kmalloc(batch_km, read->n_u * sizeof(uint64_t));
+            memcpy(new_u, read->u, read->n_u * sizeof(uint64_t));
+            read->u = new_u;
+        }
+        if (read->mini_pos && read->n_mini_pos > 0) {
+            uint64_t *new_mp = (uint64_t*)kmalloc(batch_km, read->n_mini_pos * sizeof(uint64_t));
+            memcpy(new_mp, read->mini_pos, read->n_mini_pos * sizeof(uint64_t));
+            read->mini_pos = new_mp;
+        }
+    }
+}
+
 // Drain worker thread function.
 // Each worker owns one CUDA stream and processes batches independently.
 // No shared mutable state between workers (each has own fallback_batch).
@@ -2041,6 +2100,59 @@ static void* drain_worker_fn(void *arg) {
         copy_rep_frag(s, &slot->batch);
         prepare_align_batch_gpu(&slot->batch, wb, s, sid);
         mm_trbuf_batch_reset(&slot->batch, slot->batch_max_reads, s->p->opt);
+
+        // 6. Process fallback reads with multi-threaded CPU chain (-t threads)
+        //    instead of deferring them to the end.
+        if (slot->fallback_batch.count > 0) {
+            int fb_count = slot->fallback_batch.count;
+            int n_threads = s->p->n_threads;
+
+            fprintf(stderr, "[INFO] Stream %d: CPU chain %d fallback reads with %d threads\n",
+                    sid, fb_count, n_threads);
+
+            // Create per-thread resources
+            mm_tbuf_t **fb_tbufs = (mm_tbuf_t**)calloc(n_threads, sizeof(mm_tbuf_t*));
+            void **fb_kms = (void**)calloc(n_threads, sizeof(void*));
+            for (int t = 0; t < n_threads; t++) {
+                fb_tbufs[t] = mm_tbuf_init();
+                fb_kms[t] = km_init();
+            }
+
+            // Multi-threaded CPU chain via kt_for
+            fallback_chain_ctx_t fb_ctx;
+            fb_ctx.reads = slot->fallback_batch.reads;
+            fb_ctx.mi    = s->p->mi;
+            fb_ctx.opt   = s->p->opt;
+            fb_ctx.tbufs = fb_tbufs;
+            fb_ctx.kms   = fb_kms;
+            kt_for(n_threads, fallback_chain_worker, &fb_ctx, fb_count);
+
+            // Migrate chain results (a, u, mini_pos) from per-thread kms
+            // back into fallback_batch.km so alignment's kfree works correctly
+            fallback_migrate_to_batch_km(slot->fallback_batch.reads, fb_count,
+                                         slot->fallback_batch.km);
+
+            // Destroy per-thread kms and tbufs (originals now safely copied out)
+            for (int t = 0; t < n_threads; t++) {
+                mm_tbuf_destroy(fb_tbufs[t]);
+                km_destroy(fb_kms[t]);
+            }
+            free(fb_tbufs);
+            free(fb_kms);
+
+            // Alignment for fallback reads (reuses this stream's GPU)
+            mm_batch_trbuf_t fb_align_batch;
+            fb_align_batch.reads   = slot->fallback_batch.reads;
+            fb_align_batch.count   = fb_count;
+            fb_align_batch.total_n = slot->fallback_batch.total_n;
+            fb_align_batch.km      = slot->fallback_batch.km;
+            fb_align_batch.batchid = -1;
+            copy_rep_frag(s, &fb_align_batch);
+            prepare_align_batch_gpu(&fb_align_batch, wb, s, sid);
+
+            // Reset fallback batch for next iteration
+            mm_trbuf_batch_reset(&slot->fallback_batch, slot->batch_max_reads, s->p->opt);
+        }
 
         // Signal main thread: drain complete
         pthread_mutex_lock(&slot->mutex);
@@ -2237,39 +2349,8 @@ static void* gpu_batch_consumer(void *data) {
         pthread_join(slots[i].thread, NULL);
     }
 
-    // ── Process deferred fallback reads (per-stream) ─────────────────────
-    for (int sid = 0; sid < num_streams; sid++) {
-        mm_batch_trbuf_t *fb = &slots[sid].fallback_batch;
-        while (fb->count > 0) {
-            fprintf(stderr, "[Info] Processing %d deferred fallback reads (stream %d) via GPU chain\n",
-                    fb->count, sid);
-
-            chain_read_t *fb_reads = fb->reads;
-            int fb_count = fb->count;
-            chain_stream_gpu(s->p->mi, s->p->opt, &fb_reads, &fb_count, sid, fb->km);
-
-            chain_read_t *fb_result_reads = NULL;
-            int fb_result_count = 0;
-            finish_stream_gpu(s->p->mi, s->p->opt, &fb_result_reads, &fb_result_count, sid, fb->km);
-
-            for (; fb_result_count < fb->count; fb_result_count++) {
-                fprintf(stderr, "[WARNING] Fallback GPU overflowed, CPU chain for read %d\n",
-                        fb_result_count);
-                mm_map_chain(s->p->mi, s->p->opt, &fb->reads[fb_result_count],
-                             b, fb->km);
-            }
-
-            mm_batch_trbuf_t fb_align_batch;
-            fb_align_batch.reads   = fb->reads;
-            fb_align_batch.count   = fb->count;
-            fb_align_batch.total_n = fb->total_n;
-            fb_align_batch.km      = fb->km;
-            fb_align_batch.batchid = -1;
-            copy_rep_frag(s, &fb_align_batch);
-            prepare_align_batch_gpu(&fb_align_batch, b, s, sid);
-            mm_trbuf_batch_reset(fb, s->batch_max_reads, s->p->opt);
-        }
-    }
+    // Fallback reads are now processed inline in drain_worker_fn (step 6)
+    // using multi-threaded CPU chain — no deferred processing needed here.
 
     // Cleanup
     mm_trbuf_batch_reset(&acc_batch, s->batch_max_reads, s->p->opt);

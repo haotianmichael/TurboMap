@@ -259,13 +259,11 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t short_task_max_len = 1000;     // Max qlen or tlen for short tasks
 
     // Compute n_concurrent_blocks FIRST — needed by slot-indexed buffer sizing below.
-    // Plan D: Reserve ~20% SMs for chain/backtrack stream overlap.
+    // V100: 80 SMs x 32 blocks/SM (with 3072 bytes smem) = 2560 concurrent blocks
     int numSMs = 0;
     cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
     int max_blocks_per_sm = 32;  // limited by shared memory (3072 bytes/block, 98304/SM)
-    int align_SMs = numSMs * 4 / 5;  // 80% of SMs
-    if (align_SMs < 1) align_SMs = 1;
-    dev_mem->n_align_concurrent_blocks = align_SMs * max_blocks_per_sm;
+    dev_mem->n_align_concurrent_blocks = numSMs * max_blocks_per_sm;
 
     // KSW temp buffer: slot-indexed by blockIdx.x, only n_concurrent_blocks slots needed
     size_t max_len = dev_mem->max_align_query_len;
@@ -400,13 +398,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
 
-    // Persistent kernel: atomic task counter + concurrent block count
-    // V100: 80 SMs x 32 blocks/SM (with 3072 bytes smem) = 2560 concurrent blocks
-    // Use query to get actual SM count for portability
-    int numSMs = 0;
-    cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
-    int max_blocks_per_sm = 32;  // limited by shared memory (3072 bytes/block, 98304/SM)
-    dev_mem->n_align_concurrent_blocks = numSMs * max_blocks_per_sm;
+    // Persistent kernel: atomic task counter
     cudaMalloc(&dev_mem->d_align_task_counter, sizeof(int));
 
     // Calculate total memory allocated for alignment backtrack

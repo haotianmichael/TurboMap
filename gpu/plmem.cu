@@ -414,10 +414,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     // ========== Voting Pre-allocated Buffers ==========
     // Sized by bt_anchor_total (= anchor_per_batch × micro_batch).
     // Bins are bounded by anchors (each anchor maps to ≤1 bin), so use same capacity.
-    // Read-sized arrays use bt_r (= max_reads × micro_batch) + 1 for offsets.
+    // Read-sized arrays use d_bt_max_n_reads (= max_reads × micro_batch) + 1 for offsets.
     {
         size_t vt_a = bt_anchor_total;  // anchor/bin capacity
-        size_t vt_r = bt_r + 1;         // read/group capacity (+1 for offset arrays)
+        size_t vt_r = dev_mem->d_bt_max_n_reads + 1;  // read/group capacity (+1 for offset arrays)
         dev_mem->d_vt_max_anchors = vt_a;
 
         // Anchor-sized (uint64_t × 4 + int32_t × 3)

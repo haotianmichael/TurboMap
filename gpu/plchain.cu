@@ -400,7 +400,7 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
     }
     if (n_rechain > 0) {
         plvoting_rechain_batch(mi, opt, reads, rechain_indices, n_rechain, misc, km,
-                               sp->cudastream);
+                               sp->cudastream, &sp->dev_mem);
     }
     free(rechain_indices);
 

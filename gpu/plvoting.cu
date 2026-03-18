@@ -296,6 +296,7 @@ static void run_voting_minibatch(
         int32_t         min_votes,
         int32_t         merge_gap_bins,
         cudaStream_t    stream,
+        deviceMemPtr   *dev_mem,
         /* output slices */
         uint64_t       *h_bx_base,
         uint64_t       *h_by_base,
@@ -305,18 +306,27 @@ static void run_voting_minibatch(
 {
     const int blk = 256;
 
-    /* ---- upload anchors + metadata ---- */
-    uint64_t *d_ax = NULL, *d_ay = NULL;
-    int32_t  *d_bin_off_d = NULL, *d_anchor_off_d = NULL, *d_ref_min_d = NULL, *d_bin_size_d = NULL;
+    /* Use pre-allocated device buffers — no cudaMalloc/cudaFree in hot path */
+    uint64_t *d_ax           = dev_mem->d_vt_ax;
+    uint64_t *d_ay           = dev_mem->d_vt_ay;
+    int32_t  *d_bin_off_d    = dev_mem->d_vt_bin_off;
+    int32_t  *d_anchor_off_d = dev_mem->d_vt_anchor_off;
+    int32_t  *d_ref_min_d    = dev_mem->d_vt_ref_min;
+    int32_t  *d_bin_size_d   = dev_mem->d_vt_bin_size;
+    int32_t  *d_votes        = dev_mem->d_vt_votes;
+    int8_t   *d_keep_bin     = dev_mem->d_vt_keep_bin;
+    int32_t  *d_seg_start    = dev_mem->d_vt_seg_start;
+    int32_t  *d_seg_id       = dev_mem->d_vt_seg_id;
+    int32_t  *d_nsegs_d      = dev_mem->d_vt_nsegs;
+    int32_t  *d_ncompact_d   = dev_mem->d_vt_ncompact;
+    int32_t  *d_mark         = dev_mem->d_vt_mark;
+    int32_t  *d_anchor_seg   = dev_mem->d_vt_anchor_seg;
+    int32_t  *d_out_pos      = dev_mem->d_vt_out_pos;
+    uint64_t *d_bx           = dev_mem->d_vt_bx;
+    uint64_t *d_by           = dev_mem->d_vt_by;
+    int32_t  *d_seg_cnt_flat_d = dev_mem->d_vt_seg_cnt_flat;
 
-    cudaError_t e;
-    e = cudaMalloc(&d_ax,           (size_t)mb_total_anchors * sizeof(uint64_t));
-    e = cudaMalloc(&d_ay,           (size_t)mb_total_anchors * sizeof(uint64_t));
-    cudaMalloc(&d_bin_off_d,    (size_t)(mb_n + 1)       * sizeof(int32_t));
-    cudaMalloc(&d_anchor_off_d, (size_t)(mb_n + 1)       * sizeof(int32_t));
-    cudaMalloc(&d_ref_min_d,    (size_t)mb_n             * sizeof(int32_t));
-    cudaMalloc(&d_bin_size_d,   (size_t)mb_n             * sizeof(int32_t));
-
+    /* ---- upload anchors + metadata (async, no sync) ---- */
     cudaMemcpyAsync(d_ax,           mb_h_ax,         (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_ay,           mb_h_ay,         (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_bin_off_d,    mb_bin_off,      (size_t)(mb_n + 1)       * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
@@ -324,33 +334,9 @@ static void run_voting_minibatch(
     cudaMemcpyAsync(d_ref_min_d,    mb_ref_min,      (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(d_bin_size_d,   mb_bin_size_h,   (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
 
-    /* ---- bin-level arrays ---- */
-    int32_t *d_votes, *d_seg_start, *d_seg_id;
-    int8_t  *d_keep_bin;
-    cudaMalloc(&d_votes,     (size_t)mb_total_bins * sizeof(int32_t));
-    cudaMalloc(&d_keep_bin,  (size_t)mb_total_bins * sizeof(int8_t));
-    cudaMalloc(&d_seg_start, (size_t)mb_total_bins * sizeof(int32_t));
-    cudaMalloc(&d_seg_id,    (size_t)mb_total_bins * sizeof(int32_t));
-    cudaMemsetAsync(d_votes, 0,   (size_t)mb_total_bins * sizeof(int32_t), stream);
-
-    /* ---- per-group scalars ---- */
-    int32_t *d_nsegs_d, *d_ncompact_d;
-    cudaMalloc(&d_nsegs_d,    (size_t)mb_n * sizeof(int32_t));
-    cudaMalloc(&d_ncompact_d, (size_t)mb_n * sizeof(int32_t));
-
-    /* ---- anchor-level arrays ---- */
-    int32_t *d_mark, *d_anchor_seg, *d_out_pos;
-    cudaMalloc(&d_mark,       (size_t)mb_total_anchors * sizeof(int32_t));
-    cudaMalloc(&d_anchor_seg, (size_t)mb_total_anchors * sizeof(int32_t));
-    cudaMalloc(&d_out_pos,    (size_t)mb_total_anchors * sizeof(int32_t));
-
-    /* ---- output arrays ---- */
-    uint64_t *d_bx, *d_by;
-    int32_t  *d_seg_cnt_flat_d;
-    cudaMalloc(&d_bx,              (size_t)mb_total_anchors * sizeof(uint64_t));
-    cudaMalloc(&d_by,              (size_t)mb_total_anchors * sizeof(uint64_t));
-    cudaMalloc(&d_seg_cnt_flat_d,  (size_t)mb_total_bins    * sizeof(int32_t));
-    cudaMemsetAsync(d_seg_cnt_flat_d, 0,(size_t)mb_total_bins    * sizeof(int32_t), stream);
+    /* ---- zero buffers that need it (async) ---- */
+    cudaMemsetAsync(d_votes,          0, (size_t)mb_total_bins * sizeof(int32_t), stream);
+    cudaMemsetAsync(d_seg_cnt_flat_d, 0, (size_t)mb_total_bins * sizeof(int32_t), stream);
 
     /* ---- step 1: voting histogram ---- */
     {
@@ -367,7 +353,6 @@ static void run_voting_minibatch(
             d_votes, d_keep_bin, d_bin_off_d,
             min_votes, merge_gap_bins, mb_n, mb_total_bins);
     }
-    cudaFree(d_votes);
 
     /* ---- step 3: segment-start flags ---- */
     {
@@ -382,7 +367,6 @@ static void run_voting_minibatch(
         seg_incl_sum_kernel<<<grd, blk, 0, stream>>>(
             d_seg_start, d_seg_id, d_bin_off_d, d_nsegs_d, mb_n);
     }
-    cudaFree(d_seg_start);
 
     /* ---- step 5: tag anchors (mark + segment ID) ---- */
     {
@@ -392,8 +376,6 @@ static void run_voting_minibatch(
             d_keep_bin, d_seg_id,
             d_mark, d_anchor_seg, mb_n, mb_total_anchors);
     }
-    cudaFree(d_keep_bin);
-    cudaFree(d_seg_id);
 
     /* ---- step 6: segmented exclusive prefix sum → output positions + n_compact ---- */
     {
@@ -412,10 +394,6 @@ static void run_voting_minibatch(
             d_bx, d_by, d_seg_cnt_flat_d,
             mb_n, mb_total_anchors);
     }
-    cudaFree(d_ax);  cudaFree(d_ay);
-    cudaFree(d_mark); cudaFree(d_out_pos); cudaFree(d_anchor_seg);
-    cudaFree(d_bin_off_d); cudaFree(d_anchor_off_d);
-    cudaFree(d_ref_min_d); cudaFree(d_bin_size_d);
 
     /* ---- D2H download into caller's full-batch host arrays ---- */
     {
@@ -440,10 +418,7 @@ static void run_voting_minibatch(
             fprintf(stderr, "[DEBUG] run_voting_minibatch: completed OK\n");
         }
     }
-
-    cudaFree(d_bx); cudaFree(d_by);
-    cudaFree(d_nsegs_d); cudaFree(d_ncompact_d);
-    cudaFree(d_seg_cnt_flat_d);
+    /* No cudaFree — all device buffers are pre-allocated and reused. */
 }
 
 /* =========================================================================
@@ -458,7 +433,7 @@ extern "C" {
 void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                             chain_read_t *reads, int *rechain_indices,
                             int n_rechain, Misc misc, void *km,
-                            cudaStream_t stream)
+                            cudaStream_t stream, deviceMemPtr *dev_mem)
 {
     if (n_rechain == 0) return;
 
@@ -651,7 +626,7 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
             mb_h_ax, mb_h_ay,
             mb_bin_off, mb_anchor_off, mb_ref_min, mb_bin_size_h,
             min_votes, merge_gap_bins,
-            stream,
+            stream, dev_mem,
             h_bx           + base_anchor,
             h_by           + base_anchor,
             h_nsegs        + mb_g,

@@ -48,7 +48,7 @@ extern "C" {
 void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                             chain_read_t *reads, int *rechain_indices,
                             int n_rechain, Misc misc, void *km,
-                            cudaStream_t stream);
+                            cudaStream_t stream, deviceMemPtr *dev_mem);
 
 #ifdef __cplusplus
 }

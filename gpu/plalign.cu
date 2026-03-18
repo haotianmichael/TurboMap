@@ -692,13 +692,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             // ===== Fused Persistent KSW Kernel (align + backtrack in one launch) =====
             // Clamp concurrent blocks per phase: backtrack_p is allocated as
-            //   short_task_batch_size × max_align_backtrack_size (short per-slot size).
+            //   n_concurrent_blocks × max_align_backtrack_size (slot-indexed).
             // For long tasks current_max_backtrack_size >> short per-slot size, so far
             // fewer slots fit. Cap to avoid out-of-bounds access.
             int parallel_threads = 32;   // one warp per block
             size_t parallel_smem = 3072; // 3072 bytes smem → 32 blocks/SM on V100
 
-            size_t bt_p_total_bytes = (size_t)dev_mem->short_task_batch_size *
+            size_t bt_p_total_bytes = (size_t)n_concurrent_blocks *
                                       dev_mem->max_align_backtrack_size;
             size_t max_slots_this_phase = bt_p_total_bytes /
                                           (size_t)current_max_backtrack_size;

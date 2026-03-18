@@ -258,14 +258,23 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t long_task_batch_size = 128;    // For tasks with max(qlen, tlen) > 1000bp
     size_t short_task_max_len = 1000;     // Max qlen or tlen for short tasks
 
-    // KSW temp buffer (sized for short_task_batch_size concurrent tasks)
+    // Compute n_concurrent_blocks FIRST — needed by slot-indexed buffer sizing below.
+    // Plan D: Reserve ~20% SMs for chain/backtrack stream overlap.
+    int numSMs = 0;
+    cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
+    int max_blocks_per_sm = 32;  // limited by shared memory (3072 bytes/block, 98304/SM)
+    int align_SMs = numSMs * 4 / 5;  // 80% of SMs
+    if (align_SMs < 1) align_SMs = 1;
+    dev_mem->n_align_concurrent_blocks = align_SMs * max_blocks_per_sm;
+
+    // KSW temp buffer: slot-indexed by blockIdx.x, only n_concurrent_blocks slots needed
     size_t max_len = dev_mem->max_align_query_len;
     size_t H_size = max_len * sizeof(int32_t);
     size_t u8_arrays_size = (max_len + 1) * 7 * sizeof(int8_t);
     size_t seq_size = max_len * 2 * sizeof(uint8_t);
     size_t raw_size = H_size + u8_arrays_size + seq_size;
     dev_mem->align_ksw_temp_per_task = (raw_size + 7) & ~7ULL;
-    size_t ksw_temp_bytes = short_task_batch_size * dev_mem->align_ksw_temp_per_task;
+    size_t ksw_temp_bytes = (size_t)dev_mem->n_align_concurrent_blocks * dev_mem->align_ksw_temp_per_task;
     cudaMalloc(&dev_mem->d_align_ksw_temp_buffer, ksw_temp_bytes);
 
     fprintf(stderr, " [Align] DP buffers: %.2f MB\n", (seq_unpacked_size *2 + seq_packed_size*2 + metadata_size*5 + global_buffer_bytes + ksw_temp_bytes) / (1024.0*1024.0));
@@ -311,11 +320,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
 
    
     // Allocate buffers for SHORT tasks (most common case, optimized for throughput)
-    // alloc_slots: backtrack buffer is slot-indexed (persistent kernel reuses slots).
-    // Keep alloc_slots so both phases fit:
-    //   Short: 4000 × 1.5MB = 6.0GB  (hardware runs ≤2560 concurrently)
-    //   Long:  80 × 75MB   = 6.0GB  (same buffer, capped by plalign.cu)
-    size_t alloc_slots = short_task_batch_size;  // 4000
+    // alloc_slots: backtrack/ksw_temp are slot-indexed by blockIdx.x in the
+    // persistent kernel, so only n_concurrent_blocks slots are ever used.
+    // plalign.cu caps phase_concurrent_blocks to fit within this allocation.
+    size_t alloc_slots = (size_t)dev_mem->n_align_concurrent_blocks;
 
     // Calculate max_antidiag based on SHORT task length (1000bp per sequence)
     size_t max_antidiag_short = 2 * short_task_max_len;  // 2000 antidiagonals for 1000+1000bp
@@ -392,27 +400,54 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
 
-    // Persistent kernel: atomic task counter + concurrent block count
-    // V100: 80 SMs x 32 blocks/SM (with 3072 bytes smem) = 2560 concurrent blocks
-    // Use query to get actual SM count for portability
-    int numSMs = 0;
-    cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
-    int max_blocks_per_sm = 32;  // limited by shared memory (3072 bytes/block, 98304/SM)
-    // Plan D: Reserve ~20% SMs for chain/backtrack stream overlap.
-    // Persistent kernel uses 80% of SMs so the other CUDA stream's chain
-    // kernels can run concurrently without being starved.
-    int align_SMs = numSMs * 4 / 5;  // 80% of SMs
-    if (align_SMs < 1) align_SMs = 1;
-    dev_mem->n_align_concurrent_blocks = align_SMs * max_blocks_per_sm;
+    // Persistent kernel: atomic task counter (n_concurrent_blocks already computed above)
     cudaMalloc(&dev_mem->d_align_task_counter, sizeof(int));
 
     // Calculate total memory allocated for alignment backtrack
     size_t bck_total = bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes +
                          cigar_buf_bytes + cigar_len_bytes +
                          dev_mem->max_align_tasks * sizeof(int32_t) * 4 +  // scores, ends, and task mapping
-                         sizeof(gasal_res_t) + sizeof(ksw_extz_t) * short_task_batch_size + 25;  // 25 bytes for d_align_mat
+                         sizeof(gasal_res_t) + sizeof(ksw_extz_t) * alloc_slots + 25;  // 25 bytes for d_align_mat
 
     fprintf(stderr, " [Align] Total BackTrack buffers: %.2f GB\n", bck_total / (1024.0*1024.0*1024.0));
+
+    // ========== Voting Pre-allocated Buffers ==========
+    // Sized by bt_anchor_total (= anchor_per_batch × micro_batch).
+    // Bins are bounded by anchors (each anchor maps to ≤1 bin), so use same capacity.
+    // Read-sized arrays use bt_r (= max_reads × micro_batch) + 1 for offsets.
+    {
+        size_t vt_a = bt_anchor_total;  // anchor/bin capacity
+        size_t vt_r = bt_r + 1;         // read/group capacity (+1 for offset arrays)
+        dev_mem->d_vt_max_anchors = vt_a;
+
+        // Anchor-sized (uint64_t × 4 + int32_t × 3)
+        cudaMalloc(&dev_mem->d_vt_ax,          vt_a * sizeof(uint64_t));
+        cudaMalloc(&dev_mem->d_vt_ay,          vt_a * sizeof(uint64_t));
+        cudaMalloc(&dev_mem->d_vt_bx,          vt_a * sizeof(uint64_t));
+        cudaMalloc(&dev_mem->d_vt_by,          vt_a * sizeof(uint64_t));
+        cudaMalloc(&dev_mem->d_vt_mark,        vt_a * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_anchor_seg,  vt_a * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_out_pos,     vt_a * sizeof(int32_t));
+        // Bin-sized (int32_t × 4 + int8_t × 1, capacity = vt_a)
+        cudaMalloc(&dev_mem->d_vt_votes,        vt_a * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_keep_bin,     vt_a * sizeof(int8_t));
+        cudaMalloc(&dev_mem->d_vt_seg_start,    vt_a * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_seg_id,       vt_a * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_seg_cnt_flat, vt_a * sizeof(int32_t));
+        // Read-sized (int32_t × 6, capacity = vt_r)
+        cudaMalloc(&dev_mem->d_vt_bin_off,     vt_r * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_anchor_off,  vt_r * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_ref_min,     vt_r * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_bin_size,    vt_r * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_nsegs,       vt_r * sizeof(int32_t));
+        cudaMalloc(&dev_mem->d_vt_ncompact,    vt_r * sizeof(int32_t));
+
+        size_t vt_total = vt_a * (4*sizeof(uint64_t) + 3*sizeof(int32_t) +
+                                  4*sizeof(int32_t) + sizeof(int8_t))
+                        + vt_r * 6 * sizeof(int32_t);
+        fprintf(stderr, " [Voting] Pre-allocated buffers: %.2f MB (%.2f GB)\n",
+                vt_total / (1024.0*1024.0), vt_total / (1024.0*1024.0*1024.0));
+    }
 
     // ========== GRAND TOTAL CALCULATION ==========
     size_t chain_bt_input = dev_mem->d_bt_max_total_n *
@@ -531,6 +566,26 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     if (dev_mem->d_align_task_to_align_id) cudaFree(dev_mem->d_align_task_to_align_id);
     if (dev_mem->d_align_mat) cudaFree(dev_mem->d_align_mat);
     if (dev_mem->d_align_task_counter) cudaFree(dev_mem->d_align_task_counter);
+
+    // Voting pre-allocated buffers
+    if (dev_mem->d_vt_ax)            cudaFree(dev_mem->d_vt_ax);
+    if (dev_mem->d_vt_ay)            cudaFree(dev_mem->d_vt_ay);
+    if (dev_mem->d_vt_bx)            cudaFree(dev_mem->d_vt_bx);
+    if (dev_mem->d_vt_by)            cudaFree(dev_mem->d_vt_by);
+    if (dev_mem->d_vt_mark)          cudaFree(dev_mem->d_vt_mark);
+    if (dev_mem->d_vt_anchor_seg)    cudaFree(dev_mem->d_vt_anchor_seg);
+    if (dev_mem->d_vt_out_pos)       cudaFree(dev_mem->d_vt_out_pos);
+    if (dev_mem->d_vt_votes)         cudaFree(dev_mem->d_vt_votes);
+    if (dev_mem->d_vt_keep_bin)      cudaFree(dev_mem->d_vt_keep_bin);
+    if (dev_mem->d_vt_seg_start)     cudaFree(dev_mem->d_vt_seg_start);
+    if (dev_mem->d_vt_seg_id)        cudaFree(dev_mem->d_vt_seg_id);
+    if (dev_mem->d_vt_seg_cnt_flat)  cudaFree(dev_mem->d_vt_seg_cnt_flat);
+    if (dev_mem->d_vt_bin_off)       cudaFree(dev_mem->d_vt_bin_off);
+    if (dev_mem->d_vt_anchor_off)    cudaFree(dev_mem->d_vt_anchor_off);
+    if (dev_mem->d_vt_ref_min)       cudaFree(dev_mem->d_vt_ref_min);
+    if (dev_mem->d_vt_bin_size)      cudaFree(dev_mem->d_vt_bin_size);
+    if (dev_mem->d_vt_nsegs)         cudaFree(dev_mem->d_vt_nsegs);
+    if (dev_mem->d_vt_ncompact)      cudaFree(dev_mem->d_vt_ncompact);
 
     cudaCheck();
 }

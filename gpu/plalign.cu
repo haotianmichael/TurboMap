@@ -450,7 +450,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *d_mte_q = dev_mem->d_align_mte_q;
     int  *d_task_counter = dev_mem->d_align_task_counter;
     int   n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
-    cudaStream_t align_stream = gpu_get_align_cudastream(stream_id);
+    cudaStream_t align_stream = gpu_get_cudastream(stream_id);
     // P1/P2/P3 device buffers
     uint32_t *d_compact_cigar   = dev_mem->d_align_compact_cigar;
     uint32_t *d_compact_offsets = dev_mem->d_align_compact_offsets;

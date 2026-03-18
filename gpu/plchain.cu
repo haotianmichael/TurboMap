@@ -179,26 +179,17 @@ int plchain_schedule_stream(const streamSetup_t stream_setup, const int batchid)
 
 /*
  * ════════════════════════════════════════════════════════════════════════
- *  Split-stream pipeline: each slot has TWO CUDA streams:
- *    cudastream       — chain forward DP + backtrack
- *    align_cudastream — alignment (ksw persistent kernel)
+ *  Unified-stream pipeline: ALL ops (chain → backtrack → align) run on
+ *  a single cudastream per stream slot.  Two slots alternate so that
+ *  stream[0] GPU work overlaps with stream[1] GPU work.
  *
- *  Two slots × 2 streams = 4 CUDA streams total.  This lets:
- *    - slot[0] alignment overlap with slot[1] chain/backtrack
- *    - slot[1] alignment overlap with slot[0] chain/backtrack
- *
- *    slot[0].chain:  [chain_0][bt_0]                    [chain_2][bt_2]
- *    slot[0].align:            [align_0]                          [align_2]
- *    slot[1].chain:       [chain_1][bt_1]                    [chain_3]
- *    slot[1].align:                [align_1]                          ...
- *
- *  The ksw persistent kernel uses ~80% of SMs (Plan D), leaving 20%
- *  for the other slot's chain kernels to run concurrently.
+ *    stream[0]: [chain_0][bt_0][align_0]          [chain_2][bt_2][align_2] ...
+ *    stream[1]:          [chain_1][bt_1][align_1]          [chain_3] ...
  *
  *  Per cycle in map.c gpu_batch_consumer:
- *    1. Dispatch batch B_N to slot[N%2] (async launch on cudastream)
- *    2. Drain slot[(N-1)%2] results (sync + CPU post-processing)
- *    → GPU on all streams can overlap.
+ *    1. Dispatch batch B_N to stream[N%2] (async launch)
+ *    2. Drain stream[(N-1)%2] results (sync + CPU post-processing)
+ *    → GPU on both streams can overlap.
  * ════════════════════════════════════════════════════════════════════════
  */
 
@@ -422,14 +413,6 @@ deviceMemPtr* gpu_get_dev_mem(int stream_id) {
 
 cudaStream_t gpu_get_cudastream(int stream_id) {
     return stream_setup.streams[stream_id].cudastream;
-}
-
-cudaStream_t gpu_get_align_cudastream(int stream_id) {
-    return stream_setup.streams[stream_id].align_cudastream;
-}
-
-cudaEvent_t gpu_get_bt_done_event(int stream_id) {
-    return stream_setup.streams[stream_id].bt_done_event;
 }
 
 void init_stream_gpu(size_t *total_n, int *max_reads, int *min_n, char gpu_config_file[], Misc misc) {

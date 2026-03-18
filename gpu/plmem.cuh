@@ -241,10 +241,8 @@ typedef struct stream_ptr_t{
     int cur_hm = 0;  // unused, kept for ABI compat
     longMemPtr long_mem;
     deviceMemPtr dev_mem;
-    cudaStream_t cudastream;       // chain + backtrack stream
-    cudaStream_t align_cudastream; // dedicated alignment stream (Plan A)
+    cudaStream_t cudastream;
     cudaEvent_t stopevent, startevent;
-    cudaEvent_t bt_done_event;     // recorded after backtrack D2H; align stream waits on this
     bool busy = false;
 } stream_ptr_t;
 
@@ -263,8 +261,6 @@ extern "C" {
 #endif
 deviceMemPtr* gpu_get_dev_mem(int stream_id);
 cudaStream_t  gpu_get_cudastream(int stream_id);
-cudaStream_t  gpu_get_align_cudastream(int stream_id);
-cudaEvent_t   gpu_get_bt_done_event(int stream_id);
 #ifdef __cplusplus
 }
 #endif

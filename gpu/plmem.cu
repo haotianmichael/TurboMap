@@ -400,7 +400,13 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
     cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
 
-    // Persistent kernel: atomic task counter (n_concurrent_blocks already computed above)
+    // Persistent kernel: atomic task counter + concurrent block count
+    // V100: 80 SMs x 32 blocks/SM (with 3072 bytes smem) = 2560 concurrent blocks
+    // Use query to get actual SM count for portability
+    int numSMs = 0;
+    cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
+    int max_blocks_per_sm = 32;  // limited by shared memory (3072 bytes/block, 98304/SM)
+    dev_mem->n_align_concurrent_blocks = numSMs * max_blocks_per_sm;
     cudaMalloc(&dev_mem->d_align_task_counter, sizeof(int));
 
     // Calculate total memory allocated for alignment backtrack
@@ -1035,10 +1041,8 @@ void plmem_stream_initialize(size_t *max_total_n_,
     for (int i = 0; i < num_stream; i++) {
         stream_setup.streams[i].busy = false;
         cudaStreamCreate(&stream_setup.streams[i].cudastream);
-        cudaStreamCreate(&stream_setup.streams[i].align_cudastream);
         cudaEventCreate(&stream_setup.streams[i].stopevent);
         cudaEventCreate(&stream_setup.streams[i].startevent);
-        cudaEventCreate(&stream_setup.streams[i].bt_done_event);
         cudaCheck();
         stream_setup.streams[i].dev_mem.buffer_size_long = long_seg_buffer_size;
         // one stream has multiple host mems
@@ -1072,16 +1076,13 @@ void plmem_stream_cleanup() {
     // Synchronize all streams before cleanup to ensure all GPU operations are complete
     for (int i = 0; i < stream_setup.num_stream; i++) {
         cudaStreamSynchronize(stream_setup.streams[i].cudastream);
-        cudaStreamSynchronize(stream_setup.streams[i].align_cudastream);
     }
     cudaDeviceSynchronize();
     cudaCheck();
     for (int i = 0; i < stream_setup.num_stream; i++) {
         cudaStreamDestroy(stream_setup.streams[i].cudastream);
-        cudaStreamDestroy(stream_setup.streams[i].align_cudastream);
         cudaEventDestroy(stream_setup.streams[i].stopevent);
         cudaEventDestroy(stream_setup.streams[i].startevent);
-        cudaEventDestroy(stream_setup.streams[i].bt_done_event);
         cudaCheck();
         // free multiple host mems
         for (int j = 0; j < score_kernel_config.micro_batch; j++) {

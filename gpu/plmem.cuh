@@ -88,8 +88,8 @@ typedef struct {
     seg_t *d_mid_seg;               // private to micro batch
 
     // long segement buffer
-    unsigned *d_map;            // lazily allocated in sync_chain_impl (grow-only)
-    size_t d_map_capacity;      // current capacity in elements (0 = not yet allocated)
+    unsigned *d_map;            // pre-allocated in plmem.cu (max_long_segs elements)
+    size_t d_map_capacity;      // capacity in elements
     int32_t *d_ax_long, *d_ay_long;
     int8_t *d_sid_long;
     int32_t *d_range_long;

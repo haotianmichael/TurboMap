@@ -296,13 +296,7 @@ static void sync_chain_impl(stream_ptr_t *sp) {
     pairsort(long_segs_og, map, num_long_seg);
     free(long_segs_og);
 
-    // Lazy grow-only d_map: only realloc when current buffer is too small.
-    // After the first call stabilizes, no further cudaMalloc/cudaFree occur.
-    if (num_long_seg > dev_mem->d_map_capacity) {
-        if (dev_mem->d_map) cudaFree(dev_mem->d_map);
-        cudaMalloc(&dev_mem->d_map, sizeof(unsigned) * num_long_seg);
-        dev_mem->d_map_capacity = num_long_seg;
-    }
+    // d_map is pre-allocated in plmem.cu with capacity = max_long_segs
     if (num_long_seg > 0) {
         cudaMemcpyAsync(dev_mem->d_map, map, sizeof(unsigned) * num_long_seg,
                         cudaMemcpyHostToDevice, cudastream);

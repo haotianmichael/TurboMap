@@ -132,11 +132,13 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     cudaMalloc(&dev_mem->d_long_seg_count, sizeof(unsigned int));
     cudaMalloc(&dev_mem->d_long_seg, long_seg_size);
     cudaMalloc(&dev_mem->d_long_seg_og, long_seg_size);
-    dev_mem->d_map = NULL;          // lazily allocated in sync_chain_impl
-    dev_mem->d_map_capacity = 0;
+    size_t max_long_segs = dev_mem->buffer_size_long / (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit);
+    size_t d_map_size = max_long_segs * sizeof(unsigned);
+    cudaMalloc(&dev_mem->d_map, d_map_size);
+    dev_mem->d_map_capacity = max_long_segs;
     cudaMalloc(&dev_mem->d_mid_seg_count, sizeof(unsigned int));
     cudaMalloc(&dev_mem->d_mid_seg, mid_seg_size);
-    fprintf(stderr, " [Chain] Total Cut buffers: %.2f MB\n", (idx_total + cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) / (1024.0*1024.0));
+    fprintf(stderr, " [Chain] Total Cut buffers: %.2f MB\n", (idx_total + cut_size + 2*long_seg_size + d_map_size + mid_seg_size + 2*sizeof(unsigned int)) / (1024.0*1024.0));
 
     // long seg buffer
     size_t long_ax_size = dev_mem->buffer_size_long * sizeof(int32_t);
@@ -148,7 +150,6 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     size_t long_total = long_ax_size + long_ay_size + long_sid_size + long_range_size +
                         long_f_size + long_p_size + sizeof(size_t);
 
-    dev_mem->d_map = nullptr;  // initialized per-batch in plchain_cal_score_async
     cudaMalloc(&dev_mem->d_ax_long, long_ax_size);
     cudaMalloc(&dev_mem->d_ay_long, long_ay_size);
     cudaMalloc(&dev_mem->d_sid_long, long_sid_size);
@@ -401,13 +402,20 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
     // Persistent kernel: atomic task counter
     cudaMalloc(&dev_mem->d_align_task_counter, sizeof(int));
 
-    // Calculate total memory allocated for alignment backtrack
+    // Calculate total memory allocated for alignment backtrack + results
     size_t bck_total = bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes +
                          cigar_buf_bytes + cigar_len_bytes +
-                         dev_mem->max_align_tasks * sizeof(int32_t) * 4 +  // scores, ends, and task mapping
-                         sizeof(gasal_res_t) + sizeof(ksw_extz_t) * alloc_slots + 25;  // 25 bytes for d_align_mat
+                         cigar_buf_bytes +  // compact_cigar (same size)
+                         (dev_mem->max_align_tasks + 1) * sizeof(uint32_t) +  // compact_offsets
+                         dev_mem->align_cub_tmp_size +  // CUB temp
+                         stats_bytes * 5 +  // blen, mlen, n_ambi, dp_max, gpu_stats_valid
+                         sizeof(gasal_res_t) +  // device_res
+                         sizeof(ksw_extz_t) * short_task_batch_size +  // ez_array
+                         dev_mem->max_align_tasks * sizeof(int32_t) * 8 +  // scores, query_ends, target_ends, mqe, mqe_t, mte, mte_q, task_to_align_id
+                         25 * sizeof(int8_t) +  // d_align_mat
+                         sizeof(int);  // d_align_task_counter
 
-    fprintf(stderr, " [Align] Total BackTrack buffers: %.2f GB\n", bck_total / (1024.0*1024.0*1024.0));
+    fprintf(stderr, " [Align] Total BackTrack+Result buffers: %.2f GB\n", bck_total / (1024.0*1024.0*1024.0));
 
     // ========== Voting Pre-allocated Buffers ==========
     // Sized by bt_anchor_total (= anchor_per_batch × micro_batch).
@@ -445,33 +453,34 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int
                         + vt_r * 6 * sizeof(int32_t);
         fprintf(stderr, " [Voting] Pre-allocated buffers: %.2f MB (%.2f GB)\n",
                 vt_total / (1024.0*1024.0), vt_total / (1024.0*1024.0*1024.0));
+
+        // ========== GRAND TOTAL CALCULATION ==========
+        size_t chain_bt_input = dev_mem->d_bt_max_total_n *
+                                (4*sizeof(int32_t) + sizeof(int32_t) + sizeof(uint16_t));
+        size_t chain_bt_work  = dev_mem->d_bt_max_total_n *
+                                (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
+                              + dev_mem->d_bt_max_n_reads * 6 * sizeof(int)
+                              + dev_mem->d_bt_cub_tmp_size;
+        size_t chain_bt_total = chain_bt_input + chain_bt_work;
+
+        size_t cut_total = idx_total + cut_size + 2*long_seg_size + d_map_size + mid_seg_size + 2*sizeof(unsigned int);
+        size_t chain_total_all = chain_total + cut_total + long_total + chain_bt_total;
+
+        size_t align_dp_total = (seq_unpacked_size*2 + seq_packed_size*2 +
+                                 metadata_size*5 + global_buffer_bytes + ksw_temp_bytes);
+        size_t align_total_all = align_dp_total + bck_total;
+
+        size_t grand_total = chain_total_all + align_total_all + vt_total;
+
+        fprintf(stderr, " [Chain] Total:       %8.2f MB (%.2f GB)\n",
+                chain_total_all / (1024.0*1024.0), chain_total_all / (1024.0*1024.0*1024.0));
+        fprintf(stderr, " [Align] Total:       %8.2f MB (%.2f GB)\n",
+                align_total_all / (1024.0*1024.0), align_total_all / (1024.0*1024.0*1024.0));
+        fprintf(stderr, " [Voting] Total:      %8.2f MB (%.2f GB)\n",
+                vt_total / (1024.0*1024.0), vt_total / (1024.0*1024.0*1024.0));
+        fprintf(stderr, "[Info] TurboMap Total GPU Memory: %.2f MB (%.2f GB)\n",
+                grand_total / (1024.0*1024.0), grand_total / (1024.0*1024.0*1024.0));
     }
-
-    // ========== GRAND TOTAL CALCULATION ==========
-    size_t chain_bt_input = dev_mem->d_bt_max_total_n *
-                            (4*sizeof(int32_t) + sizeof(int32_t) + sizeof(uint16_t));
-    size_t chain_bt_work  = dev_mem->d_bt_max_total_n *
-                            (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
-                          + dev_mem->d_bt_max_n_reads * 6 * sizeof(int)
-                          + dev_mem->d_bt_cub_tmp_size;
-    size_t chain_bt_total = chain_bt_input + chain_bt_work;
-
-    size_t chain_total_all = chain_total +
-                             (idx_total + cut_size + 2*long_seg_size + mid_seg_size + 2*sizeof(unsigned int)) +
-                             long_total + chain_bt_total;
-
-    size_t align_dp_total = (seq_unpacked_size*2 + seq_packed_size*2 +
-                             metadata_size*5 + global_buffer_bytes + ksw_temp_bytes);
-    size_t align_total_all = align_dp_total + bck_total;
-
-    size_t grand_total = chain_total_all + align_total_all;
-
-    fprintf(stderr, " [Chain] Total:       %8.2f MB (%.2f GB)\n",
-            chain_total_all / (1024.0*1024.0), chain_total_all / (1024.0*1024.0*1024.0));
-    fprintf(stderr, " [Align] Total:       %8.2f MB (%.2f GB)\n",
-            align_total_all / (1024.0*1024.0), align_total_all / (1024.0*1024.0*1024.0));
-    fprintf(stderr, "[Info] TurboMap Total GPU Memory: %.2f MB (%.2f GB)\n",
-            grand_total / (1024.0*1024.0), grand_total / (1024.0*1024.0*1024.0));
 
     cudaCheck();
 }
@@ -498,7 +507,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFree(dev_mem->d_mid_seg);
     cudaFree(dev_mem->d_mid_seg_count);
 
-    if (dev_mem->d_map) cudaFree(dev_mem->d_map);
+    cudaFree(dev_mem->d_map);
     cudaFree(dev_mem->d_ax_long);
     cudaFree(dev_mem->d_ay_long);
     cudaFree(dev_mem->d_sid_long);

@@ -1,12 +1,12 @@
 {
-    "num_streams": 2,
-    "//num_streams": "Number of independent GPU streams for task parallelism. Each stream has its own buffers.",
-    "min_n": 512, 
+    "num_streams": 1,
+    "//num_streams": "Single GPU stream — all 48GB VRAM used by one stream.",
+    "min_n": 512,
     "//min_n": "queries with less anchors will be handled on cpu",
-    "long_seg_buffer_size": 50000000,
+    "long_seg_buffer_size": 90000000,
     "//long_seg_buffer_size": "maximum number of anchors to fit in the aggregated long segment buffer. ",
-    "max_total_n": 25000000,
-    "max_read": 25000,
+    "max_total_n": 45000000,
+    "max_read": 45000,
      "//max_total_n, max_read": "maximum number of anchors / reads to fit in one micro batch. Make sure this fits in the device memory.",
     "range_kernel": {
         "blockdim": 512,

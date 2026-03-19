@@ -2176,7 +2176,6 @@ static void* drain_worker_fn(void *arg) {
 static void* gpu_batch_consumer(void *data) {
     step_t *s = (step_t*)data;
     mm_tbuf_t *b = s->buf[0];
-    const int num_streams = gpu_get_num_streams();
 
     #define INIT_BATCH(b_, id_) do { \
         (b_).km = km_init(); \
@@ -2187,70 +2186,58 @@ static void* gpu_batch_consumer(void *data) {
         (b_).batchid = (id_); \
     } while (0)
 
-    gpu_stream_slot_t *slots = (gpu_stream_slot_t*)calloc(num_streams, sizeof(gpu_stream_slot_t));
-    drain_worker_ctx_t *worker_ctxs = (drain_worker_ctx_t*)calloc(num_streams, sizeof(drain_worker_ctx_t));
+    // Single stream slot (stream 0)
+    gpu_stream_slot_t slot;
+    memset(&slot, 0, sizeof(slot));
+    INIT_BATCH(slot.batch, 0);
+    INIT_BATCH(slot.fallback_batch, -1);
+    slot.batch_max_reads = s->batch_max_reads;
+    pthread_mutex_init(&slot.mutex, NULL);
+    pthread_cond_init(&slot.cond_work, NULL);
+    pthread_cond_init(&slot.cond_done, NULL);
 
-    for (int i = 0; i < num_streams; i++) {
-        INIT_BATCH(slots[i].batch, i);
-        INIT_BATCH(slots[i].fallback_batch, -1);
-        slots[i].busy = 0;
-        slots[i].work_ready = 0;
-        slots[i].drain_done = 0;
-        slots[i].shutdown = 0;
-        slots[i].batch_max_reads = s->batch_max_reads;
-        pthread_mutex_init(&slots[i].mutex, NULL);
-        pthread_cond_init(&slots[i].cond_work, NULL);
-        pthread_cond_init(&slots[i].cond_done, NULL);
-
-        // Pre-allocate per-thread resources for CPU fallback chain
-        slots[i].n_fb_threads = s->p->n_threads;
-        slots[i].fb_tbufs = (mm_tbuf_t**)calloc(s->p->n_threads, sizeof(mm_tbuf_t*));
-        slots[i].fb_kms   = (void**)calloc(s->p->n_threads, sizeof(void*));
-        for (int t = 0; t < s->p->n_threads; t++) {
-            slots[i].fb_tbufs[t] = mm_tbuf_init();
-            slots[i].fb_kms[t]   = km_init();
-        }
-
-        worker_ctxs[i].s = s;
-        worker_ctxs[i].slot = &slots[i];
-        worker_ctxs[i].stream_id = i;
+    // Pre-allocate per-thread resources for CPU fallback chain
+    slot.n_fb_threads = s->p->n_threads;
+    slot.fb_tbufs = (mm_tbuf_t**)calloc(s->p->n_threads, sizeof(mm_tbuf_t*));
+    slot.fb_kms   = (void**)calloc(s->p->n_threads, sizeof(void*));
+    for (int t = 0; t < s->p->n_threads; t++) {
+        slot.fb_tbufs[t] = mm_tbuf_init();
+        slot.fb_kms[t]   = km_init();
     }
+
+    drain_worker_ctx_t worker_ctx;
+    worker_ctx.s = s;
+    worker_ctx.slot = &slot;
+    worker_ctx.stream_id = 0;
 
     mm_batch_trbuf_t acc_batch;
     INIT_BATCH(acc_batch, -1);
     #undef INIT_BATCH
 
-    // ── Start drain worker threads ───────────────────────────────────────
-    for (int i = 0; i < num_streams; i++) {
-        pthread_create(&slots[i].thread, NULL, drain_worker_fn, &worker_ctxs[i]);
-    }
+    // Start single drain worker thread
+    pthread_create(&slot.thread, NULL, drain_worker_fn, &worker_ctx);
 
-    // Helper: signal a worker to start draining, non-blocking
-    #define SIGNAL_DRAIN(sid) do { \
-        gpu_stream_slot_t *ss_ = &slots[(sid)]; \
-        pthread_mutex_lock(&ss_->mutex); \
-        ss_->work_ready = 1; \
-        ss_->drain_done = 0; \
-        pthread_cond_signal(&ss_->cond_work); \
-        pthread_mutex_unlock(&ss_->mutex); \
+    #define SIGNAL_DRAIN() do { \
+        pthread_mutex_lock(&slot.mutex); \
+        slot.work_ready = 1; \
+        slot.drain_done = 0; \
+        pthread_cond_signal(&slot.cond_work); \
+        pthread_mutex_unlock(&slot.mutex); \
     } while (0)
 
-    // Helper: wait for a worker to finish draining
-    #define WAIT_DRAIN(sid) do { \
-        gpu_stream_slot_t *ss_ = &slots[(sid)]; \
-        pthread_mutex_lock(&ss_->mutex); \
-        while (!ss_->drain_done) \
-            pthread_cond_wait(&ss_->cond_done, &ss_->mutex); \
-        ss_->drain_done = 0; \
-        pthread_mutex_unlock(&ss_->mutex); \
+    #define WAIT_DRAIN() do { \
+        pthread_mutex_lock(&slot.mutex); \
+        while (!slot.drain_done) \
+            pthread_cond_wait(&slot.cond_done, &slot.mutex); \
+        slot.drain_done = 0; \
+        pthread_mutex_unlock(&slot.mutex); \
     } while (0)
 
-    int next_stream = 0;   // round-robin stream selection
     int queue_finished = 0;
     int is_full = 0;
     chain_read_t read;
 
-    // ── Main loop ────────────────────────────────────────────────────────
+    // ── Main loop: accumulate → launch → drain → repeat ──────────────────
     while (1) {
         // Step 1: Pop reads and accumulate into acc_batch
         if (!queue_finished) {
@@ -2290,64 +2277,47 @@ static void* gpu_batch_consumer(void *data) {
             }
         }
 
-        // Step 2: When batch is full, dispatch to the next stream
+        // Step 2: When batch is full, dispatch to stream 0
         if (is_full && acc_batch.count > 0) {
-            int sid = next_stream;
-            gpu_stream_slot_t *slot = &slots[sid];
-
-            // If this stream is busy, wait for its drain worker to finish
-            if (slot->busy) {
-                WAIT_DRAIN(sid);
+            // If stream is busy, wait for drain to finish
+            if (slot.busy) {
+                WAIT_DRAIN();
             }
 
             if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                fprintf(stderr, "LAUNCH_CHAIN(stream=%d): count=%d, total_n=%zu\n",
-                        sid, acc_batch.count, acc_batch.total_n);
+                fprintf(stderr, "LAUNCH_CHAIN(stream=0): count=%d, total_n=%zu\n",
+                        acc_batch.count, acc_batch.total_n);
 
-            // Launch chain on this stream (async)
-            int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count, sid);
+            // Launch chain on stream 0 (async)
+            int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count, 0);
 
-            // Defer overflow reads to this stream's fallback batch
+            // Defer overflow reads to fallback batch
             if (overflow > 0) {
                 int fit = acc_batch.count - overflow;
                 for (int r_ = fit; r_ < acc_batch.count; r_++) {
-                    fprintf(stderr, "[INFO] Deferring read %d to stream %d fallback\n", r_, sid);
-                    deep_copy_read_to_batch(&slot->fallback_batch, &acc_batch.reads[r_], s->p->opt);
+                    fprintf(stderr, "[INFO] Deferring read %d to fallback\n", r_);
+                    deep_copy_read_to_batch(&slot.fallback_batch, &acc_batch.reads[r_], s->p->opt);
                 }
                 acc_batch.count = fit;
             }
 
-            // Move acc_batch into the stream slot, give slot's old batch to acc
-            mm_batch_trbuf_t tmp = slot->batch;
-            slot->batch = acc_batch;
+            // Swap acc_batch into slot, reuse slot's old batch for next accumulation
+            mm_batch_trbuf_t tmp = slot.batch;
+            slot.batch = acc_batch;
             acc_batch = tmp;
             acc_batch.count = 0;
             acc_batch.total_n = 0;
-            slot->busy = 1;
+            slot.busy = 1;
 
-            // Signal worker thread to start draining (non-blocking!)
-            // This is the key: main thread returns to accumulating while worker drains.
-            SIGNAL_DRAIN(sid);
-
-            next_stream = (next_stream + 1) % num_streams;
+            // Signal worker thread to drain (non-blocking)
+            SIGNAL_DRAIN();
             is_full = 0;
         }
 
-        // Step 3: When queue is done and nothing to accumulate, drain all streams
+        // Step 3: Queue done, drain remaining
         if (queue_finished && acc_batch.count == 0) {
-            // Signal all busy streams to drain (they run in parallel!)
-            for (int i = 0; i < num_streams; i++) {
-                int sid = (next_stream + i) % num_streams;
-                if (slots[sid].busy) {
-                    // Already signaled when launched — just wait
-                }
-            }
-            // Wait for all to finish
-            for (int i = 0; i < num_streams; i++) {
-                int sid = (next_stream + i) % num_streams;
-                if (slots[sid].busy) {
-                    WAIT_DRAIN(sid);
-                }
+            if (slot.busy) {
+                WAIT_DRAIN();
             }
             break;
         }
@@ -2356,41 +2326,29 @@ static void* gpu_batch_consumer(void *data) {
     #undef SIGNAL_DRAIN
     #undef WAIT_DRAIN
 
-    // ── Shutdown drain workers ───────────────────────────────────────────
-    for (int i = 0; i < num_streams; i++) {
-        pthread_mutex_lock(&slots[i].mutex);
-        slots[i].shutdown = 1;
-        pthread_cond_signal(&slots[i].cond_work);
-        pthread_mutex_unlock(&slots[i].mutex);
-    }
-    for (int i = 0; i < num_streams; i++) {
-        pthread_join(slots[i].thread, NULL);
-    }
-
-    // Fallback reads are now processed inline in drain_worker_fn (step 6)
-    // using multi-threaded CPU chain — no deferred processing needed here.
+    // Shutdown drain worker
+    pthread_mutex_lock(&slot.mutex);
+    slot.shutdown = 1;
+    pthread_cond_signal(&slot.cond_work);
+    pthread_mutex_unlock(&slot.mutex);
+    pthread_join(slot.thread, NULL);
 
     // Cleanup
     mm_trbuf_batch_reset(&acc_batch, s->batch_max_reads, s->p->opt);
-    for (int i = 0; i < num_streams; i++) {
-        mm_trbuf_batch_reset(&slots[i].batch, s->batch_max_reads, s->p->opt);
-        free(slots[i].batch.reads);
-        km_destroy(slots[i].batch.km);
-        free(slots[i].fallback_batch.reads);
-        km_destroy(slots[i].fallback_batch.km);
-        // Destroy pre-allocated per-thread fallback resources
-        for (int t = 0; t < slots[i].n_fb_threads; t++) {
-            mm_tbuf_destroy(slots[i].fb_tbufs[t]);
-            km_destroy(slots[i].fb_kms[t]);
-        }
-        free(slots[i].fb_tbufs);
-        free(slots[i].fb_kms);
-        pthread_mutex_destroy(&slots[i].mutex);
-        pthread_cond_destroy(&slots[i].cond_work);
-        pthread_cond_destroy(&slots[i].cond_done);
+    mm_trbuf_batch_reset(&slot.batch, s->batch_max_reads, s->p->opt);
+    free(slot.batch.reads);
+    km_destroy(slot.batch.km);
+    free(slot.fallback_batch.reads);
+    km_destroy(slot.fallback_batch.km);
+    for (int t = 0; t < slot.n_fb_threads; t++) {
+        mm_tbuf_destroy(slot.fb_tbufs[t]);
+        km_destroy(slot.fb_kms[t]);
     }
-    free(slots);
-    free(worker_ctxs);
+    free(slot.fb_tbufs);
+    free(slot.fb_kms);
+    pthread_mutex_destroy(&slot.mutex);
+    pthread_cond_destroy(&slot.cond_work);
+    pthread_cond_destroy(&slot.cond_done);
 
     free(acc_batch.reads);
 

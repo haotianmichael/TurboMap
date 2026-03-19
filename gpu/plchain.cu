@@ -179,17 +179,17 @@ int plchain_schedule_stream(const streamSetup_t stream_setup, const int batchid)
 
 /*
  * ════════════════════════════════════════════════════════════════════════
- *  Unified-stream pipeline: ALL ops (chain → backtrack → align) run on
- *  a single cudastream per stream slot.  Two slots alternate so that
- *  stream[0] GPU work overlaps with stream[1] GPU work.
+ *  Single-stream pipeline: ALL ops (chain → backtrack → align) run on
+ *  one cudastream (stream 0).  Main thread accumulates next batch while
+ *  drain worker processes current batch on GPU.
  *
- *    stream[0]: [chain_0][bt_0][align_0]          [chain_2][bt_2][align_2] ...
- *    stream[1]:          [chain_1][bt_1][align_1]          [chain_3] ...
+ *    stream[0]: [chain_0][bt_0][align_0][chain_1][bt_1][align_1] ...
  *
  *  Per cycle in map.c gpu_batch_consumer:
- *    1. Dispatch batch B_N to stream[N%2] (async launch)
- *    2. Drain stream[(N-1)%2] results (sync + CPU post-processing)
- *    → GPU on both streams can overlap.
+ *    1. Accumulate reads from seeded queue
+ *    2. Wait for previous drain to finish (if busy)
+ *    3. Launch chain async, signal drain worker
+ *    4. Drain worker: sync chain → backtrack → align
  * ════════════════════════════════════════════════════════════════════════
  */
 

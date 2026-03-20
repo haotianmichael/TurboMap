@@ -232,6 +232,14 @@ typedef struct {
     int32_t  *d_vt_nsegs;            // segments per group
     int32_t  *d_vt_ncompact;         // compacted anchors per group
 
+    // ========== Deferred D2H metadata (backtrack → voting fusion) ==========
+    // Set by plbacktrack_gpu, freed by plbacktrack_d2h_finish.
+    // Allows anchor data to stay on GPU between backtrack and voting stages.
+    int       bt_n_reads;            // reads in current batch
+    size_t    bt_total_n;            // total anchors (pre-backtrack count, array capacity)
+    int      *bt_h_offset;           // host: per-read offset in d_bt_*_out
+    int      *bt_h_n_u;              // host: chains per read
+
 } deviceMemPtr;
 
 typedef struct stream_ptr_t{

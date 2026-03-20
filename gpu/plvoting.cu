@@ -38,6 +38,8 @@
 #include "kalloc.h"
 #include "hipify.cuh"
 #include "plvoting.cuh"
+#include "plbacktrack.cuh"
+#include <cub/cub.cuh>
 
 /* 8 GB GPU memory budget per mini-batch for voting arrays */
 #define MEM_BUDGET_BYTES (8ULL << 30)
@@ -266,6 +268,44 @@ __global__ void scatter_compact_kernel_batched(
 }
 
 /* =========================================================================
+ * Repack kernel: gather int32 components from backtrack output into
+ * contiguous uint64 arrays suitable for voting.
+ *
+ * For each rechain read r (0..n_reads-1), copies its anchors from scattered
+ * backtrack output (at d_bt_*_out[src_off[r]]) into contiguous positions
+ * (at d_key[dst_off[r]]).
+ *
+ *   d_key[dst] = ((uint64_t)xrev[src] << 32) | (uint32_t)ax[src]
+ *   d_val[dst] = ((uint64_t)yrev[src] << 32) | (uint32_t)ay[src]
+ * ========================================================================= */
+__global__ void repack_bt_to_uint64_kernel(
+    const int32_t *d_ax_out,  const int32_t *d_ay_out,
+    const int32_t *d_xrev_out, const int32_t *d_yrev_out,
+    uint64_t      *d_key,      uint64_t      *d_val,
+    const int32_t *d_src_off,  /* [n_reads] offset in d_bt_*_out */
+    const int32_t *d_dst_off,  /* [n_reads+1] contiguous dest offset */
+    int            n_reads,
+    int            total_out)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= total_out) return;
+
+    /* binary search: find which read this output element belongs to */
+    int lo = 0, hi = n_reads - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (d_dst_off[mid] <= tid) lo = mid;
+        else hi = mid - 1;
+    }
+    int r = lo;
+    int local_idx = tid - d_dst_off[r];
+    int src = d_src_off[r] + local_idx;
+
+    d_key[tid] = ((uint64_t)(uint32_t)d_xrev_out[src] << 32) | (uint32_t)d_ax_out[src];
+    d_val[tid] = ((uint64_t)(uint32_t)d_yrev_out[src] << 32) | (uint32_t)d_ay_out[src];
+}
+
+/* =========================================================================
  * run_voting_minibatch – executes steps 1-7 for one mini-batch, then D2H
  * =========================================================================
  *
@@ -419,6 +459,109 @@ static void run_voting_minibatch(
         }
     }
     /* No cudaFree — all device buffers are pre-allocated and reused. */
+}
+
+/*
+ * run_voting_minibatch_device – same pipeline as run_voting_minibatch but
+ * reads anchor data from DEVICE pointers (d_src_ax, d_src_ay) instead of
+ * H2D from host.  Used by the fused backtrack→voting path.
+ */
+static void run_voting_minibatch_device(
+        int             mb_n,
+        int32_t         mb_total_anchors,
+        int32_t         mb_total_bins,
+        const uint64_t *d_src_ax,       /* device: sorted anchor x for this mini-batch */
+        const uint64_t *d_src_ay,       /* device: sorted anchor y for this mini-batch */
+        const int32_t  *mb_bin_off,     /* host: [mb_n+1] */
+        const int32_t  *mb_anchor_off,  /* host: [mb_n+1] */
+        const int32_t  *mb_ref_min,     /* host: [mb_n]   */
+        const int32_t  *mb_bin_size_h,  /* host: [mb_n]   */
+        int32_t         min_votes,
+        int32_t         merge_gap_bins,
+        cudaStream_t    stream,
+        deviceMemPtr   *dev_mem,
+        /* output slices (host) */
+        uint64_t       *h_bx_base,
+        uint64_t       *h_by_base,
+        int32_t        *h_nsegs_base,
+        int32_t        *h_ncompact_base,
+        int32_t        *h_seg_cnt_flat_base)
+{
+    const int blk = 256;
+
+    /* Use pre-allocated device buffers */
+    uint64_t *d_ax           = dev_mem->d_vt_ax;
+    uint64_t *d_ay           = dev_mem->d_vt_ay;
+    int32_t  *d_bin_off_d    = dev_mem->d_vt_bin_off;
+    int32_t  *d_anchor_off_d = dev_mem->d_vt_anchor_off;
+    int32_t  *d_ref_min_d    = dev_mem->d_vt_ref_min;
+    int32_t  *d_bin_size_d   = dev_mem->d_vt_bin_size;
+    int32_t  *d_votes        = dev_mem->d_vt_votes;
+    int8_t   *d_keep_bin     = dev_mem->d_vt_keep_bin;
+    int32_t  *d_seg_start    = dev_mem->d_vt_seg_start;
+    int32_t  *d_seg_id       = dev_mem->d_vt_seg_id;
+    int32_t  *d_nsegs_d      = dev_mem->d_vt_nsegs;
+    int32_t  *d_ncompact_d   = dev_mem->d_vt_ncompact;
+    int32_t  *d_mark         = dev_mem->d_vt_mark;
+    int32_t  *d_anchor_seg   = dev_mem->d_vt_anchor_seg;
+    int32_t  *d_out_pos      = dev_mem->d_vt_out_pos;
+    uint64_t *d_bx           = dev_mem->d_vt_bx;
+    uint64_t *d_by           = dev_mem->d_vt_by;
+    int32_t  *d_seg_cnt_flat_d = dev_mem->d_vt_seg_cnt_flat;
+
+    /* ---- D2D copy anchors from sorted buffer into d_vt_ax/d_vt_ay ---- */
+    /* Skip copy if source and destination are the same (first mini-batch with offset 0) */
+    if (d_src_ax != d_ax)
+        cudaMemcpyAsync(d_ax, d_src_ax, (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream);
+    if (d_src_ay != d_ay)
+        cudaMemcpyAsync(d_ay, d_src_ay, (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToDevice, stream);
+
+    /* ---- upload metadata (small, from host) ---- */
+    cudaMemcpyAsync(d_bin_off_d,    mb_bin_off,      (size_t)(mb_n + 1)       * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_anchor_off_d, mb_anchor_off,   (size_t)(mb_n + 1)       * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_ref_min_d,    mb_ref_min,      (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_bin_size_d,   mb_bin_size_h,   (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyHostToDevice, stream);
+
+    /* ---- zero buffers ---- */
+    cudaMemsetAsync(d_votes,          0, (size_t)mb_total_bins * sizeof(int32_t), stream);
+    cudaMemsetAsync(d_seg_cnt_flat_d, 0, (size_t)mb_total_bins * sizeof(int32_t), stream);
+
+    /* ---- steps 1-7: identical to run_voting_minibatch ---- */
+    { int grd = (mb_total_anchors + blk - 1) / blk;
+      voting_bin_kernel_batched<<<grd, blk, 0, stream>>>(
+          d_ax, d_anchor_off_d, d_bin_off_d, d_ref_min_d, d_bin_size_d,
+          d_votes, mb_n, mb_total_anchors); }
+    { int grd = (mb_total_bins + blk - 1) / blk;
+      mark_dilate_kernel_batched<<<grd, blk, 0, stream>>>(
+          d_votes, d_keep_bin, d_bin_off_d,
+          min_votes, merge_gap_bins, mb_n, mb_total_bins); }
+    { int grd = (mb_total_bins + blk - 1) / blk;
+      seg_start_kernel_batched<<<grd, blk, 0, stream>>>(
+          d_keep_bin, d_seg_start, d_bin_off_d, mb_n, mb_total_bins); }
+    { int grd = (mb_n + blk - 1) / blk;
+      seg_incl_sum_kernel<<<grd, blk, 0, stream>>>(
+          d_seg_start, d_seg_id, d_bin_off_d, d_nsegs_d, mb_n); }
+    { int grd = (mb_total_anchors + blk - 1) / blk;
+      tag_mark_kernel_batched<<<grd, blk, 0, stream>>>(
+          d_ax, d_anchor_off_d, d_bin_off_d, d_ref_min_d, d_bin_size_d,
+          d_keep_bin, d_seg_id,
+          d_mark, d_anchor_seg, mb_n, mb_total_anchors); }
+    { int grd = (mb_n + blk - 1) / blk;
+      seg_excl_sum_kernel<<<grd, blk, 0, stream>>>(
+          d_mark, d_out_pos, d_anchor_off_d, d_ncompact_d, mb_n); }
+    { int grd = (mb_total_anchors + blk - 1) / blk;
+      scatter_compact_kernel_batched<<<grd, blk, 0, stream>>>(
+          d_ax, d_ay, d_mark, d_out_pos, d_anchor_seg,
+          d_anchor_off_d, d_bin_off_d,
+          d_bx, d_by, d_seg_cnt_flat_d, mb_n, mb_total_anchors); }
+
+    /* ---- D2H ---- */
+    cudaMemcpyAsync(h_bx_base,            d_bx,           (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_by_base,            d_by,           (size_t)mb_total_anchors * sizeof(uint64_t), cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_nsegs_base,         d_nsegs_d,      (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_ncompact_base,      d_ncompact_d,   (size_t)mb_n             * sizeof(int32_t),  cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_seg_cnt_flat_base,  d_seg_cnt_flat_d,(size_t)mb_total_bins   * sizeof(int32_t),  cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
 }
 
 /* =========================================================================
@@ -759,6 +902,413 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
     free(h_nsegs); free(h_ncompact); free(h_seg_cnt_flat);
     free(bin_off); free(anchor_off);
     free(vg);
+}
+
+/*
+ * plvoting_rechain_batch_fused
+ *
+ * Fused backtrack→voting path: anchor data stays on GPU between stages.
+ * Replaces prepare_rechain_anchors (host sort) with GPU repack + GPU sort.
+ * Replaces Phase 4 H2D with device-to-device data flow.
+ *
+ * Flow:
+ *   1. GPU repack: int32 (ax,ay,xrev,yrev) from d_bt_*_out → uint64 (x,y)
+ *   2. GPU segmented sort by x (groups anchors by chr then ref_pos)
+ *   3. D2H sorted x values → build VgDesc on CPU (Phase 1)
+ *   4. Phase 2-3: compute offsets, allocate host output (unchanged)
+ *   5. Phase 4: run voting kernels from device data (no H2D)
+ *   6. Phase 5: D2H voting output, build b[]/u[] on CPU (unchanged)
+ */
+void plvoting_rechain_batch_fused(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                                   chain_read_t *reads, int *rechain_indices,
+                                   int n_rechain, Misc misc, void *km,
+                                   cudaStream_t stream, deviceMemPtr *dev_mem)
+{
+    if (n_rechain == 0) return;
+
+    fprintf(stderr, "[DEBUG] plvoting_rechain_batch_fused: n_rechain=%d\n", n_rechain);
+
+    int *h_offset = (int *)dev_mem->bt_h_offset;
+
+    const int32_t max_dist       = (opt->max_gap > 0) ? opt->max_gap : 10000;
+    const int32_t bin_size       = (max_dist / VOTING_BIN_DIVIDER > 0)
+                                    ? (max_dist / VOTING_BIN_DIVIDER) : 1;
+    const int32_t min_votes      = (opt->min_cnt > 1) ? opt->min_cnt : 2;
+    const int32_t merge_gap_bins = (VOTING_LARGE_GAP + bin_size - 1) / bin_size;
+
+    /* ====================================================================
+     * Phase 0: GPU repack + sort (replaces prepare_rechain_anchors)
+     *
+     * For each rechain read, gather its compacted anchors from scattered
+     * d_bt_*_out offsets into contiguous uint64 key/value arrays, then
+     * segmented-sort by key (= x = xrev<<32|ax).
+     * ==================================================================== */
+
+    int32_t total_rechain_n = 0;
+    int32_t *h_src_off = (int32_t *)malloc(n_rechain * sizeof(int32_t));
+    int32_t *h_dst_off = (int32_t *)malloc((n_rechain + 1) * sizeof(int32_t));
+    h_dst_off[0] = 0;
+    for (int i = 0; i < n_rechain; i++) {
+        int idx = rechain_indices[i];
+        h_src_off[i] = (int32_t)h_offset[idx];
+        /* reads[idx].n was set by plbacktrack_gpu to the compacted anchor count */
+        h_dst_off[i + 1] = h_dst_off[i] + (int32_t)reads[idx].n;
+        total_rechain_n += (int32_t)reads[idx].n;
+    }
+
+    if (total_rechain_n == 0) {
+        free(h_src_off); free(h_dst_off);
+        /* Free stale a[]/u[] for rechain reads since they have no anchors */
+        for (int i = 0; i < n_rechain; i++) {
+            int idx = rechain_indices[i];
+            kfree(km, reads[idx].a); reads[idx].a = NULL;
+            kfree(km, reads[idx].u); reads[idx].u = NULL;
+            reads[idx].n = 0; reads[idx].n_u = 0;
+        }
+        return;
+    }
+
+    assert((size_t)total_rechain_n <= dev_mem->d_vt_max_anchors);
+
+    /* Upload offset arrays (reuse d_vt_mark and d_vt_anchor_seg as temp) */
+    int32_t *d_src_off = dev_mem->d_vt_mark;        /* capacity: d_vt_max_anchors >> n_rechain */
+    int32_t *d_dst_off = dev_mem->d_vt_anchor_seg;  /* capacity: d_vt_max_anchors >> n_rechain+1 */
+    cudaMemcpyAsync(d_src_off, h_src_off, n_rechain * sizeof(int32_t),
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_dst_off, h_dst_off, (n_rechain + 1) * sizeof(int32_t),
+                    cudaMemcpyHostToDevice, stream);
+
+    /* Repack kernel: d_bt_*_out → d_vt_bx (key=x), d_vt_by (val=y) */
+    {
+        int blk = 256, grd = (total_rechain_n + blk - 1) / blk;
+        repack_bt_to_uint64_kernel<<<grd, blk, 0, stream>>>(
+            dev_mem->d_bt_ax_out, dev_mem->d_bt_ay_out,
+            dev_mem->d_bt_xrev_out, dev_mem->d_bt_yrev_out,
+            dev_mem->d_vt_bx, dev_mem->d_vt_by,   /* output (unsorted) */
+            d_src_off, d_dst_off,
+            n_rechain, total_rechain_n);
+        cudaCheck();
+    }
+
+    /* Segmented sort by key (x = xrev<<32|ax) → groups by chr, then ref_pos.
+     * Input: d_vt_bx/d_vt_by (unsorted), segments from d_dst_off.
+     * Output: d_vt_ax/d_vt_ay (sorted).
+     * Uses the backtrack CUB temp buffer (same capacity, uint64 vs int64). */
+    {
+        size_t cub_needed = 0;
+        cub::DeviceSegmentedRadixSort::SortPairs(
+            NULL, cub_needed,
+            dev_mem->d_vt_bx, dev_mem->d_vt_ax,
+            dev_mem->d_vt_by, dev_mem->d_vt_ay,
+            total_rechain_n, n_rechain,
+            d_dst_off, d_dst_off + 1,
+            0, 64, stream);
+        assert(cub_needed <= dev_mem->d_bt_cub_tmp_size);
+
+        cub::DeviceSegmentedRadixSort::SortPairs(
+            dev_mem->d_bt_cub_tmp, dev_mem->d_bt_cub_tmp_size,
+            dev_mem->d_vt_bx, dev_mem->d_vt_ax,   /* key in→out */
+            dev_mem->d_vt_by, dev_mem->d_vt_ay,    /* val in→out */
+            total_rechain_n, n_rechain,
+            d_dst_off, d_dst_off + 1,
+            0, 64, stream);
+        cudaCheck();
+    }
+
+    /* D2H sorted x values for VgDesc building on CPU.
+     * Only the x values (xrev + ax) are needed for chr-group detection and
+     * ref_min/ref_max. The y values stay on GPU for voting. */
+    uint64_t *h_sorted_x = (uint64_t *)malloc((size_t)total_rechain_n * sizeof(uint64_t));
+    cudaMemcpyAsync(h_sorted_x, dev_mem->d_vt_ax,
+                    (size_t)total_rechain_n * sizeof(uint64_t),
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+
+    /* ====================================================================
+     * Phase 1: enumerate (read, chr-group) pairs → vg[] descriptors
+     *          (same as original but reads from h_sorted_x instead of rd->a)
+     * ==================================================================== */
+
+    struct VgDesc {
+        int     ri;
+        int32_t a_start;
+        int32_t a_n;
+        int32_t ref_min;
+        int32_t n_bins;
+        int32_t eff_bin_size;
+    };
+
+    int       vg_cap = 64, n_vg = 0;
+    VgDesc   *vg     = (VgDesc *)malloc(vg_cap * sizeof(VgDesc));
+
+    for (int ri = 0; ri < n_rechain; ++ri) {
+        int n_a = h_dst_off[ri + 1] - h_dst_off[ri];
+        if (n_a == 0) continue;
+        uint64_t *sx = h_sorted_x + h_dst_off[ri];  /* sorted x for this read */
+
+        int64_t chr_start = 0;
+        while (chr_start < n_a) {
+            int32_t xrev    = (int32_t)(sx[chr_start] >> 32);
+            int64_t chr_end = chr_start;
+            while (chr_end < n_a && (int32_t)(sx[chr_end] >> 32) == xrev)
+                ++chr_end;
+
+            int32_t a_n     = (int32_t)(chr_end - chr_start);
+            int32_t ref_min = (int32_t)sx[chr_start];
+            int32_t ref_max = (int32_t)sx[chr_end - 1];
+            int32_t ref_span = ref_max - ref_min + 1;
+
+            int32_t n_bins_g, bsz_g;
+            if (a_n <= 1) {
+                n_bins_g = 1;
+                bsz_g    = bin_size;
+            } else {
+                n_bins_g = (ref_span + bin_size - 1) / bin_size + 1;
+                if (n_bins_g > a_n) {
+                    n_bins_g = a_n;
+                    bsz_g    = (ref_span - 1) / a_n + 1;
+                } else {
+                    bsz_g = bin_size;
+                }
+            }
+
+            if (n_vg == vg_cap) {
+                vg_cap *= 2;
+                vg      = (VgDesc *)realloc(vg, vg_cap * sizeof(VgDesc));
+            }
+            vg[n_vg].ri           = ri;
+            vg[n_vg].a_start      = (int32_t)chr_start;
+            vg[n_vg].a_n          = a_n;
+            vg[n_vg].ref_min      = ref_min;
+            vg[n_vg].n_bins       = n_bins_g;
+            vg[n_vg].eff_bin_size = bsz_g;
+            ++n_vg;
+
+            chr_start = chr_end;
+        }
+    }
+
+    free(h_sorted_x);
+
+    if (n_vg == 0) {
+        free(vg); free(h_src_off); free(h_dst_off);
+        /* Free stale a[]/u[] */
+        for (int i = 0; i < n_rechain; i++) {
+            int idx = rechain_indices[i];
+            kfree(km, reads[idx].a); reads[idx].a = NULL;
+            kfree(km, reads[idx].u); reads[idx].u = NULL;
+            reads[idx].n = 0; reads[idx].n_u = 0;
+        }
+        return;
+    }
+
+    /* ====================================================================
+     * Phase 2: compute flat offsets for bins and anchors
+     * ==================================================================== */
+
+    int32_t *bin_off    = (int32_t *)malloc((n_vg + 1) * sizeof(int32_t));
+    int32_t *anchor_off = (int32_t *)malloc((n_vg + 1) * sizeof(int32_t));
+
+    bin_off[0] = anchor_off[0] = 0;
+    for (int g = 0; g < n_vg; ++g) {
+        bin_off[g + 1]    = bin_off[g]    + vg[g].n_bins;
+        anchor_off[g + 1] = anchor_off[g] + vg[g].a_n;
+    }
+    int32_t total_bins    = bin_off[n_vg];
+    int32_t total_anchors = anchor_off[n_vg];
+
+    /* ====================================================================
+     * Phase 3: pre-allocate full-batch host output buffers
+     * ==================================================================== */
+
+    uint64_t *h_bx           = (uint64_t *)malloc((size_t)total_anchors * sizeof(uint64_t));
+    uint64_t *h_by           = (uint64_t *)malloc((size_t)total_anchors * sizeof(uint64_t));
+    int32_t  *h_nsegs        = (int32_t  *)malloc((size_t)n_vg          * sizeof(int32_t));
+    int32_t  *h_ncompact     = (int32_t  *)malloc((size_t)n_vg          * sizeof(int32_t));
+    int32_t  *h_seg_cnt_flat = (int32_t  *)malloc((size_t)total_bins    * sizeof(int32_t));
+
+    /* ====================================================================
+     * Phase 4: mini-batch GPU pipeline (device data path)
+     *
+     * Sorted anchor data is already on GPU in d_vt_ax/d_vt_ay.
+     * The per-group offsets within that sorted array correspond to
+     * (h_dst_off[ri] + vg[g].a_start) for each group g.
+     *
+     * For each mini-batch, compute the device source pointer for the
+     * first group and pass to run_voting_minibatch_device.
+     * ==================================================================== */
+
+    int mb_g = 0;
+    while (mb_g < n_vg) {
+        int     mb_end = mb_g;
+        int64_t mb_na  = 0, mb_nb = 0;
+        while (mb_end < n_vg) {
+            int64_t na = vg[mb_end].a_n;
+            int64_t nb = vg[mb_end].n_bins;
+            size_t  cost = (size_t)(mb_na + na) * 44 +
+                           (size_t)(mb_nb + nb) * 17;
+            if (cost > MEM_BUDGET_BYTES && mb_end > mb_g) break;
+            mb_na += na;
+            mb_nb += nb;
+            ++mb_end;
+        }
+
+        int     mb_n              = mb_end - mb_g;
+        int32_t mb_total_anchors  = (int32_t)mb_na;
+        int32_t mb_total_bins     = (int32_t)mb_nb;
+        int32_t base_anchor       = anchor_off[mb_g];
+        int32_t base_bin          = bin_off[mb_g];
+
+        /* build local offset arrays */
+        int32_t *mb_bin_off    = (int32_t *)malloc((size_t)(mb_n + 1) * sizeof(int32_t));
+        int32_t *mb_anchor_off = (int32_t *)malloc((size_t)(mb_n + 1) * sizeof(int32_t));
+        int32_t *mb_ref_min    = (int32_t *)malloc((size_t)mb_n       * sizeof(int32_t));
+        int32_t *mb_bin_size_h = (int32_t *)malloc((size_t)mb_n       * sizeof(int32_t));
+
+        mb_bin_off[0] = mb_anchor_off[0] = 0;
+        for (int i = 0; i < mb_n; ++i) {
+            int g = mb_g + i;
+            mb_bin_off[i + 1]    = mb_bin_off[i]    + vg[g].n_bins;
+            mb_anchor_off[i + 1] = mb_anchor_off[i] + vg[g].a_n;
+            mb_ref_min[i]        = vg[g].ref_min;
+            mb_bin_size_h[i]     = vg[g].eff_bin_size;
+        }
+
+        /* Compute device source pointer: sorted data for this mini-batch
+         * starts at d_vt_ax + (h_dst_off[vg[mb_g].ri] + vg[mb_g].a_start).
+         * But groups are contiguous across reads in sorted order, so we can
+         * use the anchor_off-based global offset. The sorted data in d_vt_ax
+         * is laid out per-read contiguously: read0's anchors, read1's, etc.
+         * Within each read, chr-groups are contiguous (sorted by xrev). */
+        int first_ri = vg[mb_g].ri;
+        int32_t dev_base = h_dst_off[first_ri] + vg[mb_g].a_start;
+        const uint64_t *d_mb_ax = dev_mem->d_vt_ax + dev_base;
+        const uint64_t *d_mb_ay = dev_mem->d_vt_ay + dev_base;
+
+        run_voting_minibatch_device(
+            mb_n, mb_total_anchors, mb_total_bins,
+            d_mb_ax, d_mb_ay,
+            mb_bin_off, mb_anchor_off, mb_ref_min, mb_bin_size_h,
+            min_votes, merge_gap_bins,
+            stream, dev_mem,
+            h_bx           + base_anchor,
+            h_by           + base_anchor,
+            h_nsegs        + mb_g,
+            h_ncompact     + mb_g,
+            h_seg_cnt_flat + base_bin);
+
+        free(mb_bin_off); free(mb_anchor_off);
+        free(mb_ref_min); free(mb_bin_size_h);
+
+        mb_g = mb_end;
+    }
+
+    /* ====================================================================
+     * Phase 5: build per-read b[]/u[] output
+     *          (identical to plvoting_rechain_batch Phase 5)
+     * ==================================================================== */
+    {
+        int g = 0;
+        while (g < n_vg) {
+            int           ri  = vg[g].ri;
+            int           idx = rechain_indices[ri];
+            chain_read_t *rd  = &reads[idx];
+
+            /* Free old anchor/chain arrays */
+            kfree(km, rd->a);
+            kfree(km, rd->u);
+            rd->a   = NULL; rd->n   = 0;
+            rd->u   = NULL; rd->n_u = 0;
+
+            int read_n_a = 0;
+            for (int gg = g; gg < n_vg && vg[gg].ri == ri; ++gg)
+                read_n_a += vg[gg].a_n;
+
+            mm128_t  *b;
+            uint64_t *u_buf;
+            KMALLOC(km, b,     read_n_a);
+            KMALLOC(km, u_buf, read_n_a);
+            int64_t n_b = 0;
+            int     n_u = 0;
+
+            while (g < n_vg && vg[g].ri == ri) {
+                int32_t n_segs_g    = h_nsegs[g];
+                int32_t n_compact_g = h_ncompact[g];
+
+                if (n_segs_g == 0 || n_compact_g == 0) { ++g; continue; }
+
+                int32_t seg_base      = bin_off[g];
+                int64_t anchor_base   = anchor_off[g];
+                int64_t anchor_cursor = anchor_base;
+
+                for (int32_t s = 0; s < n_segs_g; ++s) {
+                    int32_t cnt = h_seg_cnt_flat[seg_base + s];
+                    if (cnt == 0) continue;
+
+                    int32_t  last_q  = INT32_MIN;
+                    uint64_t sub_sc  = 0;
+                    int32_t  sub_cnt = 0;
+
+                    for (int32_t k = 0; k < cnt; ++k) {
+                        int32_t  qp  = (int32_t)(h_by[anchor_cursor + k]);
+                        uint64_t qsp = (h_by[anchor_cursor + k] >> 32) & 0xffU;
+
+                        if (qp > last_q) {
+                            b[n_b].x = h_bx[anchor_cursor + k];
+                            b[n_b].y = h_by[anchor_cursor + k];
+                            ++n_b; sub_sc += qsp; ++sub_cnt; last_q = qp;
+                        } else {
+                            int8_t sustained =
+                                (k + 1 < cnt) &&
+                                ((int32_t)(h_by[anchor_cursor + k + 1]) <= last_q);
+                            if (!sustained) {
+                                /* isolated reversal: discard */
+                            } else {
+                                if (sub_cnt > 0)
+                                    u_buf[n_u++] = (sub_sc << 32) |
+                                                   (uint64_t)sub_cnt;
+                                b[n_b].x = h_bx[anchor_cursor + k];
+                                b[n_b].y = h_by[anchor_cursor + k];
+                                ++n_b; sub_sc = qsp; sub_cnt = 1; last_q = qp;
+                            }
+                        }
+                    }
+                    if (sub_cnt > 0)
+                        u_buf[n_u++] = (sub_sc << 32) | (uint64_t)sub_cnt;
+
+                    anchor_cursor += cnt;
+                }
+                ++g;
+            }
+
+            if (n_b == 0 || n_u == 0) {
+                kfree(km, b);
+                kfree(km, u_buf);
+                continue;
+            }
+
+            mm128_t *b_final;
+            KMALLOC(km, b_final, n_b);
+            memcpy(b_final, b, n_b * sizeof(mm128_t));
+            kfree(km, b);
+
+            uint64_t *u_final;
+            KMALLOC(km, u_final, n_u);
+            memcpy(u_final, u_buf, n_u * sizeof(uint64_t));
+            kfree(km, u_buf);
+
+            rd->a   = b_final;
+            rd->n   = n_b;
+            rd->u   = u_final;
+            rd->n_u = n_u;
+        }
+    }
+
+    free(h_bx); free(h_by);
+    free(h_nsegs); free(h_ncompact); free(h_seg_cnt_flat);
+    free(bin_off); free(anchor_off);
+    free(vg);
+    free(h_src_off); free(h_dst_off);
 }
 
 } /* extern "C" */

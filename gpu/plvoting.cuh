@@ -50,6 +50,19 @@ void plvoting_rechain_batch(const mm_idx_t *mi, const mm_mapopt_t *opt,
                             int n_rechain, Misc misc, void *km,
                             cudaStream_t stream, deviceMemPtr *dev_mem);
 
+/**
+ * plvoting_rechain_batch_fused - fused backtrack→voting path
+ *
+ * Same output as plvoting_rechain_batch but reads anchor data from
+ * device buffers (d_bt_*_out) instead of host rd->a.  Performs GPU
+ * repack + sort (replacing prepare_rechain_anchors) and skips the
+ * H2D of anchor data (only D2H's sorted x for VgDesc building).
+ */
+void plvoting_rechain_batch_fused(const mm_idx_t *mi, const mm_mapopt_t *opt,
+                                   chain_read_t *reads, int *rechain_indices,
+                                   int n_rechain, Misc misc, void *km,
+                                   cudaStream_t stream, deviceMemPtr *dev_mem);
+
 #ifdef __cplusplus
 }
 #endif

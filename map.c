@@ -1322,7 +1322,17 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
         if (task->read_idx != current_read || task->reg_idx != current_reg) {
             current_read = task->read_idx;
             current_reg = task->reg_idx;
+            if (current_read < 0 || current_read >= gpu_batch->n_reads) {
+                fprintf(stderr, "[BUG] task[%d]: read_idx=%d OOB (n_reads=%d), skipping\n",
+                        i, current_read, gpu_batch->n_reads);
+                dropped = 1; continue;
+            }
             ctx = &gpu_batch->read_ctxs[current_read];
+            if (current_reg < 0 || current_reg >= ctx->n_regs) {
+                fprintf(stderr, "[BUG] task[%d]: reg_idx=%d OOB (n_regs=%d, read=%d), skipping\n",
+                        i, current_reg, ctx->n_regs, current_read);
+                dropped = 1; continue;
+            }
             r = &ctx->regs0[current_reg];
             
             // 获取query长度
@@ -1442,6 +1452,10 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                         // 部分扩展
                         rs1 = task->task_ctx.ref_rs - (task->max_t + 1);
                         qs1 = task->task_ctx.ref_qs - (task->max_q + 1);
+                        if (rs1 < 0 || qs1 < 0) {
+                            fprintf(stderr, "[BUG] LEFT_EXT underflow: rs1=%d qs1=%d (ref_rs=%d max_t=%d ref_qs=%d max_q=%d) task[%d] read=%d reg=%d\n",
+                                    rs1, qs1, task->task_ctx.ref_rs, task->max_t, task->task_ctx.ref_qs, task->max_q, i, current_read, current_reg);
+                        }
                     }
                 }
                 // re1/qe1保持为seed的起点位置（不变）
@@ -1553,6 +1567,10 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                     if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
                 } else {
                     // CPU fallback: leading-I/D coordinate fix (pass 3b) or EQX mode.
+                    if (qs1 < 0 || qs1 >= qlen || rs1 < 0 || re1 <= rs1) {
+                        fprintf(stderr, "[BUG] mm_update_extra bounds: qs1=%d qe1=%d qlen=%d rs1=%d re1=%d read=%d reg=%d task[%d] type=%d\n",
+                                qs1, qe1, qlen, rs1, re1, current_read, current_reg, i, task->task_type);
+                    } else {
                     uint8_t *qseq;
                     if (!rev || (opt->flag & MM_F_QSTRAND)) {
                         qseq = ctx->qseq0[0] + qs1;
@@ -1565,6 +1583,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                    opt->flag & MM_F_EQX, !(opt->flag & MM_F_SR));
                     if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
                     kfree(km, tseq);
+                    }  // end bounds-check else
                 }
             }
         }

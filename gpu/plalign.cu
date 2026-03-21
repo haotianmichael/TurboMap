@@ -2,6 +2,7 @@
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
+#include "plksw2_kernel.cuh"  // CUDASW4-style column-parallel kernel
 #include <cub/device/device_scan.cuh>
 
 
@@ -690,18 +691,33 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 total_target_bytes / 4
             );
 
-            // ===== Fused Persistent KSW Kernel (align + backtrack in one launch) =====
-            // Clamp concurrent blocks per phase: backtrack_p is allocated as
-            //   n_concurrent_blocks × max_align_backtrack_size (slot-indexed).
-            // For long tasks current_max_backtrack_size >> short per-slot size, so far
-            // fewer slots fit. Cap to avoid out-of-bounds access.
+            // ===== Persistent KSW Kernel (align + backtrack in one launch) =====
+            // Phase 0 (short tasks ≤1000bp): CUDASW4-style column-parallel kernel
+            //   - Row-major backtrack: bt_size = max_qlen × max_tlen
+            //   - No Z-drop, no banding, full DP in registers
+            //   - temp buffer: only unpacked sequences (qlen + tlen bytes)
+            // Phase 1 (long tasks >1000bp): Original anti-diagonal kernel
+            //   - Anti-diagonal backtrack with banding
+            //   - Z-drop, Suzuki-Kasahara formulation
             int parallel_threads = 32;   // one warp per block
-            size_t parallel_smem = 3072; // 3072 bytes smem → 32 blocks/SM on V100
 
             size_t bt_p_total_bytes = (size_t)n_concurrent_blocks *
                                       dev_mem->max_align_backtrack_size;
-            size_t max_slots_this_phase = bt_p_total_bytes /
-                                          (size_t)current_max_backtrack_size;
+
+            // For the column-parallel kernel (short tasks), backtrack is row-major:
+            // bt_size_per_slot = short_task_max_len × short_task_max_len
+            size_t col_bt_size = short_task_max_len * short_task_max_len;
+
+            size_t max_slots_this_phase;
+            if (phase == 0) {
+                // Column-parallel: row-major backtrack
+                max_slots_this_phase = bt_p_total_bytes / col_bt_size;
+            } else {
+                // Anti-diagonal: banded backtrack
+                max_slots_this_phase = bt_p_total_bytes /
+                                       (size_t)current_max_backtrack_size;
+            }
+
             int phase_concurrent_blocks = n_concurrent_blocks;
             if ((size_t)phase_concurrent_blocks > max_slots_this_phase)
                 phase_concurrent_blocks = (int)max_slots_this_phase;
@@ -712,33 +728,64 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
-            ksw_fused_persistent_kernel<<<phase_concurrent_blocks, parallel_threads,
-                                          parallel_smem, align_stream>>>(
-                d_task_counter,
-                d_packed_query,
-                d_packed_target,
-                d_query_lens,
-                d_target_lens,
-                d_query_offsets,
-                d_target_offsets,
-                (gasal_res_t*)device_res,
-                d_mat,
-                d_backtrack_p,
-                d_backtrack_off,
-                d_backtrack_off_end,
-                (int)current_max_backtrack_size,
-                (int)current_max_antidiag,
-                d_ksw_temp_buffer,
-                d_flag,
-                ksw_temp_per_task,
-                batch_size,
-                5,              // m = alphabet size (ACGTN)
-                opt->zdrop,
-                opt->end_bonus,
-                cigar_buffer ? d_cigar_buffer  : NULL,
-                cigar_buffer ? d_cigar_lengths : NULL,
-                (int)current_max_cigar_len
-            );
+            if (phase == 0) {
+                // ===== CUDASW4-style column-parallel kernel (short tasks) =====
+                // Temp buffer: reuse ksw_temp_buffer, each slot needs qlen+tlen bytes
+                // (far less than the allocated ksw_temp_per_task)
+                ksw2_col_persistent_kernel<<<phase_concurrent_blocks, parallel_threads,
+                                             0, align_stream>>>(
+                    d_task_counter,
+                    d_packed_query,
+                    d_packed_target,
+                    d_query_lens,
+                    d_target_lens,
+                    d_query_offsets,
+                    d_target_offsets,
+                    (gasal_res_t*)device_res,
+                    d_mat,
+                    d_backtrack_p,
+                    (int)col_bt_size,
+                    d_ksw_temp_buffer,
+                    d_flag,
+                    ksw_temp_per_task,
+                    batch_size,
+                    5,              // m = alphabet size (ACGTN)
+                    opt->end_bonus,
+                    cigar_buffer ? d_cigar_buffer  : NULL,
+                    cigar_buffer ? d_cigar_lengths : NULL,
+                    (int)current_max_cigar_len
+                );
+            } else {
+                // ===== Original anti-diagonal kernel (long tasks) =====
+                size_t parallel_smem = 3072;
+                ksw_fused_persistent_kernel<<<phase_concurrent_blocks, parallel_threads,
+                                              parallel_smem, align_stream>>>(
+                    d_task_counter,
+                    d_packed_query,
+                    d_packed_target,
+                    d_query_lens,
+                    d_target_lens,
+                    d_query_offsets,
+                    d_target_offsets,
+                    (gasal_res_t*)device_res,
+                    d_mat,
+                    d_backtrack_p,
+                    d_backtrack_off,
+                    d_backtrack_off_end,
+                    (int)current_max_backtrack_size,
+                    (int)current_max_antidiag,
+                    d_ksw_temp_buffer,
+                    d_flag,
+                    ksw_temp_per_task,
+                    batch_size,
+                    5,              // m = alphabet size (ACGTN)
+                    opt->zdrop,
+                    opt->end_bonus,
+                    cigar_buffer ? d_cigar_buffer  : NULL,
+                    cigar_buffer ? d_cigar_lengths : NULL,
+                    (int)current_max_cigar_len
+                );
+            }
 
             cudaError_t kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {

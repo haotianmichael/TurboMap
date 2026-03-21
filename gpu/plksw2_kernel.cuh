@@ -49,6 +49,7 @@
 #define KSW2_NUM_REGS   32
 #define KSW2_GROUP_SIZE 32
 #define KSW2_MAX_TARGET (KSW2_GROUP_SIZE * KSW2_NUM_REGS)  /* 1024 */
+#define KSW2_WARPS_PER_BLOCK 4   /* multiple warps per block for latency hiding */
 
 /* Negative infinity for int32 DP (headroom for gap penalties) */
 #define KSW2_NEG_INF32  (-0x10000000)
@@ -105,6 +106,7 @@ __global__ void ksw2_col_persistent_kernel(
     int32_t      *d_flag,
     size_t        temp_per_task,
     int           n_tasks,
+    int           max_slots,           /* total available buffer slots    */
     int8_t        m,                   /* alphabet size (5=ACGTN)        */
     int           end_bonus,
     uint32_t     *cigar_buffer,        /* task-indexed (NULL → no CIGAR) */
@@ -112,8 +114,13 @@ __global__ void ksw2_col_persistent_kernel(
     int           max_cigar_len
 )
 {
-    const int slot_id = blockIdx.x;
-    const int lane_id = threadIdx.x;
+    const int warp_id = threadIdx.x / 32;
+    const int lane_id = threadIdx.x % 32;
+    const int warps_per_block = blockDim.x / 32;
+    const int slot_id = blockIdx.x * warps_per_block + warp_id;
+
+    /* Guard: last block may have excess warps beyond available slots */
+    if (slot_id >= max_slots) return;
 
     /* ================================================================ */
     /* Persistent task loop                                             */

@@ -699,8 +699,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // Phase 1 (long tasks >1000bp): Original anti-diagonal kernel
             //   - Anti-diagonal backtrack with banding
             //   - Z-drop, Suzuki-Kasahara formulation
-            int parallel_threads = 32;   // one warp per block
-
             size_t bt_p_total_bytes = (size_t)n_concurrent_blocks *
                                       dev_mem->max_align_backtrack_size;
 
@@ -712,30 +710,37 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             if (phase == 0) {
                 // Column-parallel: row-major backtrack
                 max_slots_this_phase = bt_p_total_bytes / col_bt_size;
+                // Also cap by temp buffer: total_temp / per_slot_temp
+                size_t temp_slots = dev_mem->short_task_batch_size;
+                if (temp_slots < max_slots_this_phase)
+                    max_slots_this_phase = temp_slots;
             } else {
                 // Anti-diagonal: banded backtrack
                 max_slots_this_phase = bt_p_total_bytes /
                                        (size_t)current_max_backtrack_size;
             }
 
-            int phase_concurrent_blocks = n_concurrent_blocks;
-            if ((size_t)phase_concurrent_blocks > max_slots_this_phase)
-                phase_concurrent_blocks = (int)max_slots_this_phase;
-            if (phase_concurrent_blocks > batch_size)
-                phase_concurrent_blocks = batch_size;
-            if (phase_concurrent_blocks < 1) phase_concurrent_blocks = 1;
+            int phase_concurrent_slots = n_concurrent_blocks;
+            if ((size_t)phase_concurrent_slots > max_slots_this_phase)
+                phase_concurrent_slots = (int)max_slots_this_phase;
+            if (phase_concurrent_slots > batch_size)
+                phase_concurrent_slots = batch_size;
+            if (phase_concurrent_slots < 1) phase_concurrent_slots = 1;
 
             // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
             if (phase == 0) {
-                // ===== CUDASW4-style column-parallel kernel (short tasks) =====
-                // Temp buffer: reuse ksw_temp_buffer, each slot needs qlen+tlen bytes
-                // (far less than the allocated ksw_temp_per_task)
-                fprintf(stderr, "\n[DEBUG::%s] Phase0 launch: blocks=%d, batch=%d, max_bt=%zu, temp/task=%zu, max_cigar=%zu\n",
-                        __func__, phase_concurrent_blocks, batch_size,
-                        col_bt_size, ksw_temp_per_task, current_max_cigar_len);
-                ksw2_col_persistent_kernel<<<phase_concurrent_blocks, parallel_threads,
+                // ===== CUDASW4-style column-parallel kernel (multi-warp) =====
+                int col_warps_per_block = KSW2_WARPS_PER_BLOCK;
+                int col_threads_per_block = 32 * col_warps_per_block;
+                int col_n_blocks = (phase_concurrent_slots + col_warps_per_block - 1)
+                                   / col_warps_per_block;
+
+                fprintf(stderr, "\n[DEBUG::%s] Phase0 launch: blocks=%d, warps/blk=%d, total_slots=%d, batch=%d, max_bt=%zu\n",
+                        __func__, col_n_blocks, col_warps_per_block,
+                        phase_concurrent_slots, batch_size, col_bt_size);
+                ksw2_col_persistent_kernel<<<col_n_blocks, col_threads_per_block,
                                              0, align_stream>>>(
                     d_task_counter,
                     d_packed_query,
@@ -752,6 +757,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     d_flag,
                     ksw_temp_per_task,
                     batch_size,
+                    phase_concurrent_slots,  // max_slots
                     5,              // m = alphabet size (ACGTN)
                     opt->end_bonus,
                     cigar_buffer ? d_cigar_buffer  : NULL,
@@ -760,8 +766,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 );
             } else {
                 // ===== Original anti-diagonal kernel (long tasks) =====
+                int parallel_threads = 32;   // one warp per block
                 size_t parallel_smem = 3072;
-                ksw_fused_persistent_kernel<<<phase_concurrent_blocks, parallel_threads,
+                ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
                                               parallel_smem, align_stream>>>(
                     d_task_counter,
                     d_packed_query,

@@ -732,6 +732,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 // ===== CUDASW4-style column-parallel kernel (short tasks) =====
                 // Temp buffer: reuse ksw_temp_buffer, each slot needs qlen+tlen bytes
                 // (far less than the allocated ksw_temp_per_task)
+                fprintf(stderr, "\n[DEBUG::%s] Phase0 launch: blocks=%d, batch=%d, max_bt=%zu, temp/task=%zu, max_cigar=%zu\n",
+                        __func__, phase_concurrent_blocks, batch_size,
+                        col_bt_size, ksw_temp_per_task, current_max_cigar_len);
                 ksw2_col_persistent_kernel<<<phase_concurrent_blocks, parallel_threads,
                                              0, align_stream>>>(
                     d_task_counter,
@@ -849,13 +852,43 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
             cudaCheck();
 
+            // === DEBUG: validate kernel results before host processing ===
+            if (phase == 0) {
+                int bad_score = 0, bad_cigar = 0, bad_end = 0;
+                for (int i = 0; i < batch_size; i++) {
+                    if (h_scores[i] == (int32_t)(-0x40000000)) bad_score++;
+                    if (h_query_ends[i] < -1 || h_target_ends[i] < -1) bad_end++;
+                    if (cigar_buffer && (h_cigar_lengths[i] < 0 ||
+                        h_cigar_lengths[i] > (int)current_max_cigar_len)) bad_cigar++;
+                }
+                if (bad_score || bad_cigar || bad_end) {
+                    fprintf(stderr, "\n[DEBUG::%s] Phase0 batch %d: bad_score=%d bad_cigar=%d bad_end=%d (batch_size=%d)\n",
+                            __func__, batch_num, bad_score, bad_cigar, bad_end, batch_size);
+                    // Print first few tasks for diagnosis
+                    for (int i = 0; i < batch_size && i < 5; i++) {
+                        int tidx = current_task_indices[batch_start + i];
+                        fprintf(stderr, "  task[%d→%d]: score=%d qend=%d tend=%d cigar_len=%d qlen=%d tlen=%d\n",
+                                i, tidx, h_scores[i], h_query_ends[i], h_target_ends[i],
+                                cigar_buffer ? h_cigar_lengths[i] : -1,
+                                tasks[tidx].qlen, tasks[tidx].tlen);
+                    }
+                }
+            }
+
             // Sync 2: D2H compact CIGAR (only actual data, no stride padding)
             // Compute host-side prefix offsets from h_cigar_lengths, then copy only total_cigar_ops entries.
             int total_cigar_ops = 0;
             if (cigar_buffer) {
                 for (int i = 0; i < batch_size; i++) {
                     h_compact_offsets[i] = (uint32_t)total_cigar_ops;
-                    total_cigar_ops += h_cigar_lengths[i];
+                    int clen = h_cigar_lengths[i];
+                    if (clen < 0 || clen > (int)current_max_cigar_len) {
+                        fprintf(stderr, "\n[DEBUG::%s] CORRUPT cigar_length[%d]=%d (max=%zu), clamping to 0\n",
+                                __func__, i, clen, current_max_cigar_len);
+                        h_cigar_lengths[i] = 0;
+                        clen = 0;
+                    }
+                    total_cigar_ops += clen;
                 }
                 if (total_cigar_ops > 0) {
                     // Transfer only the compacted, fixed CIGAR data — typically 10-40× smaller than stride layout

@@ -460,6 +460,28 @@ __global__ void ksw2_col_persistent_kernel(
         } /* end query row loop */
 
         /* ============================================================ */
+        /* Warp-reduce ez_score, ez_mte, ez_mte_q                      */
+        /* These may have been set by a lane other than lane 0          */
+        /* ============================================================ */
+        {
+            /* ez_score: only the lane holding tj==tlen-1 has the value;
+             * all other lanes have KSW_NEG_INF.  Max-reduce to lane 0. */
+            int32_t sc = ez_score;
+            for (int off = 16; off > 0; off >>= 1) {
+                int32_t v = __shfl_down_sync(0xffffffff, sc, off);
+                if (v > sc) sc = v;
+            }
+            ez_score = __shfl_sync(0xffffffff, sc, 0);
+
+            /* ez_mte / ez_mte_q: argmax reduce (same as mqe) */
+            int32_t mte_v = ez_mte;
+            int32_t mte_q = ez_mte_q;
+            warp_argmax_broadcast(mte_v, mte_q);
+            ez_mte   = mte_v;
+            ez_mte_q = mte_q;
+        }
+
+        /* ============================================================ */
         /* Determine backtrack endpoint                                 */
         /* ============================================================ */
         int backtrack_q = -1, backtrack_t = -1;

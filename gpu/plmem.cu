@@ -85,516 +85,333 @@ void plmem_free_long_mem(longMemPtr *long_mem) {
     cudaCheck();
 }
 
-void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch, int range_grid_size, int num_cut){
-    fprintf(stderr, "[Info] GPU MEMORY ALLOCATION BREAKDOWN ========== ");
-    fprintf(stderr, "Configuration: anchor_per_batch=%zu, range_grid_size=%d, num_cut=%d, ",
-            anchor_per_batch, range_grid_size, num_cut);
-    fprintf(stderr, "buffer_size_long=%zu\n", dev_mem->buffer_size_long);
 
-    // data array — forward chain pass only (overwritten per micro-batch)
-    cudaSetDevice(CUDA_DEVICE);
+/* ======== Arena-based GPU memory helpers ======== */
+
+static size_t cub_sort_tmp_size(size_t n, size_t n_segs) {
+    size_t tmp_bytes = 0;
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        nullptr, tmp_bytes,
+        (int64_t*)nullptr, (int64_t*)nullptr,
+        (int64_t*)nullptr, (int64_t*)nullptr,
+        (int)n, (int)n_segs,
+        (int*)nullptr, (int*)nullptr,
+        0, (int)(sizeof(int64_t) * 8));
+    return tmp_bytes;
+}
+
+static size_t cub_scan_tmp_size(size_t n) {
+    size_t tmp_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, tmp_bytes,
+                                  (int*)nullptr, (int*)nullptr, (int)n);
+    return tmp_bytes;
+}
+
+/* Set up chain + backtrack + voting buffers from arena.
+ * Called during init (chain phase first) and after alignment completes. */
+static void setup_chain_phase(deviceMemPtr *dev_mem, size_t anchor_per_batch,
+                               int range_grid_size, int num_cut) {
+    gpu_arena_t *a = &dev_mem->arena;
+    arena_reset(a);
 
     int mb = score_kernel_config.micro_batch;
-    size_t bt_anchor_total = anchor_per_batch * mb;  // for backtrack buffers below
+    size_t bt_anchor_total = anchor_per_batch * mb;
 
-    size_t chain_ax_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_ay_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_sid_size = anchor_per_batch * sizeof(int8_t);
-    size_t chain_xrev_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_yrev_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_range_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_f_size = anchor_per_batch * sizeof(int32_t);
-    size_t chain_p_size = anchor_per_batch * sizeof(uint16_t);
-    size_t chain_total = chain_ax_size + chain_ay_size + chain_sid_size + chain_xrev_size + chain_yrev_size +
-                         chain_range_size + chain_f_size + chain_p_size;
+    // ---- Chain anchor buffers ----
+    dev_mem->d_ax    = (int32_t*)arena_alloc(a, anchor_per_batch * sizeof(int32_t));
+    dev_mem->d_ay    = (int32_t*)arena_alloc(a, anchor_per_batch * sizeof(int32_t));
+    dev_mem->d_sid   = (int8_t*)arena_alloc(a, anchor_per_batch * sizeof(int8_t));
+    dev_mem->d_xrev  = (int32_t*)arena_alloc(a, anchor_per_batch * sizeof(int32_t));
+    dev_mem->d_yrev  = (int32_t*)arena_alloc(a, anchor_per_batch * sizeof(int32_t));
+    dev_mem->d_range = (int32_t*)arena_alloc(a, anchor_per_batch * sizeof(int32_t));
+    dev_mem->d_f     = (int32_t*)arena_alloc(a, anchor_per_batch * sizeof(int32_t));
+    dev_mem->d_p     = (uint16_t*)arena_alloc(a, anchor_per_batch * sizeof(uint16_t));
 
-    cudaMalloc(&dev_mem->d_ax, chain_ax_size);
-    cudaMalloc(&dev_mem->d_ay, chain_ay_size);
-    cudaMalloc(&dev_mem->d_sid, chain_sid_size);
-    cudaMalloc(&dev_mem->d_xrev, chain_xrev_size);
-    cudaMalloc(&dev_mem->d_yrev, chain_yrev_size);
-    cudaMalloc(&dev_mem->d_range, chain_range_size);
-    cudaMalloc(&dev_mem->d_f, chain_f_size);
-    cudaMalloc(&dev_mem->d_p, chain_p_size);
-    fprintf(stderr, " [Chain] Total anchor buffers: %.2f MB\n", chain_total / (1024.0*1024.0));
+    // ---- Index buffers ----
+    dev_mem->d_start_idx     = (size_t*)arena_alloc(a, range_grid_size * sizeof(size_t));
+    dev_mem->d_read_end_idx  = (size_t*)arena_alloc(a, range_grid_size * sizeof(size_t));
+    dev_mem->d_cut_start_idx = (size_t*)arena_alloc(a, range_grid_size * sizeof(size_t));
 
-    //index
-    size_t idx_total = range_grid_size * sizeof(size_t) * 3;
-    cudaMalloc(&dev_mem->d_start_idx, range_grid_size * sizeof(size_t));
-    cudaMalloc(&dev_mem->d_read_end_idx, range_grid_size * sizeof(size_t));
-    cudaMalloc(&dev_mem->d_cut_start_idx, range_grid_size * sizeof(size_t));
+    // ---- Cut buffers ----
+    size_t max_long_segs = dev_mem->buffer_size_long /
+        (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit);
+    size_t long_seg_size = max_long_segs * sizeof(seg_t);
+    size_t mid_seg_size = num_cut / (score_kernel_config.mid_seg_cutoff + 1) * sizeof(seg_t);
 
-    // cut
-    size_t cut_size = num_cut * sizeof(size_t);
-    size_t long_seg_size = dev_mem->buffer_size_long / (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit) * sizeof(seg_t);
-    size_t mid_seg_size = num_cut/(score_kernel_config.mid_seg_cutoff + 1) * sizeof(seg_t);
-    cudaMalloc(&dev_mem->d_cut, cut_size);
-    cudaMalloc(&dev_mem->d_long_seg_count, sizeof(unsigned int));
-    cudaMalloc(&dev_mem->d_long_seg, long_seg_size);
-    cudaMalloc(&dev_mem->d_long_seg_og, long_seg_size);
-    size_t max_long_segs = dev_mem->buffer_size_long / (score_kernel_config.long_seg_cutoff * score_kernel_config.cut_unit);
-    size_t d_map_size = max_long_segs * sizeof(unsigned);
-    cudaMalloc(&dev_mem->d_map, d_map_size);
-    dev_mem->d_map_capacity = max_long_segs;
-    cudaMalloc(&dev_mem->d_mid_seg_count, sizeof(unsigned int));
-    cudaMalloc(&dev_mem->d_mid_seg, mid_seg_size);
-    fprintf(stderr, " [Chain] Total Cut buffers: %.2f MB\n", (idx_total + cut_size + 2*long_seg_size + d_map_size + mid_seg_size + 2*sizeof(unsigned int)) / (1024.0*1024.0));
+    dev_mem->d_cut            = (size_t*)arena_alloc(a, num_cut * sizeof(size_t));
+    dev_mem->d_long_seg_count = (unsigned int*)arena_alloc(a, sizeof(unsigned int));
+    dev_mem->d_long_seg       = (seg_t*)arena_alloc(a, long_seg_size);
+    dev_mem->d_long_seg_og    = (seg_t*)arena_alloc(a, long_seg_size);
+    dev_mem->d_map            = (unsigned*)arena_alloc(a, max_long_segs * sizeof(unsigned));
+    dev_mem->d_map_capacity   = max_long_segs;
+    dev_mem->d_mid_seg_count  = (unsigned int*)arena_alloc(a, sizeof(unsigned int));
+    dev_mem->d_mid_seg        = (seg_t*)arena_alloc(a, mid_seg_size);
 
-    // long seg buffer
-    size_t long_ax_size = dev_mem->buffer_size_long * sizeof(int32_t);
-    size_t long_ay_size = dev_mem->buffer_size_long * sizeof(int32_t);
-    size_t long_sid_size = dev_mem->buffer_size_long * sizeof(int8_t);
-    size_t long_range_size = dev_mem->buffer_size_long * sizeof(int32_t);
-    size_t long_f_size = dev_mem->buffer_size_long * sizeof(int32_t);
-    size_t long_p_size = dev_mem->buffer_size_long * sizeof(uint16_t);
-    size_t long_total = long_ax_size + long_ay_size + long_sid_size + long_range_size +
-                        long_f_size + long_p_size + sizeof(size_t);
+    // ---- Long segment buffers ----
+    dev_mem->d_ax_long      = (int32_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int32_t));
+    dev_mem->d_ay_long      = (int32_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int32_t));
+    dev_mem->d_sid_long     = (int8_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int8_t));
+    dev_mem->d_range_long   = (int32_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int32_t));
+    dev_mem->d_total_n_long = (size_t*)arena_alloc(a, sizeof(size_t));
+    dev_mem->d_f_long       = (int32_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int32_t));
+    dev_mem->d_p_long       = (uint16_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(uint16_t));
 
-    cudaMalloc(&dev_mem->d_ax_long, long_ax_size);
-    cudaMalloc(&dev_mem->d_ay_long, long_ay_size);
-    cudaMalloc(&dev_mem->d_sid_long, long_sid_size);
-    cudaMalloc(&dev_mem->d_range_long, long_range_size);
-    cudaMalloc(&dev_mem->d_total_n_long, sizeof(size_t));
-    cudaMalloc(&dev_mem->d_f_long, long_f_size);
-    cudaMalloc(&dev_mem->d_p_long, long_p_size);
-    fprintf(stderr, " [Chain] Total long seg buffers: %.2f MB (%.2f GB)\n",
-            long_total / (1024.0*1024.0), long_total / (1024.0*1024.0*1024.0)); 
+    // ---- Backtrack buffers ----
+    size_t bt_n = bt_anchor_total;
+    size_t bt_r = (size_t)range_grid_size * mb;
+    dev_mem->d_bt_max_total_n = bt_n;
+    dev_mem->d_bt_max_n_reads = bt_r;
 
-    // ========== Chain Backtrack Pre-allocated Buffers ==========
-    // Sized for ALL micro-batches combined (anchor_per_batch * micro_batch).
-    // d_bt_*_in: SEPARATE input buffers for backtrack H2D (separate from d_ax/d_ay/d_f/d_p).
-    {
-        size_t bt_n = bt_anchor_total;  // all micro-batches combined
-        size_t bt_r = (size_t)range_grid_size * mb;  // reads across all micro-batches
+    dev_mem->d_bt_ax_in       = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_ay_in       = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_xrev_in     = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_yrev_in     = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_f_in        = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_p_in        = (uint16_t*)arena_alloc(a, bt_n * sizeof(uint16_t));
 
-        dev_mem->d_bt_max_total_n = bt_n;
-        dev_mem->d_bt_max_n_reads = bt_r;
+    dev_mem->d_bt_zx          = (int64_t*)arena_alloc(a, bt_n * sizeof(int64_t));
+    dev_mem->d_bt_zy          = (int64_t*)arena_alloc(a, bt_n * sizeof(int64_t));
+    dev_mem->d_bt_v           = (int64_t*)arena_alloc(a, bt_n * sizeof(int64_t));
+    dev_mem->d_bt_p_abs       = (int64_t*)arena_alloc(a, bt_n * sizeof(int64_t));
+    dev_mem->d_bt_t           = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_u           = (uint64_t*)arena_alloc(a, bt_n * sizeof(uint64_t));
+    dev_mem->d_bt_ax_out      = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_ay_out      = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_xrev_out    = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_yrev_out    = (int32_t*)arena_alloc(a, bt_n * sizeof(int32_t));
+    dev_mem->d_bt_n_a          = (int*)arena_alloc(a, bt_r * sizeof(int));
+    dev_mem->d_bt_offset       = (int*)arena_alloc(a, bt_r * sizeof(int));
+    dev_mem->d_bt_ofs_end      = (int*)arena_alloc(a, bt_r * sizeof(int));
+    dev_mem->d_bt_num_elements = (int*)arena_alloc(a, bt_r * sizeof(int));
+    dev_mem->d_bt_n_v          = (int*)arena_alloc(a, bt_r * sizeof(int));
+    dev_mem->d_bt_n_u          = (int*)arena_alloc(a, bt_r * sizeof(int));
 
-        // Backtrack input buffers (separate from d_ax etc.)
-        cudaMalloc(&dev_mem->d_bt_ax_in,       bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_ay_in,       bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_xrev_in,     bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_yrev_in,     bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_f_in,        bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_p_in,        bt_n * sizeof(uint16_t));
+    dev_mem->d_bt_cub_tmp_size = cub_sort_tmp_size(bt_n, bt_r);
+    dev_mem->d_bt_cub_tmp      = arena_alloc(a, dev_mem->d_bt_cub_tmp_size);
 
-        // Working buffers
-        cudaMalloc(&dev_mem->d_bt_zx,          bt_n * sizeof(int64_t));
-        cudaMalloc(&dev_mem->d_bt_zy,          bt_n * sizeof(int64_t));
-        cudaMalloc(&dev_mem->d_bt_v,           bt_n * sizeof(int64_t));
-        cudaMalloc(&dev_mem->d_bt_p_abs,       bt_n * sizeof(int64_t));
-        cudaMalloc(&dev_mem->d_bt_t,           bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_u,           bt_n * sizeof(uint64_t));
-        cudaMalloc(&dev_mem->d_bt_ax_out,      bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_ay_out,      bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_xrev_out,    bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_yrev_out,    bt_n * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_bt_n_a,          bt_r * sizeof(int));
-        cudaMalloc(&dev_mem->d_bt_offset,       bt_r * sizeof(int));
-        cudaMalloc(&dev_mem->d_bt_ofs_end,      bt_r * sizeof(int));
-        cudaMalloc(&dev_mem->d_bt_num_elements, bt_r * sizeof(int));
-        cudaMalloc(&dev_mem->d_bt_n_v,          bt_r * sizeof(int));
-        cudaMalloc(&dev_mem->d_bt_n_u,          bt_r * sizeof(int));
+    // ---- Voting buffers ----
+    size_t vt_a = bt_anchor_total;
+    size_t vt_r = dev_mem->d_bt_max_n_reads + 1;
+    dev_mem->d_vt_max_anchors = vt_a;
 
-        // CUB DeviceSegmentedRadixSort temp storage (size query with max dimensions)
-        dev_mem->d_bt_cub_tmp      = nullptr;
-        dev_mem->d_bt_cub_tmp_size = 0;
-        {
-            size_t tmp_bytes = 0;
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                nullptr, tmp_bytes,
-                dev_mem->d_bt_zx, dev_mem->d_bt_zx,
-                dev_mem->d_bt_zy, dev_mem->d_bt_zy,
-                (int)bt_n, (int)bt_r,
-                dev_mem->d_bt_offset, dev_mem->d_bt_ofs_end,
-                0, (int)(sizeof(int64_t) * 8));
-            dev_mem->d_bt_cub_tmp_size = tmp_bytes;
-            cudaMalloc(&dev_mem->d_bt_cub_tmp, tmp_bytes);
-        }
+    dev_mem->d_vt_ax          = (uint64_t*)arena_alloc(a, vt_a * sizeof(uint64_t));
+    dev_mem->d_vt_ay          = (uint64_t*)arena_alloc(a, vt_a * sizeof(uint64_t));
+    dev_mem->d_vt_bx          = (uint64_t*)arena_alloc(a, vt_a * sizeof(uint64_t));
+    dev_mem->d_vt_by          = (uint64_t*)arena_alloc(a, vt_a * sizeof(uint64_t));
+    dev_mem->d_vt_mark        = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
+    dev_mem->d_vt_anchor_seg  = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
+    dev_mem->d_vt_out_pos     = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
+    dev_mem->d_vt_votes        = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
+    dev_mem->d_vt_keep_bin     = (int8_t*)arena_alloc(a, vt_a * sizeof(int8_t));
+    dev_mem->d_vt_seg_start    = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
+    dev_mem->d_vt_seg_id       = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
+    dev_mem->d_vt_seg_cnt_flat = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
+    dev_mem->d_vt_bin_off     = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
+    dev_mem->d_vt_anchor_off  = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
+    dev_mem->d_vt_ref_min     = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
+    dev_mem->d_vt_bin_size    = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
+    dev_mem->d_vt_nsegs       = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
+    dev_mem->d_vt_ncompact    = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
 
-        size_t bt_input = bt_n * (4*sizeof(int32_t) + sizeof(int32_t) + sizeof(uint16_t));
-        size_t bt_work  = bt_n * (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
-                        + bt_r * 6 * sizeof(int)
-                        + dev_mem->d_bt_cub_tmp_size;
-        fprintf(stderr, " [Chain] Backtrack input buffers: %.2f MB (%.2f GB)\n",
-                bt_input / (1024.0*1024.0), bt_input / (1024.0*1024.0*1024.0));
-        fprintf(stderr, " [Chain] Backtrack working buffers: %.2f MB (%.2f GB)\n",
-                bt_work / (1024.0*1024.0), bt_work / (1024.0*1024.0*1024.0));
-    }
+    dev_mem->current_phase = GPU_PHASE_CHAIN;
+}
 
-    // ========== Alignment Buffers ==========
-    // Configuration for alignment
-    // OPTIMIZATION: Adjusted for 24GB GPU memory constraints
-    // Key bottleneck: backtrack_p buffer = alloc_tasks × (2×max_query_len) × 752
-    dev_mem->max_align_tasks = 120000;        // For DP phase batching
-    dev_mem->max_align_seq_bytes = 1*1024*1024*1024;  // 1GB for sequences (reduced from 2GB)
-    dev_mem->max_align_query_len = 50000;    // max query length (reduced from 100000 to save ~9GB)
+/* Set up alignment buffers from arena.
+ * Called when transitioning from chain→align phase. */
+static void setup_align_phase(deviceMemPtr *dev_mem) {
+    gpu_arena_t *a = &dev_mem->arena;
+    arena_reset(a);
 
-
-    // Sequence data
+    // ---- Sequence data ----
     size_t seq_unpacked_size = dev_mem->max_align_seq_bytes;
     size_t seq_packed_size = (dev_mem->max_align_seq_bytes / 8) * sizeof(uint32_t);
     size_t metadata_size = dev_mem->max_align_tasks * sizeof(uint32_t);
 
-    cudaMalloc(&dev_mem->d_align_unpacked_query, seq_unpacked_size);
+    dev_mem->d_align_unpacked_query  = (uint8_t*)arena_alloc(a, seq_unpacked_size);
+    dev_mem->d_align_unpacked_target = (uint8_t*)arena_alloc(a, seq_unpacked_size);
+    dev_mem->d_align_packed_query    = (uint32_t*)arena_alloc(a, seq_packed_size);
+    dev_mem->d_align_packed_target   = (uint32_t*)arena_alloc(a, seq_packed_size);
+    dev_mem->d_align_query_offsets   = (uint32_t*)arena_alloc(a, metadata_size);
+    dev_mem->d_align_target_offsets  = (uint32_t*)arena_alloc(a, metadata_size);
+    dev_mem->d_align_query_lens      = (uint32_t*)arena_alloc(a, metadata_size);
+    dev_mem->d_align_target_lens     = (uint32_t*)arena_alloc(a, metadata_size);
+    dev_mem->d_align_flag            = (int32_t*)arena_alloc(a, metadata_size);
 
-    cudaMalloc(&dev_mem->d_align_unpacked_target, seq_unpacked_size);
-
-    cudaMalloc(&dev_mem->d_align_packed_query, seq_packed_size);
-
-    cudaMalloc(&dev_mem->d_align_packed_target, seq_packed_size);
-
-    cudaMalloc(&dev_mem->d_align_query_offsets, metadata_size);
-    cudaMalloc(&dev_mem->d_align_target_offsets, metadata_size);
-    cudaMalloc(&dev_mem->d_align_query_lens, metadata_size);
-    cudaMalloc(&dev_mem->d_align_target_lens, metadata_size);
-    cudaMalloc(&dev_mem->d_align_flag, metadata_size);
-
-    // global buffer (28 blocks * 32 threads/warp * max_query_len * 4)
+    // ---- Global DP buffer ----
     size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_query_len * 4;
     size_t global_buffer_bytes = global_buffer_size * sizeof(short2);
-    cudaMalloc(&dev_mem->d_align_global_buffer, global_buffer_bytes);
+    dev_mem->d_align_global_buffer = arena_alloc(a, global_buffer_bytes);
 
-    size_t short_task_batch_size = 4000; // For tasks with max(qlen, tlen) <= 1000bp (reduced for 32GB GPU)
-    size_t long_task_batch_size = 128;    // For tasks with max(qlen, tlen) > 1000bp
-    size_t short_task_max_len = 1000;     // Max qlen or tlen for short tasks
-
-    // Compute n_concurrent_blocks FIRST — needed by slot-indexed buffer sizing below.
-    // V100: 80 SMs x 32 blocks/SM (with 3072 bytes smem) = 2560 concurrent blocks
-    int numSMs = 0;
-    cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
-    int max_blocks_per_sm = 32;  // limited by shared memory (3072 bytes/block, 98304/SM)
-    dev_mem->n_align_concurrent_blocks = numSMs * max_blocks_per_sm;
-
-    // KSW temp buffer: slot-indexed by blockIdx.x, only n_concurrent_blocks slots needed
+    // ---- KSW temp buffer (slot-indexed by blockIdx.x) ----
     size_t max_len = dev_mem->max_align_query_len;
     size_t H_size = max_len * sizeof(int32_t);
     size_t u8_arrays_size = (max_len + 1) * 7 * sizeof(int8_t);
     size_t seq_size = max_len * 2 * sizeof(uint8_t);
     size_t raw_size = H_size + u8_arrays_size + seq_size;
     dev_mem->align_ksw_temp_per_task = (raw_size + 7) & ~7ULL;
-    size_t ksw_temp_bytes = (size_t)dev_mem->n_align_concurrent_blocks * dev_mem->align_ksw_temp_per_task;
-    cudaMalloc(&dev_mem->d_align_ksw_temp_buffer, ksw_temp_bytes);
+    size_t ksw_temp_bytes = (size_t)dev_mem->n_align_concurrent_blocks *
+                            dev_mem->align_ksw_temp_per_task;
+    dev_mem->d_align_ksw_temp_buffer = arena_alloc(a, ksw_temp_bytes);
 
-    fprintf(stderr, " [Align] DP buffers: %.2f MB\n", (seq_unpacked_size *2 + seq_packed_size*2 + metadata_size*5 + global_buffer_bytes + ksw_temp_bytes) / (1024.0*1024.0));
-    // Backtrack buffers(Strategy: Two-tier allocation for short vs long tasks)
-    // ==================== Backtrack Buffers ====================
-    // Purpose: Store information for CIGAR generation (alignment path reconstruction)
-    //
-    // For each alignment with qlen and tlen:
-    // - Total antidiagonals: qlen + tlen - 1
-    // - Cells per antidiagonal: n_col = min(bandwidth+1, min(qlen, tlen))
-    //
-    // backtrack_p[]: Direction bits for each DP cell
-    //   - Size per task: (qlen + tlen - 1) × n_col bytes
-    //   - Each byte stores 4 bits for direction (which cell we came from)
-    //                     + 4 bits for state flags
-    //
-    // backtrack_off[], backtrack_off_end[]: Valid range for each antidiagonal
-    //   - Size per task: (qlen + tlen - 1) × 2 integers
-    //   - Tells us which cells in each antidiagonal are within the band
-    //
-    // backtrack_n_col[]: The n_col value for each task
-    //   - Size per task: 1 integer
-    //=============================================================
-    // SHORT TASKS (max(qlen, tlen) <= 1000bp, ~90% of workload):
-    //   - Allocate based on 1000bp max per sequence
-    //   - Backtrack size per task: (1000+1000) × 752 = 1.5MB
-    //   - With 32GB GPU memory, ~28GB available for backtrack
-    //   - Theoretical max: 28GB / 1.5MB ≈ 18,000 tasks
-    //   - Conservative allocation: 10,000 tasks (accounts for DP buffers, safety margin)
-    //   - Memory: 10,000 × 1.5MB ≈ 15GB backtrack + other buffers ≈ 18GB total
-    //
-    // LONG TASKS (max(qlen, tlen) > 1000bp, ~10% of workload):
-    //   - Allocate based on max length (50000bp)
-    //   - Backtrack size per task: (50000+50000) × 752 = 75MB
-    //   - Batch size: 200 tasks (original conservative value)
-    //   - Memory: 200 × 75MB ≈ 14.3GB
-    //
-    // Processing flow in plalign.cu:
-    //   1. Scan all tasks, classify by max(qlen, tlen)
-    //   2. Process short tasks first (high throughput, 10,000 at a time)
-    //   3. Process long tasks separately (low throughput, 200 at a time)
-    //
-
-   
-    // Allocate buffers for SHORT tasks (most common case, optimized for throughput)
-    // alloc_slots: backtrack/ksw_temp are slot-indexed by blockIdx.x in the
-    // persistent kernel, so only n_concurrent_blocks slots are ever used.
-    // plalign.cu caps phase_concurrent_blocks to fit within this allocation.
+    // ---- Backtrack buffers ----
     size_t alloc_slots = (size_t)dev_mem->n_align_concurrent_blocks;
-
-    // Calculate max_antidiag based on SHORT task length (1000bp per sequence)
-    size_t max_antidiag_short = 2 * short_task_max_len;  // 2000 antidiagonals for 1000+1000bp
+    size_t max_antidiag_short = 2 * dev_mem->short_task_max_len;
     size_t max_n_col = 751 + 1;  // bandwidth + 1
+    dev_mem->max_align_backtrack_size = max_antidiag_short * max_n_col;
+    dev_mem->max_align_cigar_len = 2 * dev_mem->short_task_max_len;
 
-    // Store configuration in deviceMemPtr for plalign.cu to use
-    dev_mem->short_task_batch_size = short_task_batch_size;
-    dev_mem->long_task_batch_size = long_task_batch_size;
-    dev_mem->short_task_max_len = short_task_max_len;
-    dev_mem->max_align_backtrack_size = max_antidiag_short * max_n_col;  // Optimized for short tasks
-    dev_mem->max_align_cigar_len = 2 * short_task_max_len;  // Optimized for short tasks
+    size_t bt_p_bytes   = alloc_slots * dev_mem->max_align_backtrack_size;
+    size_t bt_off_bytes = alloc_slots * max_antidiag_short * sizeof(int);
 
-    size_t bt_p_bytes       = alloc_slots * dev_mem->max_align_backtrack_size;
-    size_t bt_off_bytes     = alloc_slots * max_antidiag_short * sizeof(int);
-    size_t bt_off_end_bytes = alloc_slots * max_antidiag_short * sizeof(int);
-    size_t bt_n_col_bytes   = alloc_slots * sizeof(int);
+    dev_mem->d_align_backtrack_p       = (uint8_t*)arena_alloc(a, bt_p_bytes);
+    dev_mem->d_align_backtrack_off     = (int*)arena_alloc(a, bt_off_bytes);
+    dev_mem->d_align_backtrack_off_end = (int*)arena_alloc(a, bt_off_bytes);
+    dev_mem->d_align_backtrack_n_col   = (int*)arena_alloc(a, alloc_slots * sizeof(int));
 
-    // CIGAR buffer: task-indexed output, sized for max_align_tasks per batch.
-    // With persistent kernel batch_size = max_align_tasks (short) or 2400 (long),
-    // both require max_align_tasks × max_align_cigar_len × 4 = 120000×2000×4 = 960MB.
-    // Same 960MB covers long tasks: 2400 × 100000 × 4 = 960MB.
-    size_t cigar_buf_bytes = dev_mem->max_align_tasks * dev_mem->max_align_cigar_len * sizeof(uint32_t);
+    // ---- CIGAR buffers ----
+    size_t cigar_buf_bytes = dev_mem->max_align_tasks *
+                             dev_mem->max_align_cigar_len * sizeof(uint32_t);
     size_t cigar_len_bytes = dev_mem->max_align_tasks * sizeof(int);
 
-    cudaMalloc(&dev_mem->d_align_backtrack_p, bt_p_bytes);
-    cudaMalloc(&dev_mem->d_align_backtrack_off, bt_off_bytes);
-    cudaMalloc(&dev_mem->d_align_backtrack_off_end, bt_off_end_bytes);
-    cudaMalloc(&dev_mem->d_align_backtrack_n_col, bt_n_col_bytes);
-    cudaMalloc(&dev_mem->d_align_cigar_buffer, cigar_buf_bytes);
-    cudaMalloc(&dev_mem->d_align_cigar_lengths, cigar_len_bytes);
+    dev_mem->d_align_cigar_buffer  = (uint32_t*)arena_alloc(a, cigar_buf_bytes);
+    dev_mem->d_align_cigar_lengths = (int*)arena_alloc(a, cigar_len_bytes);
 
-    // P1: Compact CIGAR buffers
-    // compact_cigar: worst-case same size as stride buffer (all tasks have max CIGAR length)
-    // compact_offsets: (max_align_tasks + 1) entries so CUB ExclusiveSum output fits
-    cudaMalloc(&dev_mem->d_align_compact_cigar, cigar_buf_bytes);
-    cudaMalloc(&dev_mem->d_align_compact_offsets,
-               (dev_mem->max_align_tasks + 1) * sizeof(uint32_t));
+    // ---- Compact CIGAR ----
+    dev_mem->d_align_compact_cigar   = (uint32_t*)arena_alloc(a, cigar_buf_bytes);
+    dev_mem->d_align_compact_offsets = (uint32_t*)arena_alloc(a,
+        (dev_mem->max_align_tasks + 1) * sizeof(uint32_t));
 
-    // Query CUB DeviceScan::ExclusiveSum temp size (cast int* input, uint32_t* output)
-    // Use ExclusiveSum on cigar_lengths (int) → compact_offsets (uint32_t).
-    // CUB requires type match; we cast to (uint32_t*) for both since lengths are non-negative.
-    dev_mem->d_align_cub_tmp = nullptr;
-    dev_mem->align_cub_tmp_size = 0;
-    {
-        size_t tmp_bytes = 0;
-        // Use (int*) cast for both pointers so CUB deduces type=int consistently.
-        // d_align_compact_offsets is uint32_t* but same size as int; values are non-negative.
-        cub::DeviceScan::ExclusiveSum(nullptr, tmp_bytes,
-                                      dev_mem->d_align_cigar_lengths,
-                                      (int*)dev_mem->d_align_compact_offsets,
-                                      (int)dev_mem->max_align_tasks);
-        dev_mem->align_cub_tmp_size = tmp_bytes;
-        cudaMalloc(&dev_mem->d_align_cub_tmp, tmp_bytes);
-    }
+    // ---- CUB temp ----
+    dev_mem->align_cub_tmp_size = cub_scan_tmp_size(dev_mem->max_align_tasks);
+    dev_mem->d_align_cub_tmp = arena_alloc(a, dev_mem->align_cub_tmp_size);
 
-    // P2: GPU alignment statistics buffers (one entry per task slot)
+    // ---- Stats buffers ----
     size_t stats_bytes = dev_mem->max_align_tasks * sizeof(int32_t);
-    cudaMalloc(&dev_mem->d_align_blen,            stats_bytes);
-    cudaMalloc(&dev_mem->d_align_mlen,            stats_bytes);
-    cudaMalloc(&dev_mem->d_align_n_ambi,          stats_bytes);
-    cudaMalloc(&dev_mem->d_align_dp_max,          stats_bytes);
-    cudaMalloc(&dev_mem->d_align_gpu_stats_valid, stats_bytes);
+    dev_mem->d_align_blen            = (int32_t*)arena_alloc(a, stats_bytes);
+    dev_mem->d_align_mlen            = (int32_t*)arena_alloc(a, stats_bytes);
+    dev_mem->d_align_n_ambi          = (int32_t*)arena_alloc(a, stats_bytes);
+    dev_mem->d_align_dp_max          = (int32_t*)arena_alloc(a, stats_bytes);
+    dev_mem->d_align_gpu_stats_valid = (int32_t*)arena_alloc(a, stats_bytes);
 
-    // Result structures
-    cudaMalloc(&dev_mem->d_align_device_res, sizeof(gasal_res_t));
-    cudaMalloc(&dev_mem->d_align_ez_array, sizeof(ksw_extz_t) * short_task_batch_size);
-    cudaMalloc(&dev_mem->d_align_scores, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_query_ends, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_target_ends, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mqe, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mqe_t, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mte, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mte_q, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_task_to_align_id, dev_mem->max_align_tasks * sizeof(int32_t));
-    cudaMalloc(&dev_mem->d_align_mat, 25 * sizeof(int8_t));
+    // ---- Result buffers ----
+    dev_mem->d_align_device_res       = arena_alloc(a, sizeof(gasal_res_t));
+    dev_mem->d_align_ez_array         = arena_alloc(a,
+        sizeof(ksw_extz_t) * dev_mem->short_task_batch_size);
+    dev_mem->d_align_scores           = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    dev_mem->d_align_query_ends       = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    dev_mem->d_align_target_ends      = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    dev_mem->d_align_mqe              = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    dev_mem->d_align_mqe_t            = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    dev_mem->d_align_mte              = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    dev_mem->d_align_mte_q            = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    dev_mem->d_align_task_to_align_id = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    dev_mem->d_align_mat              = (int8_t*)arena_alloc(a, 25 * sizeof(int8_t));
 
-    // Persistent kernel: atomic task counter
-    cudaMalloc(&dev_mem->d_align_task_counter, sizeof(int));
+    // ---- Persistent kernel counter ----
+    dev_mem->d_align_task_counter = (int*)arena_alloc(a, sizeof(int));
 
-    // Calculate total memory allocated for alignment backtrack + results
-    size_t bck_total = bt_p_bytes + bt_off_bytes + bt_off_end_bytes + bt_n_col_bytes +
-                         cigar_buf_bytes + cigar_len_bytes +
-                         cigar_buf_bytes +  // compact_cigar (same size)
-                         (dev_mem->max_align_tasks + 1) * sizeof(uint32_t) +  // compact_offsets
-                         dev_mem->align_cub_tmp_size +  // CUB temp
-                         stats_bytes * 5 +  // blen, mlen, n_ambi, dp_max, gpu_stats_valid
-                         sizeof(gasal_res_t) +  // device_res
-                         sizeof(ksw_extz_t) * short_task_batch_size +  // ez_array
-                         dev_mem->max_align_tasks * sizeof(int32_t) * 8 +  // scores, query_ends, target_ends, mqe, mqe_t, mte, mte_q, task_to_align_id
-                         25 * sizeof(int8_t) +  // d_align_mat
-                         sizeof(int);  // d_align_task_counter
+    dev_mem->current_phase = GPU_PHASE_ALIGN;
+}
 
-    fprintf(stderr, " [Align] Total BackTrack+Result buffers: %.2f GB\n", bck_total / (1024.0*1024.0*1024.0));
+/* ======== Public API ======== */
 
-    // ========== Voting Pre-allocated Buffers ==========
-    // Sized by bt_anchor_total (= anchor_per_batch × micro_batch).
-    // Bins are bounded by anchors (each anchor maps to ≤1 bin), so use same capacity.
-    // Read-sized arrays use d_bt_max_n_reads (= max_reads × micro_batch) + 1 for offsets.
-    {
-        size_t vt_a = bt_anchor_total;  // anchor/bin capacity
-        size_t vt_r = dev_mem->d_bt_max_n_reads + 1;  // read/group capacity (+1 for offset arrays)
-        dev_mem->d_vt_max_anchors = vt_a;
+void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
+                              int range_grid_size, int num_cut) {
+    fprintf(stderr, "[Info] GPU ARENA MEMORY ALLOCATION ==========\n");
+    fprintf(stderr, "Configuration: anchor_per_batch=%zu, range_grid_size=%d, num_cut=%d, ",
+            anchor_per_batch, range_grid_size, num_cut);
+    fprintf(stderr, "buffer_size_long=%zu\n", dev_mem->buffer_size_long);
+    cudaSetDevice(CUDA_DEVICE);
 
-        // Anchor-sized (uint64_t × 4 + int32_t × 3)
-        cudaMalloc(&dev_mem->d_vt_ax,          vt_a * sizeof(uint64_t));
-        cudaMalloc(&dev_mem->d_vt_ay,          vt_a * sizeof(uint64_t));
-        cudaMalloc(&dev_mem->d_vt_bx,          vt_a * sizeof(uint64_t));
-        cudaMalloc(&dev_mem->d_vt_by,          vt_a * sizeof(uint64_t));
-        cudaMalloc(&dev_mem->d_vt_mark,        vt_a * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_anchor_seg,  vt_a * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_out_pos,     vt_a * sizeof(int32_t));
-        // Bin-sized (int32_t × 4 + int8_t × 1, capacity = vt_a)
-        cudaMalloc(&dev_mem->d_vt_votes,        vt_a * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_keep_bin,     vt_a * sizeof(int8_t));
-        cudaMalloc(&dev_mem->d_vt_seg_start,    vt_a * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_seg_id,       vt_a * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_seg_cnt_flat, vt_a * sizeof(int32_t));
-        // Read-sized (int32_t × 6, capacity = vt_r)
-        cudaMalloc(&dev_mem->d_vt_bin_off,     vt_r * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_anchor_off,  vt_r * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_ref_min,     vt_r * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_bin_size,    vt_r * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_nsegs,       vt_r * sizeof(int32_t));
-        cudaMalloc(&dev_mem->d_vt_ncompact,    vt_r * sizeof(int32_t));
+    // Save parameters for phase transitions
+    dev_mem->saved_anchor_per_batch = anchor_per_batch;
+    dev_mem->saved_range_grid_size  = range_grid_size;
+    dev_mem->saved_num_cut          = num_cut;
 
-        size_t vt_total = vt_a * (4*sizeof(uint64_t) + 3*sizeof(int32_t) +
-                                  4*sizeof(int32_t) + sizeof(int8_t))
-                        + vt_r * 6 * sizeof(int32_t);
-        fprintf(stderr, " [Voting] Pre-allocated buffers: %.2f MB (%.2f GB)\n",
-                vt_total / (1024.0*1024.0), vt_total / (1024.0*1024.0*1024.0));
+    // Pre-compute alignment config values (needed for arena sizing)
+    dev_mem->max_align_tasks     = 120000;
+    dev_mem->max_align_seq_bytes = (size_t)1*1024*1024*1024;  // 1 GB
+    dev_mem->max_align_query_len = 50000;
+    dev_mem->short_task_batch_size = 4000;
+    dev_mem->long_task_batch_size  = 128;
+    dev_mem->short_task_max_len    = 1000;
 
-        // ========== GRAND TOTAL CALCULATION ==========
-        size_t chain_bt_input = dev_mem->d_bt_max_total_n *
-                                (4*sizeof(int32_t) + sizeof(int32_t) + sizeof(uint16_t));
-        size_t chain_bt_work  = dev_mem->d_bt_max_total_n *
-                                (4*sizeof(int64_t) + sizeof(int32_t) + sizeof(uint64_t) + 4*sizeof(int32_t))
-                              + dev_mem->d_bt_max_n_reads * 6 * sizeof(int)
-                              + dev_mem->d_bt_cub_tmp_size;
-        size_t chain_bt_total = chain_bt_input + chain_bt_work;
+    int numSMs = 0;
+    cudaDeviceGetAttribute(&numSMs, cudaDevAttrMultiProcessorCount, 0);
+    int max_blocks_per_sm = 32;
+    dev_mem->n_align_concurrent_blocks = numSMs * max_blocks_per_sm;
 
-        size_t cut_total = idx_total + cut_size + 2*long_seg_size + d_map_size + mid_seg_size + 2*sizeof(unsigned int);
-        size_t chain_total_all = chain_total + cut_total + long_total + chain_bt_total;
+    // ---- Dry run: measure chain phase size ----
+    gpu_arena_t dry = {(void*)256, SIZE_MAX, 0};
+    dev_mem->arena = dry;
+    setup_chain_phase(dev_mem, anchor_per_batch, range_grid_size, num_cut);
+    size_t chain_size = dev_mem->arena.offset;
 
-        size_t align_dp_total = (seq_unpacked_size*2 + seq_packed_size*2 +
-                                 metadata_size*5 + global_buffer_bytes + ksw_temp_bytes);
-        size_t align_total_all = align_dp_total + bck_total;
+    // ---- Dry run: measure align phase size ----
+    dev_mem->arena = dry;
+    setup_align_phase(dev_mem);
+    size_t align_size = dev_mem->arena.offset;
 
-        size_t grand_total = chain_total_all + align_total_all + vt_total;
+    // ---- Allocate single arena = max(chain, align) + safety ----
+    size_t arena_size = (chain_size > align_size ? chain_size : align_size);
+    arena_size += 1 * 1024 * 1024;  // 1 MB safety margin
 
-        fprintf(stderr, " [Chain] Total:       %8.2f MB (%.2f GB)\n",
-                chain_total_all / (1024.0*1024.0), chain_total_all / (1024.0*1024.0*1024.0));
-        fprintf(stderr, " [Align] Total:       %8.2f MB (%.2f GB)\n",
-                align_total_all / (1024.0*1024.0), align_total_all / (1024.0*1024.0*1024.0));
-        fprintf(stderr, " [Voting] Total:      %8.2f MB (%.2f GB)\n",
-                vt_total / (1024.0*1024.0), vt_total / (1024.0*1024.0*1024.0));
-        fprintf(stderr, "[Info] TurboMap Total GPU Memory: %.2f MB (%.2f GB)\n",
-                grand_total / (1024.0*1024.0), grand_total / (1024.0*1024.0*1024.0));
+    void *arena_base = nullptr;
+    cudaMalloc(&arena_base, arena_size);
+    if (!arena_base) {
+        fprintf(stderr, "[FATAL] Failed to allocate GPU arena: %.2f GB\n",
+                arena_size / (1024.0*1024.0*1024.0));
+        abort();
     }
+
+    dev_mem->arena.base       = arena_base;
+    dev_mem->arena.total_size = arena_size;
+    dev_mem->arena.offset     = 0;
+
+    fprintf(stderr, " [Arena] Single allocation: %.2f MB (%.2f GB)\n",
+            arena_size / (1024.0*1024.0), arena_size / (1024.0*1024.0*1024.0));
+    fprintf(stderr, " [Arena] Chain phase needs: %.2f MB (%.2f GB)\n",
+            chain_size / (1024.0*1024.0), chain_size / (1024.0*1024.0*1024.0));
+    fprintf(stderr, " [Arena] Align phase needs: %.2f MB (%.2f GB)\n",
+            align_size / (1024.0*1024.0), align_size / (1024.0*1024.0*1024.0));
+    fprintf(stderr, " [Arena] Saved vs separate alloc: %.2f GB\n",
+            (chain_size + align_size - arena_size) / (1024.0*1024.0*1024.0));
+
+    // Set up chain phase initially
+    setup_chain_phase(dev_mem, anchor_per_batch, range_grid_size, num_cut);
+
+    fprintf(stderr, " [Arena] Chain phase active: %.2f MB used of %.2f MB\n",
+            dev_mem->arena.offset / (1024.0*1024.0),
+            dev_mem->arena.total_size / (1024.0*1024.0));
 
     cudaCheck();
 }
 
 void plmem_free_device_mem(deviceMemPtr *dev_mem) {
-    // chain buffer
-    cudaFree(dev_mem->d_ax);
-    cudaFree(dev_mem->d_ay);
-    cudaFree(dev_mem->d_sid);
-    cudaFree(dev_mem->d_xrev);
-    cudaFree(dev_mem->d_yrev);
-    cudaFree(dev_mem->d_range);
-    cudaFree(dev_mem->d_f);
-    cudaFree(dev_mem->d_p);
-
-    cudaFree(dev_mem->d_start_idx);
-    cudaFree(dev_mem->d_read_end_idx);
-    cudaFree(dev_mem->d_cut_start_idx);
-
-    cudaFree(dev_mem->d_cut);
-    cudaFree(dev_mem->d_long_seg);
-    cudaFree(dev_mem->d_long_seg_og);
-    cudaFree(dev_mem->d_long_seg_count);
-    cudaFree(dev_mem->d_mid_seg);
-    cudaFree(dev_mem->d_mid_seg_count);
-
-    cudaFree(dev_mem->d_map);
-    cudaFree(dev_mem->d_ax_long);
-    cudaFree(dev_mem->d_ay_long);
-    cudaFree(dev_mem->d_sid_long);
-    cudaFree(dev_mem->d_range_long);
-    cudaFree(dev_mem->d_total_n_long);
-
-    // Chain backtrack pre-allocated buffers
-    cudaFree(dev_mem->d_bt_ax_in);
-    cudaFree(dev_mem->d_bt_ay_in);
-    cudaFree(dev_mem->d_bt_xrev_in);
-    cudaFree(dev_mem->d_bt_yrev_in);
-    cudaFree(dev_mem->d_bt_f_in);
-    cudaFree(dev_mem->d_bt_p_in);
-    cudaFree(dev_mem->d_bt_zx);
-    cudaFree(dev_mem->d_bt_zy);
-    cudaFree(dev_mem->d_bt_v);
-    cudaFree(dev_mem->d_bt_p_abs);
-    cudaFree(dev_mem->d_bt_t);
-    cudaFree(dev_mem->d_bt_u);
-    cudaFree(dev_mem->d_bt_ax_out);
-    cudaFree(dev_mem->d_bt_ay_out);
-    cudaFree(dev_mem->d_bt_xrev_out);
-    cudaFree(dev_mem->d_bt_yrev_out);
-    cudaFree(dev_mem->d_bt_n_a);
-    cudaFree(dev_mem->d_bt_offset);
-    cudaFree(dev_mem->d_bt_ofs_end);
-    cudaFree(dev_mem->d_bt_num_elements);
-    cudaFree(dev_mem->d_bt_n_v);
-    cudaFree(dev_mem->d_bt_n_u);
-    cudaFree(dev_mem->d_bt_cub_tmp);
-
-    // Alignment buffers
-    if (dev_mem->d_align_unpacked_query) cudaFree(dev_mem->d_align_unpacked_query);
-    if (dev_mem->d_align_unpacked_target) cudaFree(dev_mem->d_align_unpacked_target);
-    if (dev_mem->d_align_packed_query) cudaFree(dev_mem->d_align_packed_query);
-    if (dev_mem->d_align_packed_target) cudaFree(dev_mem->d_align_packed_target);
-    if (dev_mem->d_align_query_offsets) cudaFree(dev_mem->d_align_query_offsets);
-    if (dev_mem->d_align_target_offsets) cudaFree(dev_mem->d_align_target_offsets);
-    if (dev_mem->d_align_query_lens) cudaFree(dev_mem->d_align_query_lens);
-    if (dev_mem->d_align_target_lens) cudaFree(dev_mem->d_align_target_lens);
-    if (dev_mem->d_align_flag) cudaFree(dev_mem->d_align_flag);
-    if (dev_mem->d_align_global_buffer) cudaFree(dev_mem->d_align_global_buffer);
-    if (dev_mem->d_align_ksw_temp_buffer) cudaFree(dev_mem->d_align_ksw_temp_buffer);
-    if (dev_mem->d_align_backtrack_p) cudaFree(dev_mem->d_align_backtrack_p);
-    if (dev_mem->d_align_backtrack_off) cudaFree(dev_mem->d_align_backtrack_off);
-    if (dev_mem->d_align_backtrack_off_end) cudaFree(dev_mem->d_align_backtrack_off_end);
-    if (dev_mem->d_align_backtrack_n_col) cudaFree(dev_mem->d_align_backtrack_n_col);
-    if (dev_mem->d_align_cigar_buffer) cudaFree(dev_mem->d_align_cigar_buffer);
-    if (dev_mem->d_align_cigar_lengths) cudaFree(dev_mem->d_align_cigar_lengths);
-    if (dev_mem->d_align_compact_cigar)   cudaFree(dev_mem->d_align_compact_cigar);
-    if (dev_mem->d_align_compact_offsets) cudaFree(dev_mem->d_align_compact_offsets);
-    if (dev_mem->d_align_cub_tmp)         cudaFree(dev_mem->d_align_cub_tmp);
-    if (dev_mem->d_align_blen)            cudaFree(dev_mem->d_align_blen);
-    if (dev_mem->d_align_mlen)            cudaFree(dev_mem->d_align_mlen);
-    if (dev_mem->d_align_n_ambi)          cudaFree(dev_mem->d_align_n_ambi);
-    if (dev_mem->d_align_dp_max)          cudaFree(dev_mem->d_align_dp_max);
-    if (dev_mem->d_align_gpu_stats_valid) cudaFree(dev_mem->d_align_gpu_stats_valid);
-    if (dev_mem->d_align_device_res) cudaFree(dev_mem->d_align_device_res);
-    if (dev_mem->d_align_ez_array) cudaFree(dev_mem->d_align_ez_array);
-    if (dev_mem->d_align_scores) cudaFree(dev_mem->d_align_scores);
-    if (dev_mem->d_align_query_ends) cudaFree(dev_mem->d_align_query_ends);
-    if (dev_mem->d_align_target_ends) cudaFree(dev_mem->d_align_target_ends);
-    if (dev_mem->d_align_task_to_align_id) cudaFree(dev_mem->d_align_task_to_align_id);
-    if (dev_mem->d_align_mat) cudaFree(dev_mem->d_align_mat);
-    if (dev_mem->d_align_task_counter) cudaFree(dev_mem->d_align_task_counter);
-
-    // Voting pre-allocated buffers
-    if (dev_mem->d_vt_ax)            cudaFree(dev_mem->d_vt_ax);
-    if (dev_mem->d_vt_ay)            cudaFree(dev_mem->d_vt_ay);
-    if (dev_mem->d_vt_bx)            cudaFree(dev_mem->d_vt_bx);
-    if (dev_mem->d_vt_by)            cudaFree(dev_mem->d_vt_by);
-    if (dev_mem->d_vt_mark)          cudaFree(dev_mem->d_vt_mark);
-    if (dev_mem->d_vt_anchor_seg)    cudaFree(dev_mem->d_vt_anchor_seg);
-    if (dev_mem->d_vt_out_pos)       cudaFree(dev_mem->d_vt_out_pos);
-    if (dev_mem->d_vt_votes)         cudaFree(dev_mem->d_vt_votes);
-    if (dev_mem->d_vt_keep_bin)      cudaFree(dev_mem->d_vt_keep_bin);
-    if (dev_mem->d_vt_seg_start)     cudaFree(dev_mem->d_vt_seg_start);
-    if (dev_mem->d_vt_seg_id)        cudaFree(dev_mem->d_vt_seg_id);
-    if (dev_mem->d_vt_seg_cnt_flat)  cudaFree(dev_mem->d_vt_seg_cnt_flat);
-    if (dev_mem->d_vt_bin_off)       cudaFree(dev_mem->d_vt_bin_off);
-    if (dev_mem->d_vt_anchor_off)    cudaFree(dev_mem->d_vt_anchor_off);
-    if (dev_mem->d_vt_ref_min)       cudaFree(dev_mem->d_vt_ref_min);
-    if (dev_mem->d_vt_bin_size)      cudaFree(dev_mem->d_vt_bin_size);
-    if (dev_mem->d_vt_nsegs)         cudaFree(dev_mem->d_vt_nsegs);
-    if (dev_mem->d_vt_ncompact)      cudaFree(dev_mem->d_vt_ncompact);
-
+    if (dev_mem->arena.base) {
+        cudaFree(dev_mem->arena.base);
+        dev_mem->arena.base       = nullptr;
+        dev_mem->arena.total_size = 0;
+        dev_mem->arena.offset     = 0;
+    }
     cudaCheck();
+}
+
+void plmem_phase_to_align(deviceMemPtr *dev_mem) {
+    if (dev_mem->current_phase == GPU_PHASE_ALIGN) return;
+    setup_align_phase(dev_mem);
+    fprintf(stderr, " [Arena] Phase -> ALIGN: %.2f MB used of %.2f MB\n",
+            dev_mem->arena.offset / (1024.0*1024.0),
+            dev_mem->arena.total_size / (1024.0*1024.0));
+}
+
+void plmem_phase_to_chain(deviceMemPtr *dev_mem) {
+    if (dev_mem->current_phase == GPU_PHASE_CHAIN) return;
+    setup_chain_phase(dev_mem, dev_mem->saved_anchor_per_batch,
+                      dev_mem->saved_range_grid_size, dev_mem->saved_num_cut);
+    fprintf(stderr, " [Arena] Phase -> CHAIN: %.2f MB used of %.2f MB\n",
+            dev_mem->arena.offset / (1024.0*1024.0),
+            dev_mem->arena.total_size / (1024.0*1024.0));
 }
 
 

@@ -12,6 +12,40 @@
 #define OneM (OneK*1024)
 #define OneG (OneM*1024)
 
+/* ======== GPU Memory Arena ========
+ * Single large allocation shared between chain and alignment phases.
+ * Phase transitions just reassign pointers (zero cudaMalloc/cudaFree overhead).
+ */
+typedef struct {
+    void  *base;        // single cudaMalloc'd chunk
+    size_t total_size;  // total bytes allocated
+    size_t offset;      // current bump-pointer offset
+} gpu_arena_t;
+
+typedef enum {
+    GPU_PHASE_CHAIN = 0,   // chain + backtrack + voting
+    GPU_PHASE_ALIGN = 1    // KSW alignment
+} gpu_mem_phase_t;
+
+static inline void *arena_alloc(gpu_arena_t *a, size_t bytes) {
+    size_t aligned_off = (a->offset + 255) & ~(size_t)255;  // 256-byte alignment for coalescing
+    void *ptr = (char*)a->base + aligned_off;
+    a->offset = aligned_off + bytes;
+    if (a->offset > a->total_size) {
+        fprintf(stderr, "[FATAL] GPU arena OOM: need %zu, have %zu (alloc %zu at offset %zu)\n",
+                a->offset, a->total_size, bytes, aligned_off);
+        abort();
+    }
+    return ptr;
+}
+
+static inline void arena_reset(gpu_arena_t *a) {
+    a->offset = 0;
+}
+
+static inline size_t arena_remaining(gpu_arena_t *a) {
+    return a->total_size - a->offset;
+}
 
 typedef struct {
     int index;       // read index / batch index
@@ -59,6 +93,14 @@ typedef struct {
 } longMemPtr;
 
 typedef struct {
+    // ========== Arena for dynamic phase-based memory sharing ==========
+    gpu_arena_t arena;             // single GPU allocation shared between phases
+    gpu_mem_phase_t current_phase; // which phase's buffers are currently set up
+    // Saved chain-phase allocation parameters (for re-setup after alignment)
+    size_t saved_anchor_per_batch;
+    int    saved_range_grid_size;
+    int    saved_num_cut;
+
     int size;
     int griddim;
     size_t total_n;
@@ -288,6 +330,12 @@ void plmem_free_long_mem(longMemPtr *long_mem);
 void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                              int range_grid_size, int num_cut);
 void plmem_free_device_mem(deviceMemPtr *dev_mem);
+
+// Phase transitions: reclaim chain memory for alignment and vice versa.
+// Call plmem_phase_to_align() after finish_backtrack_gpu() returns.
+// Call plmem_phase_to_chain() after alignment completes.
+void plmem_phase_to_align(deviceMemPtr *dev_mem);
+void plmem_phase_to_chain(deviceMemPtr *dev_mem);
 
 // data movement
 void plmem_reorg_input_arr(chain_read_t *reads, int n_read,

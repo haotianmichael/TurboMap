@@ -480,31 +480,46 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t max_batch_size = (short_batch_persistent > long_batch_persistent) ?
                              short_batch_persistent : long_batch_persistent;  // 120000
     // P1: Compact CIGAR host buffer (worst-case same total elements, but D2H transfers only real data)
+    // Use pinned memory (cudaMallocHost) for truly async D2H/H2D transfers.
+    // With pageable memory, cudaMemcpyAsync blocks until the kernel completes,
+    // making the first D2H appear to take the full kernel execution time.
     size_t cigar_buffer_size = max_batch_size * max_cigar_len;  // 240M uint32_t entries = 960MB worst-case
-    uint32_t *h_compact_cigar   = (uint32_t*)malloc(cigar_buffer_size * sizeof(uint32_t));
-    uint32_t *h_compact_offsets = (uint32_t*)calloc(max_batch_size, sizeof(uint32_t));
-    int *h_cigar_lengths = (int*)calloc(max_batch_size, sizeof(int));
-    // P2: GPU stats host buffers
-    int32_t *h_blen            = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_mlen            = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_n_ambi          = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_dp_max          = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_gpu_stats_valid = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_scores = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_query_ends = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_target_ends = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_mqe = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_mqe_t = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_mte = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_mte_q = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
+    uint32_t *h_compact_cigar = nullptr;
+    cudaMallocHost(&h_compact_cigar, cigar_buffer_size * sizeof(uint32_t));
+    uint32_t *h_compact_offsets = nullptr;
+    cudaMallocHost(&h_compact_offsets, max_batch_size * sizeof(uint32_t));
+    memset(h_compact_offsets, 0, max_batch_size * sizeof(uint32_t));
+    int *h_cigar_lengths = nullptr;
+    cudaMallocHost(&h_cigar_lengths, max_batch_size * sizeof(int));
+    memset(h_cigar_lengths, 0, max_batch_size * sizeof(int));
+    // P2: GPU stats host buffers (pinned)
+    int32_t *h_blen = nullptr, *h_mlen = nullptr, *h_n_ambi = nullptr;
+    int32_t *h_dp_max = nullptr, *h_gpu_stats_valid = nullptr;
+    int32_t *h_scores = nullptr, *h_query_ends = nullptr, *h_target_ends = nullptr;
+    int32_t *h_mqe = nullptr, *h_mqe_t = nullptr, *h_mte = nullptr, *h_mte_q = nullptr;
+    cudaMallocHost(&h_blen, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_mlen, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_n_ambi, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_dp_max, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_gpu_stats_valid, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_scores, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_query_ends, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_target_ends, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_mqe, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_mqe_t, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_mte, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_mte_q, max_batch_size * sizeof(int32_t));
 
-    // Host arrays for batch preparation (sized for LARGEST batch)
-    uint32_t *h_query_offsets = (uint32_t*)calloc(max_batch_size, sizeof(uint32_t));
-    uint32_t *h_target_offsets = (uint32_t*)calloc(max_batch_size, sizeof(uint32_t));
-    uint32_t *h_query_lens = (uint32_t*)calloc(max_batch_size, sizeof(uint32_t));
-    uint32_t *h_target_lens = (uint32_t*)calloc(max_batch_size, sizeof(uint32_t));
-    int32_t *h_flag = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
-    int32_t *h_task_to_align_id = (int32_t*)calloc(max_batch_size, sizeof(int32_t));
+    // Host arrays for batch preparation (pinned for async H2D)
+    uint32_t *h_query_offsets = nullptr, *h_target_offsets = nullptr;
+    uint32_t *h_query_lens = nullptr, *h_target_lens = nullptr;
+    int32_t *h_flag = nullptr, *h_task_to_align_id = nullptr;
+    cudaMallocHost(&h_query_offsets, max_batch_size * sizeof(uint32_t));
+    cudaMallocHost(&h_target_offsets, max_batch_size * sizeof(uint32_t));
+    cudaMallocHost(&h_query_lens, max_batch_size * sizeof(uint32_t));
+    cudaMallocHost(&h_target_lens, max_batch_size * sizeof(uint32_t));
+    cudaMallocHost(&h_flag, max_batch_size * sizeof(int32_t));
+    cudaMallocHost(&h_task_to_align_id, max_batch_size * sizeof(int32_t));
 
     int8_t h_scoring_matrix[25];
     ksw_gen_simple_mat(5, h_scoring_matrix, opt->a, opt->b, opt->sc_ambi);
@@ -1005,28 +1020,28 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     free(task_indices_short);
     free(task_indices_long);
 
-    // Cleanup host buffers (allocated once, used across all batches)
-    free(h_query_offsets);
-    free(h_target_offsets);
-    free(h_query_lens);
-    free(h_target_lens);
-    free(h_flag);
-    free(h_task_to_align_id);
-    free(h_compact_cigar);
-    free(h_compact_offsets);
-    free(h_cigar_lengths);
-    free(h_blen);
-    free(h_mlen);
-    free(h_n_ambi);
-    free(h_dp_max);
-    free(h_gpu_stats_valid);
-    free(h_scores);
-    free(h_query_ends);
-    free(h_target_ends);
-    free(h_mqe);
-    free(h_mqe_t);
-    free(h_mte);
-    free(h_mte_q);
+    // Cleanup pinned host buffers
+    cudaFreeHost(h_query_offsets);
+    cudaFreeHost(h_target_offsets);
+    cudaFreeHost(h_query_lens);
+    cudaFreeHost(h_target_lens);
+    cudaFreeHost(h_flag);
+    cudaFreeHost(h_task_to_align_id);
+    cudaFreeHost(h_compact_cigar);
+    cudaFreeHost(h_compact_offsets);
+    cudaFreeHost(h_cigar_lengths);
+    cudaFreeHost(h_blen);
+    cudaFreeHost(h_mlen);
+    cudaFreeHost(h_n_ambi);
+    cudaFreeHost(h_dp_max);
+    cudaFreeHost(h_gpu_stats_valid);
+    cudaFreeHost(h_scores);
+    cudaFreeHost(h_query_ends);
+    cudaFreeHost(h_target_ends);
+    cudaFreeHost(h_mqe);
+    cudaFreeHost(h_mqe_t);
+    cudaFreeHost(h_mte);
+    cudaFreeHost(h_mte_q);
 
     // Switch arena back to chain phase for next batch
     plmem_phase_to_chain(dev_mem);

@@ -412,16 +412,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         }
     }
 
-    int total_batches_short = (n_short_tasks + short_batch_size - 1) / short_batch_size;
-    int total_batches_long = (n_long_tasks + long_batch_size - 1) / long_batch_size;
-    int total_batches = total_batches_short + total_batches_long;
-
     fprintf(stderr, "[Info::%s] Two-tier processing: %d short tasks (max_len≤%zubp) + %d long tasks (max_len>%zubp)\n",
             __func__, n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
-    fprintf(stderr, "[Info::%s]   Short: %d batches × %zu tasks/batch\n",
-            __func__, total_batches_short, short_batch_size);
-    fprintf(stderr, "[Info::%s]   Long:  %d batches × %zu tasks/batch\n",
-            __func__, total_batches_long, long_batch_size);
 
     int kernel_threads = 256;
     uint8_t *d_unpacked_query = dev_mem->d_align_unpacked_query;
@@ -476,6 +468,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t short_batch_persistent = (size_t)dev_mem->max_align_tasks;  // 120000
     size_t cigar_buf_total_tasks   = (size_t)dev_mem->max_align_tasks;  // device allocation
     size_t long_batch_persistent   = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;  // 2400
+
+    int total_batches_short = n_short_tasks > 0 ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
+    int total_batches_long = n_long_tasks > 0 ? (int)((n_long_tasks + long_batch_persistent - 1) / long_batch_persistent) : 0;
+    int total_batches = total_batches_short + total_batches_long;
+    fprintf(stderr, "[Info::%s]   Short: %d kernel launches × %zu tasks/launch (max_align_tasks=%zu)\n",
+            __func__, total_batches_short, short_batch_persistent, (size_t)dev_mem->max_align_tasks);
+    fprintf(stderr, "[Info::%s]   Long:  %d kernel launches × %zu tasks/launch\n",
+            __func__, total_batches_long, long_batch_persistent);
+
     size_t max_batch_size = (short_batch_persistent > long_batch_persistent) ?
                              short_batch_persistent : long_batch_persistent;  // 120000
     // P1: Compact CIGAR host buffer (worst-case same total elements, but D2H transfers only real data)

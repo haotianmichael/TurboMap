@@ -352,12 +352,25 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     setup_align_phase(dev_mem);
     size_t align_size = dev_mem->arena.offset;
 
-    // ---- Allocate single arena = max(chain, align) + safety ----
-    size_t arena_size = (chain_size > align_size ? chain_size : align_size);
-    arena_size += 1 * 1024 * 1024;  // 1 MB safety margin
+    // ---- Allocate arena using available VRAM ----
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    size_t reserve = (size_t)2 * 1024 * 1024 * 1024;  // 2 GB reserve for CUDA overhead
+    size_t min_arena = (chain_size > align_size ? chain_size : align_size);
+    min_arena += 1 * 1024 * 1024;  // 1 MB safety margin
+
+    // Use most of available VRAM: max(needed, available - reserve)
+    size_t arena_size = min_arena;
+    if (free_mem > reserve && free_mem - reserve > arena_size)
+        arena_size = free_mem - reserve;
 
     void *arena_base = nullptr;
     cudaMalloc(&arena_base, arena_size);
+    if (!arena_base) {
+        // Fall back to minimum needed
+        arena_size = min_arena;
+        cudaMalloc(&arena_base, arena_size);
+    }
     if (!arena_base) {
         fprintf(stderr, "[FATAL] Failed to allocate GPU arena: %.2f GB\n",
                 arena_size / (1024.0*1024.0*1024.0));
@@ -368,14 +381,60 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     dev_mem->arena.total_size = arena_size;
     dev_mem->arena.offset     = 0;
 
+    fprintf(stderr, " [Arena] GPU VRAM: %.2f GB total, %.2f GB free\n",
+            total_mem / (1024.0*1024.0*1024.0), free_mem / (1024.0*1024.0*1024.0));
     fprintf(stderr, " [Arena] Single allocation: %.2f MB (%.2f GB)\n",
             arena_size / (1024.0*1024.0), arena_size / (1024.0*1024.0*1024.0));
     fprintf(stderr, " [Arena] Chain phase needs: %.2f MB (%.2f GB)\n",
             chain_size / (1024.0*1024.0), chain_size / (1024.0*1024.0*1024.0));
-    fprintf(stderr, " [Arena] Align phase needs: %.2f MB (%.2f GB)\n",
-            align_size / (1024.0*1024.0), align_size / (1024.0*1024.0*1024.0));
-    fprintf(stderr, " [Arena] Saved vs separate alloc: %.2f GB\n",
-            (chain_size + align_size - arena_size) / (1024.0*1024.0*1024.0));
+
+    // ---- Dynamic scaling: use extra arena memory for larger align batches ----
+    // Per-task align cost: 2×CIGAR(8KB) + metadata/stats/results(84B) + ez(48B) ≈ 16.2KB
+    // Use 17KB to account for 256-byte alignment padding per arena_alloc
+    size_t per_task_bytes = (size_t)2 * dev_mem->short_task_max_len * 2 * sizeof(uint32_t)
+                          + 21 * sizeof(int32_t) + sizeof(ksw_extz_t) + 256;  // ~16.5KB
+    if (arena_size > align_size) {
+        size_t extra = arena_size - align_size;
+        size_t extra_tasks = extra / per_task_bytes;
+        size_t old_tasks = dev_mem->max_align_tasks;
+        dev_mem->max_align_tasks += extra_tasks;
+        // Cap: HOST memory for compact CIGAR = max_align_tasks × max_cigar_len × 4
+        // Keep HOST alloc reasonable (< 2GB → max_align_tasks ≈ 250K)
+        size_t max_tasks_cap = 250000;
+        if (dev_mem->max_align_tasks > max_tasks_cap)
+            dev_mem->max_align_tasks = max_tasks_cap;
+        // Scale short batch size to match (fewer kernel launches = faster)
+        dev_mem->short_task_batch_size = (int)dev_mem->max_align_tasks;
+        // Also scale long batch size proportionally
+        dev_mem->long_task_batch_size = (int)(128.0 * dev_mem->max_align_tasks / (double)old_tasks);
+        if (dev_mem->long_task_batch_size > (int)dev_mem->max_align_tasks)
+            dev_mem->long_task_batch_size = (int)dev_mem->max_align_tasks;
+        if (dev_mem->long_task_batch_size < 128)
+            dev_mem->long_task_batch_size = 128;
+
+        // Verify: re-run align dry run with scaled params
+        gpu_arena_t verify = {(void*)256, SIZE_MAX, 0};
+        dev_mem->arena = verify;
+        setup_align_phase(dev_mem);
+        size_t scaled_align_size = dev_mem->arena.offset;
+        if (scaled_align_size > arena_size) {
+            // Scale back if doesn't fit
+            dev_mem->max_align_tasks = old_tasks;
+            dev_mem->short_task_batch_size = 4000;
+            dev_mem->long_task_batch_size = 128;
+            fprintf(stderr, " [Arena] Align scaling failed, using defaults\n");
+        } else {
+            align_size = scaled_align_size;
+        }
+        // Restore arena for real use
+        dev_mem->arena.base       = arena_base;
+        dev_mem->arena.total_size = arena_size;
+        dev_mem->arena.offset     = 0;
+    }
+
+    fprintf(stderr, " [Arena] Align phase needs: %.2f MB (%.2f GB) [max_tasks=%zu, short_batch=%d, long_batch=%d]\n",
+            align_size / (1024.0*1024.0), align_size / (1024.0*1024.0*1024.0),
+            dev_mem->max_align_tasks, dev_mem->short_task_batch_size, dev_mem->long_task_batch_size);
 
     // Set up chain phase initially
     setup_chain_phase(dev_mem, anchor_per_batch, range_grid_size, num_cut);

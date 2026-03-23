@@ -12,6 +12,7 @@
 #include "khash.h"
 #include "gpu/plalign.cuh"
 #include "ksw2.h"
+#include <nvToolsExt.h>
 
 #define __AMD_SPLIT_KERNELS__ 1
 struct mm_tbuf_s {
@@ -1292,11 +1293,12 @@ static int task_compare(const void *a, const void *b) {
     return ta->task_sub_idx - tb->task_sub_idx;
 }
 
-static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch, 
-                                       const mm_mapopt_t *opt, 
+static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
+                                       const mm_mapopt_t *opt,
                                        const mm_idx_t *mi, void *km)
 {
-    if (gpu_batch->n_tasks == 0) return;
+    nvtxRangePushA("gpu_batch_process_results");
+    if (gpu_batch->n_tasks == 0) { nvtxRangePop(); return; }
    
     qsort(gpu_batch->tasks, gpu_batch->n_tasks, 
           sizeof(gpu_align_task_t), task_compare);
@@ -1588,6 +1590,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             }
         }
     }
+    nvtxRangePop();
 }
 
 /* Forward declarations for align.c functions that lack header declarations */
@@ -1752,24 +1755,31 @@ static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
 static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s, int stream_id)
 {
+    nvtxRangePushA("prepare_align_batch_gpu");
     gpu_align_batch_t *gpu_batch = gpu_align_batch_init(batch->count, batch->km);
 
     // Process each read and collect alignment tasks
+    nvtxRangePushA("pre_align_helper_gpu_loop");
     for (int iread = 0; iread < batch->count; iread++) {
         pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
                             	batch->km, gpu_batch, iread);
     }
+    nvtxRangePop();
 
     // Submit all tasks to GPU and process results
+    nvtxRangePushA("gpu_submit_and_process");
     gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km, stream_id);
-    
-  
+    nvtxRangePop();
+
+    nvtxRangePushA("post_align_helper_gpu_loop");
 	for (int iread = 0; iread < batch->count; iread++) {
-        post_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread], 
+        post_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
                          		gpu_batch, batch->km, iread);
     }
+    nvtxRangePop();
 
 	// After Align
+    nvtxRangePushA("result_copyback");
 	int pe_ori = s->p->opt->pe_ori;
 	for (int iread = 0; iread < batch->count; iread++) {
 		int i = batch->reads[iread].seq.i;
@@ -1814,6 +1824,8 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
 			//fprintf(stderr, "QT\t%s\t%d\t%.6f\n", s->seq[off].name, tid, realtime() - t);
     }
 
+    nvtxRangePop(); // result_copyback
+
 	// Final cleanup for each read
     for (int iread = 0; iread < batch->count; iread++) {
         read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
@@ -1824,6 +1836,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     kfree(batch->km, gpu_batch->cigar_buffer);
     kfree(batch->km, gpu_batch->read_ctxs);
     kfree(batch->km, gpu_batch);
+    nvtxRangePop(); // prepare_align_batch_gpu
 }
 
 static seeded_queue_t *g_seeded_queue = NULL;
@@ -2113,12 +2126,16 @@ static void* drain_worker_fn(void *arg) {
             fprintf(stderr, "DRAIN_WORKER(%d): count=%d\n", sid, slot->batch.count);
 
         // 1. Sync chain (blocks until chain kernels finish)
+        nvtxRangePushA("sync_chain_gpu");
         sync_chain_gpu(sid);
+        nvtxRangePop();
 
         // 2. Backtrack (H2D + backtrack kernels)
+        nvtxRangePushA("start_backtrack_gpu");
         int bt_n = 0;
         start_backtrack_gpu(s->p->mi, s->p->opt, slot->batch.reads,
                             sid, slot->batch.km, &bt_n);
+        nvtxRangePop();
 
         // 3. Defer overflow reads to per-worker fallback batch
         for (int r_ = bt_n; r_ < slot->batch.count; r_++) {
@@ -2129,17 +2146,24 @@ static void* drain_worker_fn(void *arg) {
         slot->batch.count = bt_n;
 
         // 4. Finish backtrack (voting + post_chain)
+        nvtxRangePushA("finish_backtrack_gpu");
         finish_backtrack_gpu(s->p->mi, s->p->opt, slot->batch.reads,
                              bt_n, sid, slot->batch.km);
+        nvtxRangePop();
 
         // 5. Alignment (KSW) — uses this stream's device memory
+        nvtxRangePushA("copy_rep_frag");
         copy_rep_frag(s, &slot->batch);
+        nvtxRangePop();
         prepare_align_batch_gpu(&slot->batch, wb, s, sid);
+        nvtxRangePushA("batch_reset");
         mm_trbuf_batch_reset(&slot->batch, slot->batch_max_reads, s->p->opt);
+        nvtxRangePop();
 
         // 6. Process fallback reads with multi-threaded CPU chain (-t threads)
         //    instead of deferring them to the end.
         if (slot->fallback_batch.count > 0) {
+            nvtxRangePushA("fallback_cpu_chain");
             int fb_count = slot->fallback_batch.count;
             int n_threads = slot->n_fb_threads;
             // Don't spawn more threads than reads
@@ -2180,6 +2204,7 @@ static void* drain_worker_fn(void *arg) {
 
             // Reset fallback batch for next iteration
             mm_trbuf_batch_reset(&slot->fallback_batch, slot->batch_max_reads, s->p->opt);
+            nvtxRangePop(); // fallback_cpu_chain
         }
 
         // Signal main thread: drain complete
@@ -2308,7 +2333,9 @@ static void* gpu_batch_consumer(void *data) {
                         acc_batch.count, acc_batch.total_n);
 
             // Launch chain on stream 0 (async)
+            nvtxRangePushA("launch_chain_gpu");
             int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count, 0);
+            nvtxRangePop();
 
             // Defer overflow reads to fallback batch
             if (overflow > 0) {

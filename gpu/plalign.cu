@@ -3,6 +3,7 @@
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
 #include "plksw2_kernel.cuh"  // CUDASW4-style column-parallel kernel
+#include <nvToolsExt.h>
 #include <cub/device/device_scan.cuh>
 
 
@@ -369,6 +370,7 @@ extern "C" void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                             uint8_t *seq_buffer, uint32_t *cigar_buffer, int stream_id) {
     if (n_tasks <= 0) return;
+    nvtxRangePushA("gpu_align_batch_execute");
     cudaSetDevice(0);
     gpu_align_copy_param();
 
@@ -1045,4 +1047,5 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     // Switch arena back to chain phase for next batch
     plmem_phase_to_chain(dev_mem);
+    nvtxRangePop(); // gpu_align_batch_execute
 }

@@ -379,6 +379,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         return;
     }
 
+    // Switch arena from chain phase to align phase
+    plmem_phase_to_align(dev_mem);
+
     // ========== Two-Tier Batched Processing Setup ==========
     // Strategy: Process short tasks (max_len <= 1000bp) first with large batches,
     //           then process long tasks (max_len > 1000bp) with smaller batches
@@ -1023,4 +1026,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     free(h_mqe_t);
     free(h_mte);
     free(h_mte_q);
+
+    // Switch arena back to chain phase for next batch
+    plmem_phase_to_chain(dev_mem);
 }

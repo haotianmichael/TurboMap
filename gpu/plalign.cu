@@ -3,8 +3,8 @@
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
 #include "plksw2_kernel.cuh"  // CUDASW4-style column-parallel kernel
-#include <nvToolsExt.h>
 #include <cub/device/device_scan.cuh>
+// NVTX3 C API (nvtxRangePushA/nvtxRangePop) already available via cub/detail/nvtx.cuh
 
 
 #define CHECKCUDAERROR(error) \

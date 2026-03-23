@@ -1997,11 +1997,6 @@ typedef struct {
 
     // Per-worker batch sizing (set once during init)
     int batch_max_reads;
-
-    // Pre-allocated per-thread resources for CPU fallback chain (reused across iterations)
-    int n_fb_threads;
-    mm_tbuf_t **fb_tbufs;
-    void **fb_kms;
 } gpu_stream_slot_t;
 
 // Shared context passed to each drain worker
@@ -2026,76 +2021,7 @@ static void copy_rep_frag(step_t *s, mm_batch_trbuf_t *batch) {
     }
 }
 
-// ── Multi-threaded CPU fallback chain ─────────────────────────────────
-// Context for kt_for callback that runs mm_map_chain on fallback reads.
-typedef struct {
-    chain_read_t *reads;
-    const mm_idx_t *mi;
-    const mm_mapopt_t *opt;
-    mm_tbuf_t **tbufs;   // per-thread tbufs (scratch + timers)
-    void **kms;           // per-thread kms (chain allocations)
-} fallback_chain_ctx_t;
 
-// kt_for callback: CPU chain for a single fallback read using per-thread km
-static void fallback_chain_worker(void *data, long i, int tid) {
-    if (i < 0) return;  // sentinel from __AMD_SPLIT_KERNELS__ kt_for
-    fallback_chain_ctx_t *ctx = (fallback_chain_ctx_t*)data;
-    chain_read_t *read = &ctx->reads[i];
-    void *km = ctx->kms[tid];
-
-    // Re-allocate read's a and mini_pos into per-thread km so that
-    // kfree() inside mm_map_chain operates on the correct allocator.
-    // The originals (in fallback_batch.km) become leaked but are
-    // cleaned up when fallback_batch.km is reset after alignment.
-    if (read->a && read->n > 0) {
-        mm128_t *new_a = (mm128_t*)kmalloc(km, read->n * sizeof(mm128_t));
-        memcpy(new_a, read->a, read->n * sizeof(mm128_t));
-        read->a = new_a;
-    }
-    if (read->mini_pos && read->n_mini_pos > 0) {
-        uint64_t *new_mp = (uint64_t*)kmalloc(km, read->n_mini_pos * sizeof(uint64_t));
-        memcpy(new_mp, read->mini_pos, read->n_mini_pos * sizeof(uint64_t));
-        read->mini_pos = new_mp;
-    }
-
-    mm_map_chain(ctx->mi, ctx->opt, read, ctx->tbufs[tid], km);
-}
-
-// After kt_for completes, copy chain results (a, u, mini_pos) from
-// per-thread kms back into the fallback batch km so that alignment's
-// kfree(batch->km, ...) works correctly.
-// IMPORTANT: After mm_map_chain, compact_a() shrinks `a` to n_v entries
-// (= sum of (uint32_t)u[i]), but read->n is NOT updated.  We must
-// compute the real anchor count from u[] to avoid reading past the
-// allocation.
-static void fallback_migrate_to_batch_km(chain_read_t *reads, int count, void *batch_km) {
-    for (int r = 0; r < count; r++) {
-        chain_read_t *read = &reads[r];
-
-        // Compute actual anchor count from chain descriptors
-        int64_t n_a = 0;
-        if (read->u && read->n_u > 0) {
-            for (int j = 0; j < read->n_u; j++)
-                n_a += (int32_t)(read->u[j]);
-        }
-
-        if (read->a && n_a > 0) {
-            mm128_t *new_a = (mm128_t*)kmalloc(batch_km, n_a * sizeof(mm128_t));
-            memcpy(new_a, read->a, n_a * sizeof(mm128_t));
-            read->a = new_a;
-        }
-        if (read->u && read->n_u > 0) {
-            uint64_t *new_u = (uint64_t*)kmalloc(batch_km, read->n_u * sizeof(uint64_t));
-            memcpy(new_u, read->u, read->n_u * sizeof(uint64_t));
-            read->u = new_u;
-        }
-        if (read->mini_pos && read->n_mini_pos > 0) {
-            uint64_t *new_mp = (uint64_t*)kmalloc(batch_km, read->n_mini_pos * sizeof(uint64_t));
-            memcpy(new_mp, read->mini_pos, read->n_mini_pos * sizeof(uint64_t));
-            read->mini_pos = new_mp;
-        }
-    }
-}
 
 // Drain worker thread function.
 // Each worker owns one CUDA stream and processes batches independently.
@@ -2137,9 +2063,8 @@ static void* drain_worker_fn(void *arg) {
                             sid, slot->batch.km, &bt_n);
         nvtxRangePop();
 
-        // 3. Defer overflow reads to per-worker fallback batch
+        // 3. Collect overflow reads (couldn't fit in backtrack) into fallback batch
         for (int r_ = bt_n; r_ < slot->batch.count; r_++) {
-            fprintf(stderr, "[INFO] Stream %d: deferring read %d to fallback\n", sid, r_);
             deep_copy_read_to_batch(&slot->fallback_batch,
                                     &slot->batch.reads[r_], s->p->opt);
         }
@@ -2160,51 +2085,76 @@ static void* drain_worker_fn(void *arg) {
         mm_trbuf_batch_reset(&slot->batch, slot->batch_max_reads, s->p->opt);
         nvtxRangePop();
 
-        // 6. Process fallback reads with multi-threaded CPU chain (-t threads)
-        //    instead of deferring them to the end.
-        if (slot->fallback_batch.count > 0) {
-            nvtxRangePushA("fallback_cpu_chain");
+        // 6. Re-chain overflow reads on GPU (loop until all processed)
+        //    Stream is now free — reuse it for the overflow batch.
+        while (slot->fallback_batch.count > 0) {
+            nvtxRangePushA("gpu_rechain_overflow");
             int fb_count = slot->fallback_batch.count;
-            int n_threads = slot->n_fb_threads;
-            // Don't spawn more threads than reads
-            int use_threads = n_threads < fb_count ? n_threads : fb_count;
 
-            fprintf(stderr, "[INFO] Stream %d: CPU chain %d fallback reads with %d threads\n",
-                    sid, fb_count, use_threads);
+            if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
+                fprintf(stderr, "RECHAIN_GPU(%d): %d overflow reads\n", sid, fb_count);
 
-            // Multi-threaded CPU chain via kt_for (uses pre-allocated tbufs/kms)
-            fallback_chain_ctx_t fb_ctx;
-            fb_ctx.reads = slot->fallback_batch.reads;
-            fb_ctx.mi    = s->p->mi;
-            fb_ctx.opt   = s->p->opt;
-            fb_ctx.tbufs = slot->fb_tbufs;
-            fb_ctx.kms   = slot->fb_kms;
-            kt_for(use_threads, fallback_chain_worker, &fb_ctx, fb_count);
+            // Re-launch chain on GPU for overflow reads
+            nvtxRangePushA("launch_chain_gpu_overflow");
+            launch_chain_gpu(slot->fallback_batch.reads, fb_count, sid);
+            nvtxRangePop();
 
-            // Migrate chain results (a, u, mini_pos) from per-thread kms
-            // back into fallback_batch.km so alignment's kfree works correctly
-            fallback_migrate_to_batch_km(slot->fallback_batch.reads, fb_count,
-                                         slot->fallback_batch.km);
+            // Sync + backtrack
+            nvtxRangePushA("sync_chain_gpu");
+            sync_chain_gpu(sid);
+            nvtxRangePop();
 
-            // Reset per-thread kms for reuse (don't destroy — pre-allocated)
-            for (int t = 0; t < use_threads; t++) {
-                km_destroy(slot->fb_kms[t]);
-                slot->fb_kms[t] = km_init();
+            nvtxRangePushA("start_backtrack_gpu");
+            int bt_n2 = 0;
+            start_backtrack_gpu(s->p->mi, s->p->opt, slot->fallback_batch.reads,
+                                sid, slot->fallback_batch.km, &bt_n2);
+            nvtxRangePop();
+
+            // Guard: if no reads were processed, we're stuck (e.g. single read
+            // exceeds GPU micro-batch capacity).  Drop these reads to avoid
+            // an infinite loop.
+            if (bt_n2 == 0) {
+                fprintf(stderr, "[WARNING] Stream %d: %d reads too large for GPU "
+                        "chain, skipping\n", sid, fb_count);
+                mm_trbuf_batch_reset(&slot->fallback_batch,
+                                     slot->batch_max_reads, s->p->opt);
+                nvtxRangePop(); // gpu_rechain_overflow
+                break;
             }
 
-            // Alignment for fallback reads (reuses this stream's GPU)
+            // If still overflow from backtrack, defer remaining for next iteration.
+            int remaining = fb_count - bt_n2;
+            chain_read_t *deferred = NULL;
+            if (remaining > 0) {
+                deferred = (chain_read_t*)malloc(remaining * sizeof(chain_read_t));
+                memcpy(deferred, &slot->fallback_batch.reads[bt_n2],
+                       remaining * sizeof(chain_read_t));
+            }
+
+            // Finish backtrack + align for the reads that fit
+            nvtxRangePushA("finish_backtrack_gpu");
+            finish_backtrack_gpu(s->p->mi, s->p->opt, slot->fallback_batch.reads,
+                                 bt_n2, sid, slot->fallback_batch.km);
+            nvtxRangePop();
+
             mm_batch_trbuf_t fb_align_batch;
             fb_align_batch.reads   = slot->fallback_batch.reads;
-            fb_align_batch.count   = fb_count;
+            fb_align_batch.count   = bt_n2;
             fb_align_batch.total_n = slot->fallback_batch.total_n;
             fb_align_batch.km      = slot->fallback_batch.km;
             fb_align_batch.batchid = -1;
             copy_rep_frag(s, &fb_align_batch);
             prepare_align_batch_gpu(&fb_align_batch, wb, s, sid);
 
-            // Reset fallback batch for next iteration
+            // Prepare next iteration: put deferred reads back
             mm_trbuf_batch_reset(&slot->fallback_batch, slot->batch_max_reads, s->p->opt);
-            nvtxRangePop(); // fallback_cpu_chain
+            if (remaining > 0) {
+                memcpy(slot->fallback_batch.reads, deferred,
+                       remaining * sizeof(chain_read_t));
+                slot->fallback_batch.count = remaining;
+                free(deferred);
+            }
+            nvtxRangePop(); // gpu_rechain_overflow
         }
 
         // Signal main thread: drain complete
@@ -2239,15 +2189,6 @@ static void* gpu_batch_consumer(void *data) {
     pthread_mutex_init(&slot.mutex, NULL);
     pthread_cond_init(&slot.cond_work, NULL);
     pthread_cond_init(&slot.cond_done, NULL);
-
-    // Pre-allocate per-thread resources for CPU fallback chain
-    slot.n_fb_threads = s->p->n_threads;
-    slot.fb_tbufs = (mm_tbuf_t**)calloc(s->p->n_threads, sizeof(mm_tbuf_t*));
-    slot.fb_kms   = (void**)calloc(s->p->n_threads, sizeof(void*));
-    for (int t = 0; t < s->p->n_threads; t++) {
-        slot.fb_tbufs[t] = mm_tbuf_init();
-        slot.fb_kms[t]   = km_init();
-    }
 
     drain_worker_ctx_t worker_ctx;
     worker_ctx.s = s;
@@ -2386,12 +2327,6 @@ static void* gpu_batch_consumer(void *data) {
     km_destroy(slot.batch.km);
     free(slot.fallback_batch.reads);
     km_destroy(slot.fallback_batch.km);
-    for (int t = 0; t < slot.n_fb_threads; t++) {
-        mm_tbuf_destroy(slot.fb_tbufs[t]);
-        km_destroy(slot.fb_kms[t]);
-    }
-    free(slot.fb_tbufs);
-    free(slot.fb_kms);
     pthread_mutex_destroy(&slot.mutex);
     pthread_cond_destroy(&slot.cond_work);
     pthread_cond_destroy(&slot.cond_done);

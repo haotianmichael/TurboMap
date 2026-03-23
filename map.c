@@ -2051,42 +2051,34 @@ static void* drain_worker_fn(void *arg) {
         if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
             fprintf(stderr, "DRAIN_WORKER(%d): count=%d\n", sid, slot->batch.count);
 
-        // 1. Sync chain (blocks until chain kernels finish)
+        // ── Process main batch (chain already launched by consumer) ──
         nvtxRangePushA("sync_chain_gpu");
         sync_chain_gpu(sid);
         nvtxRangePop();
 
-        // 2. Backtrack (H2D + backtrack kernels)
         nvtxRangePushA("start_backtrack_gpu");
         int bt_n = 0;
         start_backtrack_gpu(s->p->mi, s->p->opt, slot->batch.reads,
                             sid, slot->batch.km, &bt_n);
         nvtxRangePop();
+        // bt_n == batch.count: backtrack processes exactly what chain fitted.
+        // Chain overflow was already moved to fallback_batch by the consumer.
 
-        // 3. Collect overflow reads (couldn't fit in backtrack) into fallback batch
-        for (int r_ = bt_n; r_ < slot->batch.count; r_++) {
-            deep_copy_read_to_batch(&slot->fallback_batch,
-                                    &slot->batch.reads[r_], s->p->opt);
-        }
-        slot->batch.count = bt_n;
-
-        // 4. Finish backtrack (voting + post_chain)
         nvtxRangePushA("finish_backtrack_gpu");
         finish_backtrack_gpu(s->p->mi, s->p->opt, slot->batch.reads,
                              bt_n, sid, slot->batch.km);
         nvtxRangePop();
 
-        // 5. Alignment (KSW) — uses this stream's device memory
-        nvtxRangePushA("copy_rep_frag");
+        slot->batch.count = bt_n;
         copy_rep_frag(s, &slot->batch);
-        nvtxRangePop();
         prepare_align_batch_gpu(&slot->batch, wb, s, sid);
-        nvtxRangePushA("batch_reset");
         mm_trbuf_batch_reset(&slot->batch, slot->batch_max_reads, s->p->opt);
-        nvtxRangePop();
 
-        // 6. Re-chain overflow reads on GPU (loop until all processed)
-        //    Stream is now free — reuse it for the overflow batch.
+        // ── Re-chain overflow reads on GPU ───────────────────────────
+        // Overflow reads (from launch_chain_gpu in consumer) are in
+        // fallback_batch. Run them through the full GPU pipeline.
+        // Loop handles the rare case where overflow still doesn't fit
+        // in one shot.
         while (slot->fallback_batch.count > 0) {
             nvtxRangePushA("gpu_rechain_overflow");
             int fb_count = slot->fallback_batch.count;
@@ -2094,68 +2086,54 @@ static void* drain_worker_fn(void *arg) {
             if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
                 fprintf(stderr, "RECHAIN_GPU(%d): %d overflow reads\n", sid, fb_count);
 
-            // Re-launch chain on GPU for overflow reads
-            nvtxRangePushA("launch_chain_gpu_overflow");
-            launch_chain_gpu(slot->fallback_batch.reads, fb_count, sid);
-            nvtxRangePop();
+            int overflow = launch_chain_gpu(slot->fallback_batch.reads, fb_count, sid);
+            (void)overflow; // overflow handled via bt_n2 from backtrack
 
-            // Sync + backtrack
-            nvtxRangePushA("sync_chain_gpu");
             sync_chain_gpu(sid);
-            nvtxRangePop();
 
-            nvtxRangePushA("start_backtrack_gpu");
             int bt_n2 = 0;
             start_backtrack_gpu(s->p->mi, s->p->opt, slot->fallback_batch.reads,
                                 sid, slot->fallback_batch.km, &bt_n2);
-            nvtxRangePop();
 
-            // Guard: if no reads were processed, we're stuck (e.g. single read
-            // exceeds GPU micro-batch capacity).  Drop these reads to avoid
-            // an infinite loop.
+            // Safety: if nothing fits, single read exceeds GPU capacity — skip
             if (bt_n2 == 0) {
-                fprintf(stderr, "[WARNING] Stream %d: %d reads too large for GPU "
-                        "chain, skipping\n", sid, fb_count);
+                fprintf(stderr, "[WARNING] Stream %d: %d reads exceed GPU "
+                        "capacity, skipping\n", sid, fb_count);
                 mm_trbuf_batch_reset(&slot->fallback_batch,
                                      slot->batch_max_reads, s->p->opt);
-                nvtxRangePop(); // gpu_rechain_overflow
+                nvtxRangePop();
                 break;
             }
 
-            // If still overflow from backtrack, defer remaining for next iteration.
-            int remaining = fb_count - bt_n2;
-            chain_read_t *deferred = NULL;
-            if (remaining > 0) {
-                deferred = (chain_read_t*)malloc(remaining * sizeof(chain_read_t));
-                memcpy(deferred, &slot->fallback_batch.reads[bt_n2],
-                       remaining * sizeof(chain_read_t));
-            }
-
-            // Finish backtrack + align for the reads that fit
-            nvtxRangePushA("finish_backtrack_gpu");
             finish_backtrack_gpu(s->p->mi, s->p->opt, slot->fallback_batch.reads,
                                  bt_n2, sid, slot->fallback_batch.km);
-            nvtxRangePop();
 
-            mm_batch_trbuf_t fb_align_batch;
-            fb_align_batch.reads   = slot->fallback_batch.reads;
-            fb_align_batch.count   = bt_n2;
-            fb_align_batch.total_n = slot->fallback_batch.total_n;
-            fb_align_batch.km      = slot->fallback_batch.km;
-            fb_align_batch.batchid = -1;
-            copy_rep_frag(s, &fb_align_batch);
-            prepare_align_batch_gpu(&fb_align_batch, wb, s, sid);
+            // Align the fitted reads
+            mm_batch_trbuf_t fb_align;
+            fb_align.reads   = slot->fallback_batch.reads;
+            fb_align.count   = bt_n2;
+            fb_align.total_n = slot->fallback_batch.total_n;
+            fb_align.km      = slot->fallback_batch.km;
+            fb_align.batchid = -1;
+            copy_rep_frag(s, &fb_align);
+            prepare_align_batch_gpu(&fb_align, wb, s, sid);
 
-            // Prepare next iteration: put deferred reads back
-            mm_trbuf_batch_reset(&slot->fallback_batch, slot->batch_max_reads, s->p->opt);
+            // Shift remaining overflow reads to front for next iteration
+            int remaining = fb_count - bt_n2;
             if (remaining > 0) {
-                memcpy(slot->fallback_batch.reads, deferred,
-                       remaining * sizeof(chain_read_t));
-                slot->fallback_batch.count = remaining;
-                free(deferred);
+                memmove(slot->fallback_batch.reads,
+                        &slot->fallback_batch.reads[bt_n2],
+                        remaining * sizeof(chain_read_t));
             }
+            slot->fallback_batch.count = remaining;
             nvtxRangePop(); // gpu_rechain_overflow
         }
+        // Reset fallback km for next drain cycle
+        if (slot->fallback_batch.km)
+            km_destroy(slot->fallback_batch.km);
+        slot->fallback_batch.km = km_init();
+        slot->fallback_batch.count = 0;
+        slot->fallback_batch.total_n = 0;
 
         // Signal main thread: drain complete
         pthread_mutex_lock(&slot->mutex);

@@ -282,6 +282,32 @@ typedef struct {
     int      *bt_h_offset;           // host: per-read offset in d_bt_*_out
     int      *bt_h_n_u;              // host: chains per read
 
+    // ========== Pre-allocated Pinned Host Buffers (alignment D2H/H2D) ==========
+    // Allocated once during init, reused across all gpu_align_batch_execute calls.
+    // Eliminates 22× cudaMallocHost/cudaFreeHost per batch (each is a mlock syscall).
+    size_t    h_align_max_batch;          // max_batch_size used to size these buffers
+    uint32_t *h_align_compact_cigar;     // compact CIGAR data
+    uint32_t *h_align_compact_offsets;   // per-task CIGAR offsets
+    int      *h_align_cigar_lengths;     // per-task CIGAR lengths
+    int32_t  *h_align_blen;
+    int32_t  *h_align_mlen;
+    int32_t  *h_align_n_ambi;
+    int32_t  *h_align_dp_max;
+    int32_t  *h_align_gpu_stats_valid;
+    int32_t  *h_align_scores;
+    int32_t  *h_align_query_ends;
+    int32_t  *h_align_target_ends;
+    int32_t  *h_align_mqe;
+    int32_t  *h_align_mqe_t;
+    int32_t  *h_align_mte;
+    int32_t  *h_align_mte_q;
+    uint32_t *h_align_query_offsets;
+    uint32_t *h_align_target_offsets;
+    uint32_t *h_align_query_lens;
+    uint32_t *h_align_target_lens;
+    int32_t  *h_align_flag;
+    int32_t  *h_align_task_to_align_id;
+
 } deviceMemPtr;
 
 typedef struct stream_ptr_t{

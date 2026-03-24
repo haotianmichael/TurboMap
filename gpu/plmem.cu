@@ -443,6 +443,43 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             dev_mem->arena.offset / (1024.0*1024.0),
             dev_mem->arena.total_size / (1024.0*1024.0));
 
+    // ---- Pre-allocate pinned host buffers for alignment D2H/H2D ----
+    // These were previously allocated/freed inside every gpu_align_batch_execute call
+    // (22× cudaMallocHost + 22× cudaFreeHost per batch = expensive mlock syscalls).
+    {
+        size_t short_bp = (size_t)dev_mem->max_align_tasks;
+        size_t long_cigar_l = 2 * dev_mem->max_align_query_len;
+        size_t long_bp = dev_mem->max_align_tasks * dev_mem->max_align_cigar_len / long_cigar_l;
+        size_t mbs = (short_bp > long_bp) ? short_bp : long_bp;
+        size_t cigar_buf_sz = mbs * dev_mem->max_align_cigar_len;
+        dev_mem->h_align_max_batch = mbs;
+
+        cudaMallocHost(&dev_mem->h_align_compact_cigar,   cigar_buf_sz * sizeof(uint32_t));
+        cudaMallocHost(&dev_mem->h_align_compact_offsets,  mbs * sizeof(uint32_t));
+        cudaMallocHost(&dev_mem->h_align_cigar_lengths,    mbs * sizeof(int));
+        cudaMallocHost(&dev_mem->h_align_blen,             mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_mlen,             mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_n_ambi,           mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_dp_max,           mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_gpu_stats_valid,  mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_scores,           mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_query_ends,       mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_target_ends,      mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_mqe,              mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_mqe_t,            mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_mte,              mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_mte_q,            mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_query_offsets,    mbs * sizeof(uint32_t));
+        cudaMallocHost(&dev_mem->h_align_target_offsets,   mbs * sizeof(uint32_t));
+        cudaMallocHost(&dev_mem->h_align_query_lens,       mbs * sizeof(uint32_t));
+        cudaMallocHost(&dev_mem->h_align_target_lens,      mbs * sizeof(uint32_t));
+        cudaMallocHost(&dev_mem->h_align_flag,             mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_task_to_align_id, mbs * sizeof(int32_t));
+
+        fprintf(stderr, " [Arena] Pinned host buffers: %.2f MB (max_batch=%zu)\n",
+                (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0), mbs);
+    }
+
     cudaCheck();
 }
 
@@ -453,6 +490,28 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
         dev_mem->arena.total_size = 0;
         dev_mem->arena.offset     = 0;
     }
+    // Free pre-allocated pinned host buffers
+    cudaFreeHost(dev_mem->h_align_compact_cigar);
+    cudaFreeHost(dev_mem->h_align_compact_offsets);
+    cudaFreeHost(dev_mem->h_align_cigar_lengths);
+    cudaFreeHost(dev_mem->h_align_blen);
+    cudaFreeHost(dev_mem->h_align_mlen);
+    cudaFreeHost(dev_mem->h_align_n_ambi);
+    cudaFreeHost(dev_mem->h_align_dp_max);
+    cudaFreeHost(dev_mem->h_align_gpu_stats_valid);
+    cudaFreeHost(dev_mem->h_align_scores);
+    cudaFreeHost(dev_mem->h_align_query_ends);
+    cudaFreeHost(dev_mem->h_align_target_ends);
+    cudaFreeHost(dev_mem->h_align_mqe);
+    cudaFreeHost(dev_mem->h_align_mqe_t);
+    cudaFreeHost(dev_mem->h_align_mte);
+    cudaFreeHost(dev_mem->h_align_mte_q);
+    cudaFreeHost(dev_mem->h_align_query_offsets);
+    cudaFreeHost(dev_mem->h_align_target_offsets);
+    cudaFreeHost(dev_mem->h_align_query_lens);
+    cudaFreeHost(dev_mem->h_align_target_lens);
+    cudaFreeHost(dev_mem->h_align_flag);
+    cudaFreeHost(dev_mem->h_align_task_to_align_id);
     cudaCheck();
 }
 

@@ -190,7 +190,7 @@ typedef struct {
     size_t long_task_batch_size;  // batch size for long tasks (max(qlen,tlen) > 1000bp)
     size_t short_task_max_len;    // max sequence length for short tasks (1000bp)
     
-    // Sequence data
+    // Sequence data (double-buffered [A/B] for dual-stream H2D overlap)
     uint8_t *d_align_unpacked_query;
     uint8_t *d_align_unpacked_target;
     uint32_t *d_align_packed_query;
@@ -200,6 +200,14 @@ typedef struct {
     uint32_t *d_align_query_lens;
     uint32_t *d_align_target_lens;
     int32_t *d_align_flag;
+    // Buffer B (ping-pong partner for dual-stream overlap)
+    uint8_t  *d_align_unpacked_query_b;
+    uint8_t  *d_align_unpacked_target_b;
+    uint32_t *d_align_query_offsets_b;
+    uint32_t *d_align_target_offsets_b;
+    uint32_t *d_align_query_lens_b;
+    uint32_t *d_align_target_lens_b;
+    int32_t  *d_align_flag_b;
 
     // Working buffers
     void *d_align_global_buffer;     // AGATHA working buffer
@@ -318,7 +326,9 @@ typedef struct stream_ptr_t{
     longMemPtr long_mem;
     deviceMemPtr dev_mem;
     cudaStream_t cudastream;
+    cudaStream_t align_xfer_stream;   // second stream for H2D overlap
     cudaEvent_t stopevent, startevent;
+    cudaEvent_t align_h2d_event;      // signals H2D prefetch complete
     bool busy = false;
 } stream_ptr_t;
 
@@ -337,6 +347,8 @@ extern "C" {
 #endif
 deviceMemPtr* gpu_get_dev_mem(int stream_id);
 cudaStream_t  gpu_get_cudastream(int stream_id);
+cudaStream_t  gpu_get_align_xfer_stream(int stream_id);
+cudaEvent_t   gpu_get_align_h2d_event(int stream_id);
 #ifdef __cplusplus
 }
 #endif

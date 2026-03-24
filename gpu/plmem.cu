@@ -236,6 +236,14 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_query_lens      = (uint32_t*)arena_alloc(a, metadata_size);
     dev_mem->d_align_target_lens     = (uint32_t*)arena_alloc(a, metadata_size);
     dev_mem->d_align_flag            = (int32_t*)arena_alloc(a, metadata_size);
+    // Buffer B (ping-pong partner for dual-stream H2D overlap)
+    dev_mem->d_align_unpacked_query_b  = (uint8_t*)arena_alloc(a, seq_unpacked_size);
+    dev_mem->d_align_unpacked_target_b = (uint8_t*)arena_alloc(a, seq_unpacked_size);
+    dev_mem->d_align_query_offsets_b   = (uint32_t*)arena_alloc(a, metadata_size);
+    dev_mem->d_align_target_offsets_b  = (uint32_t*)arena_alloc(a, metadata_size);
+    dev_mem->d_align_query_lens_b      = (uint32_t*)arena_alloc(a, metadata_size);
+    dev_mem->d_align_target_lens_b     = (uint32_t*)arena_alloc(a, metadata_size);
+    dev_mem->d_align_flag_b            = (int32_t*)arena_alloc(a, metadata_size);
 
     // ---- Global DP buffer ----
     size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_query_len * 4;
@@ -977,8 +985,10 @@ void plmem_stream_initialize(size_t *max_total_n_,
     for (int i = 0; i < num_stream; i++) {
         stream_setup.streams[i].busy = false;
         cudaStreamCreate(&stream_setup.streams[i].cudastream);
+        cudaStreamCreate(&stream_setup.streams[i].align_xfer_stream);
         cudaEventCreate(&stream_setup.streams[i].stopevent);
         cudaEventCreate(&stream_setup.streams[i].startevent);
+        cudaEventCreateWithFlags(&stream_setup.streams[i].align_h2d_event, cudaEventDisableTiming);
         cudaCheck();
         stream_setup.streams[i].dev_mem.buffer_size_long = long_seg_buffer_size;
         // one stream has multiple host mems
@@ -1017,8 +1027,10 @@ void plmem_stream_cleanup() {
     cudaCheck();
     for (int i = 0; i < stream_setup.num_stream; i++) {
         cudaStreamDestroy(stream_setup.streams[i].cudastream);
+        cudaStreamDestroy(stream_setup.streams[i].align_xfer_stream);
         cudaEventDestroy(stream_setup.streams[i].stopevent);
         cudaEventDestroy(stream_setup.streams[i].startevent);
+        cudaEventDestroy(stream_setup.streams[i].align_h2d_event);
         cudaCheck();
         // free multiple host mems
         for (int j = 0; j < score_kernel_config.micro_batch; j++) {

@@ -2001,6 +2001,7 @@ typedef struct {
     step_t *s;
     gpu_stream_slot_t *slot;
     int stream_id;
+    mm_tbuf_t *wb;  // dedicated tbuf (avoids conflict with seeding threads)
 } drain_worker_ctx_t;
 
 // Helper: copy rep_len/frag_gap from batch reads back to step arrays
@@ -2029,7 +2030,7 @@ static void* drain_worker_fn(void *arg) {
     step_t *s = ctx->s;
     gpu_stream_slot_t *slot = ctx->slot;
     int sid = ctx->stream_id;
-    mm_tbuf_t *wb = s->buf[sid];  // per-stream tbuf
+    mm_tbuf_t *wb = ctx->wb;  // dedicated tbuf (not shared with seeding threads)
 
     while (1) {
         // Wait for work signal from main thread
@@ -2086,7 +2087,8 @@ static void* drain_worker_fn(void *arg) {
 
 static void* gpu_batch_consumer(void *data) {
     step_t *s = (step_t*)data;
-    mm_tbuf_t *b = s->buf[0];
+
+    #define NUM_GPU_STREAMS 2
 
     #define INIT_BATCH(b_, id_) do { \
         (b_).km = km_init(); \
@@ -2097,48 +2099,52 @@ static void* gpu_batch_consumer(void *data) {
         (b_).batchid = (id_); \
     } while (0)
 
-    // Single stream slot (stream 0)
-    gpu_stream_slot_t slot;
-    memset(&slot, 0, sizeof(slot));
-    INIT_BATCH(slot.batch, 0);
-    slot.batch_max_reads = s->batch_max_reads;
-    pthread_mutex_init(&slot.mutex, NULL);
-    pthread_cond_init(&slot.cond_work, NULL);
-    pthread_cond_init(&slot.cond_done, NULL);
-
-    drain_worker_ctx_t worker_ctx;
-    worker_ctx.s = s;
-    worker_ctx.slot = &slot;
-    worker_ctx.stream_id = 0;
+    // Two stream slots for pipeline overlap
+    gpu_stream_slot_t slots[NUM_GPU_STREAMS];
+    drain_worker_ctx_t worker_ctxs[NUM_GPU_STREAMS];
+    for (int i = 0; i < NUM_GPU_STREAMS; i++) {
+        memset(&slots[i], 0, sizeof(gpu_stream_slot_t));
+        INIT_BATCH(slots[i].batch, i);
+        slots[i].batch_max_reads = s->batch_max_reads;
+        pthread_mutex_init(&slots[i].mutex, NULL);
+        pthread_cond_init(&slots[i].cond_work, NULL);
+        pthread_cond_init(&slots[i].cond_done, NULL);
+        worker_ctxs[i].s = s;
+        worker_ctxs[i].slot = &slots[i];
+        worker_ctxs[i].stream_id = i;
+        worker_ctxs[i].wb = mm_tbuf_init();  // dedicated tbuf per drain worker
+    }
 
     mm_batch_trbuf_t acc_batch;
     INIT_BATCH(acc_batch, -1);
     #undef INIT_BATCH
 
-    // Start single drain worker thread
-    pthread_create(&slot.thread, NULL, drain_worker_fn, &worker_ctx);
+    // Start drain worker threads (one per stream)
+    for (int i = 0; i < NUM_GPU_STREAMS; i++)
+        pthread_create(&slots[i].thread, NULL, drain_worker_fn, &worker_ctxs[i]);
 
-    #define SIGNAL_DRAIN() do { \
-        pthread_mutex_lock(&slot.mutex); \
-        slot.work_ready = 1; \
-        slot.drain_done = 0; \
-        pthread_cond_signal(&slot.cond_work); \
-        pthread_mutex_unlock(&slot.mutex); \
+    #define SIGNAL_DRAIN(sl_) do { \
+        pthread_mutex_lock(&(sl_)->mutex); \
+        (sl_)->work_ready = 1; \
+        (sl_)->drain_done = 0; \
+        pthread_cond_signal(&(sl_)->cond_work); \
+        pthread_mutex_unlock(&(sl_)->mutex); \
     } while (0)
 
-    #define WAIT_DRAIN() do { \
-        pthread_mutex_lock(&slot.mutex); \
-        while (!slot.drain_done) \
-            pthread_cond_wait(&slot.cond_done, &slot.mutex); \
-        slot.drain_done = 0; \
-        pthread_mutex_unlock(&slot.mutex); \
+    #define WAIT_DRAIN(sl_) do { \
+        pthread_mutex_lock(&(sl_)->mutex); \
+        while (!(sl_)->drain_done) \
+            pthread_cond_wait(&(sl_)->cond_done, &(sl_)->mutex); \
+        (sl_)->drain_done = 0; \
+        pthread_mutex_unlock(&(sl_)->mutex); \
     } while (0)
 
     int queue_finished = 0;
     int is_full = 0;
+    int cur_stream = 0;  // round-robin stream index
     chain_read_t read;
 
-    // ── Main loop: accumulate → launch → drain → repeat ──────────────────
+    // ── Main loop: accumulate → dispatch to stream[cur] → rotate → repeat ──
     while (1) {
         // Step 1: Pop reads and accumulate into acc_batch
         if (!queue_finished) {
@@ -2182,37 +2188,39 @@ static void* gpu_batch_consumer(void *data) {
         if (queue_finished && acc_batch.count > 0)
             is_full = 1;
 
-        // Step 2: When batch is full, dispatch to stream 0
+        // Step 2: When batch is full, dispatch to stream[cur_stream]
         if (is_full && acc_batch.count > 0) {
-            // If stream is busy, wait for drain to finish
-            if (slot.busy) {
-                WAIT_DRAIN();
+            gpu_stream_slot_t *sl = &slots[cur_stream];
+
+            // If this stream is still busy, wait for its drain to finish
+            if (sl->busy) {
+                WAIT_DRAIN(sl);
             }
 
             if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
-                fprintf(stderr, "LAUNCH_CHAIN(stream=0): count=%d, total_n=%zu\n",
-                        acc_batch.count, acc_batch.total_n);
+                fprintf(stderr, "LAUNCH_CHAIN(stream=%d): count=%d, total_n=%zu\n",
+                        cur_stream, acc_batch.count, acc_batch.total_n);
 
-            // Launch chain on stream 0 (async)
+            // Launch chain on stream[cur_stream] (async)
             nvtxRangePushA("launch_chain_gpu");
-            int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count, 0);
+            int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count, cur_stream);
             nvtxRangePop();
 
             int fit = acc_batch.count - overflow;
 
             // Safety: if nothing fits at all, these reads exceed GPU capacity
             if (fit == 0) {
-                fprintf(stderr, "[WARNING] %d reads exceed GPU chain capacity, "
-                        "skipping\n", acc_batch.count);
+                fprintf(stderr, "[WARNING] %d reads exceed GPU chain capacity (stream=%d), "
+                        "skipping\n", acc_batch.count, cur_stream);
                 mm_trbuf_batch_reset(&acc_batch, s->batch_max_reads, s->p->opt);
                 is_full = 0;
                 continue;
             }
 
             // Swap fitted reads into slot for draining
-            mm_batch_trbuf_t tmp = slot.batch;
-            slot.batch = acc_batch;
-            slot.batch.count = fit;  // only fitted reads go to drain
+            mm_batch_trbuf_t tmp = sl->batch;
+            sl->batch = acc_batch;
+            sl->batch.count = fit;  // only fitted reads go to drain
             acc_batch = tmp;
 
             // Put overflow reads back into acc_batch for next round
@@ -2221,24 +2229,29 @@ static void* gpu_batch_consumer(void *data) {
             if (overflow > 0) {
                 for (int r_ = fit; r_ < fit + overflow; r_++) {
                     deep_copy_read_to_batch(&acc_batch,
-                                            &slot.batch.reads[r_], s->p->opt);
+                                            &sl->batch.reads[r_], s->p->opt);
                 }
                 if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
                     fprintf(stderr, "[INFO] %d overflow reads back to acc_batch\n",
                             overflow);
             }
 
-            slot.busy = 1;
+            sl->busy = 1;
 
-            // Signal worker thread to drain (non-blocking)
-            SIGNAL_DRAIN();
+            // Signal this stream's drain worker (non-blocking)
+            SIGNAL_DRAIN(sl);
             is_full = 0;
+
+            // Rotate to next stream
+            cur_stream = (cur_stream + 1) % NUM_GPU_STREAMS;
         }
 
-        // Step 3: Queue done, drain remaining
+        // Step 3: Queue done and no pending reads, drain all busy streams
         if (queue_finished && acc_batch.count == 0) {
-            if (slot.busy) {
-                WAIT_DRAIN();
+            for (int i = 0; i < NUM_GPU_STREAMS; i++) {
+                if (slots[i].busy) {
+                    WAIT_DRAIN(&slots[i]);
+                }
             }
             break;
         }
@@ -2247,26 +2260,31 @@ static void* gpu_batch_consumer(void *data) {
     #undef SIGNAL_DRAIN
     #undef WAIT_DRAIN
 
-    // Shutdown drain worker
-    pthread_mutex_lock(&slot.mutex);
-    slot.shutdown = 1;
-    pthread_cond_signal(&slot.cond_work);
-    pthread_mutex_unlock(&slot.mutex);
-    pthread_join(slot.thread, NULL);
+    // Shutdown all drain workers
+    for (int i = 0; i < NUM_GPU_STREAMS; i++) {
+        pthread_mutex_lock(&slots[i].mutex);
+        slots[i].shutdown = 1;
+        pthread_cond_signal(&slots[i].cond_work);
+        pthread_mutex_unlock(&slots[i].mutex);
+        pthread_join(slots[i].thread, NULL);
+    }
 
     // Cleanup
     mm_trbuf_batch_reset(&acc_batch, s->batch_max_reads, s->p->opt);
-    mm_trbuf_batch_reset(&slot.batch, s->batch_max_reads, s->p->opt);
-    free(slot.batch.reads);
-    km_destroy(slot.batch.km);
-    pthread_mutex_destroy(&slot.mutex);
-    pthread_cond_destroy(&slot.cond_work);
-    pthread_cond_destroy(&slot.cond_done);
-
     free(acc_batch.reads);
-
     km_destroy(acc_batch.km);
 
+    for (int i = 0; i < NUM_GPU_STREAMS; i++) {
+        mm_trbuf_batch_reset(&slots[i].batch, s->batch_max_reads, s->p->opt);
+        free(slots[i].batch.reads);
+        km_destroy(slots[i].batch.km);
+        pthread_mutex_destroy(&slots[i].mutex);
+        pthread_cond_destroy(&slots[i].cond_work);
+        pthread_cond_destroy(&slots[i].cond_done);
+        mm_tbuf_destroy(worker_ctxs[i].wb);
+    }
+
+    #undef NUM_GPU_STREAMS
     return NULL;
 }
 static void* kt_worker_manager(void *shared, void *in) {

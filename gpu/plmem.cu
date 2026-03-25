@@ -316,7 +316,8 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
 /* ======== Public API ======== */
 
 void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
-                              int range_grid_size, int num_cut) {
+                              int range_grid_size, int num_cut,
+                              int num_streams) {
     fprintf(stderr, "[Info] GPU ARENA MEMORY ALLOCATION ==========\n");
     fprintf(stderr, "Configuration: anchor_per_batch=%zu, range_grid_size=%d, num_cut=%d, ",
             anchor_per_batch, range_grid_size, num_cut);
@@ -355,14 +356,18 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     // ---- Allocate arena using available VRAM ----
     size_t free_mem = 0, total_mem = 0;
     cudaMemGetInfo(&free_mem, &total_mem);
-    size_t reserve = (size_t)2 * 1024 * 1024 * 1024;  // 2 GB reserve for CUDA overhead
+    // Reserve per stream: divide available VRAM fairly, keep 512MB global headroom
+    size_t global_reserve = (size_t)512 * 1024 * 1024;
+    size_t usable = (free_mem > global_reserve) ? (free_mem - global_reserve) : free_mem;
+    size_t budget_per_stream = usable / num_streams;
+
     size_t min_arena = (chain_size > align_size ? chain_size : align_size);
     min_arena += 1 * 1024 * 1024;  // 1 MB safety margin
 
-    // Use most of available VRAM: max(needed, available - reserve)
+    // Use per-stream budget (capped to fair share)
     size_t arena_size = min_arena;
-    if (free_mem > reserve && free_mem - reserve > arena_size)
-        arena_size = free_mem - reserve;
+    if (budget_per_stream > arena_size)
+        arena_size = budget_per_stream;
 
     void *arena_base = nullptr;
     cudaMalloc(&arena_base, arena_size);
@@ -381,8 +386,9 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     dev_mem->arena.total_size = arena_size;
     dev_mem->arena.offset     = 0;
 
-    fprintf(stderr, " [Arena] GPU VRAM: %.2f GB total, %.2f GB free\n",
-            total_mem / (1024.0*1024.0*1024.0), free_mem / (1024.0*1024.0*1024.0));
+    fprintf(stderr, " [Arena] GPU VRAM: %.2f GB total, %.2f GB free, %d streams → %.2f GB/stream\n",
+            total_mem / (1024.0*1024.0*1024.0), free_mem / (1024.0*1024.0*1024.0),
+            num_streams, budget_per_stream / (1024.0*1024.0*1024.0));
     fprintf(stderr, " [Arena] Single allocation: %.2f MB (%.2f GB)\n",
             arena_size / (1024.0*1024.0), arena_size / (1024.0*1024.0*1024.0));
     fprintf(stderr, " [Arena] Chain phase needs: %.2f MB (%.2f GB)\n",
@@ -881,13 +887,38 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
 
     /* If Use define max_total_n & max_read */
     // FIXME: this is limited by int32max
-    cJSON *max_total_n_json = cJSON_GetObjectItem(json, "max_total_n"); 
+    cJSON *max_total_n_json = cJSON_GetObjectItem(json, "max_total_n");
     cJSON *max_read_json = cJSON_GetObjectItem(json, "max_read");
     cJSON *long_seg_buffer_size_json = cJSON_GetObjectItem(json, "long_seg_buffer_size");
     if (max_total_n_json && max_read_json){
-        *max_total_n_ = (size_t) max_total_n_json->valuedouble;
-        *max_read_ = max_read_json->valueint;
-        *long_seg_buffer_size_ = long_seg_buffer_size_json->valueint;
+        // JSON values are single-stream baselines (tuned for full VRAM).
+        // Auto-scale by num_streams and actual available VRAM.
+        size_t base_total_n = (size_t) max_total_n_json->valuedouble;
+        int    base_read    = max_read_json->valueint;
+        size_t base_long    = long_seg_buffer_size_json ?
+                              (size_t) long_seg_buffer_size_json->valueint : base_total_n;
+
+        // Query actual free VRAM and compute per-stream budget
+        size_t gpu_free_mem, gpu_total_mem;
+        cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
+        double vram_ratio = (double)gpu_free_mem / (double)gpu_total_mem;
+        // Scale down from full-VRAM baseline: divide by num_streams, then
+        // further scale if current GPU has less total VRAM than assumed (48GB).
+        // Use 0.85 headroom factor for runtime allocations.
+        double scale = vram_ratio * 0.85 / (double)(*num_stream_);
+        *max_total_n_ = (size_t)(base_total_n * scale);
+        *max_read_ = (int)(base_read * scale);
+        *long_seg_buffer_size_ = (size_t)(base_long * scale);
+
+        // Sanity floor
+        if (*max_total_n_ < 1000000) *max_total_n_ = 1000000;
+        if (*max_read_ < 1000) *max_read_ = 1000;
+        if (*long_seg_buffer_size_ < 1000000) *long_seg_buffer_size_ = 1000000;
+
+        fprintf(stderr, "[Info::plmem] Auto-scaled for %d streams (%.1f GB free): "
+                "max_total_n=%zu, max_read=%d, long_seg_buf=%zu\n",
+                *num_stream_, gpu_free_mem / (1024.0*1024.0*1024.0),
+                *max_total_n_, *max_read_, *long_seg_buffer_size_);
         return;
     }
 
@@ -989,7 +1020,7 @@ void plmem_stream_initialize(size_t *max_total_n_,
         // one stream has one long mem and one device mem
         plmem_malloc_long_mem(&stream_setup.streams[i].long_mem, long_seg_buffer_size);
         plmem_malloc_device_mem(&stream_setup.streams[i].dev_mem, max_anchors_stream,
-                                max_range_grid, max_num_cut);
+                                max_range_grid, max_num_cut, num_stream);
         cudaMemset(stream_setup.streams[i].dev_mem.d_long_seg_count, 0, sizeof(unsigned int));
         cudaMemset(stream_setup.streams[i].dev_mem.d_mid_seg_count, 0, sizeof(unsigned int));
         cudaMemset(stream_setup.streams[i].dev_mem.d_total_n_long, 0, sizeof(size_t));

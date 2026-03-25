@@ -356,18 +356,18 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     // ---- Allocate arena using available VRAM ----
     size_t free_mem = 0, total_mem = 0;
     cudaMemGetInfo(&free_mem, &total_mem);
-    // Reserve per stream: divide available VRAM fairly, keep 512MB global headroom
-    size_t global_reserve = (size_t)512 * 1024 * 1024;
-    size_t usable = (free_mem > global_reserve) ? (free_mem - global_reserve) : free_mem;
-    size_t budget_per_stream = usable / num_streams;
+    // Divide remaining free VRAM equally among unallocated streams.
+    // Only reserve 128MB per stream for CUDA runtime/driver overhead.
+    size_t per_stream_reserve = (size_t)128 * 1024 * 1024;
+    // Remaining streams that haven't allocated yet (including this one)
+    int remaining_streams = num_streams;  // conservative: assume all compete
+    size_t budget_per_stream = (free_mem / remaining_streams) - per_stream_reserve;
 
     size_t min_arena = (chain_size > align_size ? chain_size : align_size);
     min_arena += 1 * 1024 * 1024;  // 1 MB safety margin
 
-    // Use per-stream budget (capped to fair share)
-    size_t arena_size = min_arena;
-    if (budget_per_stream > arena_size)
-        arena_size = budget_per_stream;
+    // Use as much of the budget as possible
+    size_t arena_size = (budget_per_stream > min_arena) ? budget_per_stream : min_arena;
 
     void *arena_base = nullptr;
     cudaMalloc(&arena_base, arena_size);
@@ -885,86 +885,57 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     size_t min_anchors = get_json_int(json, "min_n");
     *min_n_ = min_anchors;
 
-    /* If Use define max_total_n & max_read */
-    // FIXME: this is limited by int32max
-    cJSON *max_total_n_json = cJSON_GetObjectItem(json, "max_total_n");
-    cJSON *max_read_json = cJSON_GetObjectItem(json, "max_read");
-    cJSON *long_seg_buffer_size_json = cJSON_GetObjectItem(json, "long_seg_buffer_size");
-    if (max_total_n_json && max_read_json){
-        // JSON values are single-stream baselines (tuned for full VRAM).
-        // Auto-scale by num_streams and actual available VRAM.
-        size_t base_total_n = (size_t) max_total_n_json->valuedouble;
-        int    base_read    = max_read_json->valueint;
-        size_t base_long    = long_seg_buffer_size_json ?
-                              (size_t) long_seg_buffer_size_json->valueint : base_total_n;
-
-        // Query actual free VRAM and compute per-stream budget
-        size_t gpu_free_mem, gpu_total_mem;
-        cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
-        double vram_ratio = (double)gpu_free_mem / (double)gpu_total_mem;
-        // Scale down from full-VRAM baseline: divide by num_streams, then
-        // further scale if current GPU has less total VRAM than assumed (48GB).
-        // Use 0.85 headroom factor for runtime allocations.
-        double scale = vram_ratio * 0.85 / (double)(*num_stream_);
-        *max_total_n_ = (size_t)(base_total_n * scale);
-        *max_read_ = (int)(base_read * scale);
-        *long_seg_buffer_size_ = (size_t)(base_long * scale);
-
-        // Sanity floor
-        if (*max_total_n_ < 1000000) *max_total_n_ = 1000000;
-        if (*max_read_ < 1000) *max_read_ = 1000;
-        if (*long_seg_buffer_size_ < 1000000) *long_seg_buffer_size_ = 1000000;
-
-        fprintf(stderr, "[Info::plmem] Auto-scaled for %d streams (%.1f GB free): "
-                "max_total_n=%zu, max_read=%d, long_seg_buf=%zu\n",
-                *num_stream_, gpu_free_mem / (1024.0*1024.0*1024.0),
-                *max_total_n_, *max_read_, *long_seg_buffer_size_);
-        return;
-    }
-
-    /* Determine configuration smartly */
+    /* Auto-compute max_total_n, max_read, and long_seg_buffer_size from VRAM */
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, CUDA_DEVICE);
+    size_t gpu_free_mem, gpu_total_mem;
+    cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
 
-    size_t avail_mem_per_stream = (prop.totalGlobalMem / *num_stream_ ) * 0.9;
+    // Per-stream VRAM budget: leave only 256MB global headroom
+    size_t global_reserve = (size_t)256 * 1024 * 1024;
+    size_t usable = (gpu_free_mem > global_reserve) ? (gpu_free_mem - global_reserve) : gpu_free_mem;
+    size_t avail_mem_per_stream = usable / (*num_stream_);
 
-    // memory per anchor = (ax + ay + range + f + p) + (start_idx + read_end_idx
-    // + cut_start_idx) + cut + long_seg size: F1 = ax + ay + range + f + p; F2
-    // = start_idx + read_end_idx + cut_start_idx; F3 = cut; F4 = long_seg
-    int F1 = 8 + 8 + 4 + 4 + 2, F2 = 8 + 8 + 8, F3 = 8, F4 = 16;
-    // TODO: define these data types
+    // Per-anchor memory cost for chain phase:
+    // F1 = ax(4)+ay(4)+sid(1)+xrev(4)+yrev(4)+range(4)+f(4)+p(2) = 27 bytes per anchor
+    // Backtrack: micro_batch × anchor × ~54 bytes (ax,ay,xrev,yrev,f,p,zx,zy,v,p_abs,t,u,ax_out,ay_out,xrev_out,yrev_out)
+    // Voting:    micro_batch × anchor × ~41 bytes
+    // Index/cut: per-read overhead (~24B per grid + ~12B per cut)
+    int F1 = 27;  // chain anchor buffers
+    int mb = score_kernel_config.micro_batch;
+    int bt_per_anchor = 4*4 + 2 + 8*4 + 4 + 8 + 4*4;  // ~54 bytes
+    int vt_per_anchor = 8*4 + 4*4 + 1 + 4*3;           // ~49 bytes
+    size_t per_anchor_total = F1 + (size_t)mb * (bt_per_anchor + vt_per_anchor);
 
-    // max iteration of each block, must be an integer
-    // int max_it =
-    //     range_kernel_config.anchor_per_block / range_kernel_config.blockdim;
-    // int blockdim = range_kernel_config.blockdim;
+    // Long segment buffers: ~27 bytes per long anchor
+    // Reserve ~15% of per-stream VRAM for long_seg + index + cuts + overhead
+    size_t overhead_budget = (size_t)(avail_mem_per_stream * 0.15);
+    size_t anchor_budget   = avail_mem_per_stream - overhead_budget;
 
-    // g = max_grid_size
-    // g * F2 + g * blockdim * max_it * F1 + max_cut * F3 + max_cut/2 * F4 <
-    // mem_per_stream max_cut = g * max_it
-    /*
-    size_t cost_per_anchor = F1;
-    size_t cost_per_grid = F2;
-    size_t cost_per_cut = F3 + F4 / 2;
-    */
-    size_t avg_read_n = get_json_int(json, "avg_read_n");
+    *max_total_n_ = anchor_budget / per_anchor_total;
+    // Cap to INT32_MAX safety (anchors are often int-indexed)
+    if (*max_total_n_ > (size_t)2000000000) *max_total_n_ = 2000000000;
 
-    /**
-     * Assume max_total_n = max_read * avg_read_n
-     * max_grid = max_total_n / range.anchor_per_block + max_read
-     *          = max_read *( avg_read_n / anchor_per_block + 1)
-     * max_cut  = max_total_n / range.blockdim + max_read
-     *          = max_read * ( avg_read_n / blockdim + 1)
-     * total_mem = max_grid * cost_per_grid + max_cut * cost_per_cut + max_total_n * cost_per_anchor
-     */
+    // Estimate avg anchors per read (~1000 for ONT, configurable via JSON)
+    cJSON *avg_n_json = cJSON_GetObjectItem(json, "avg_read_n");
+    size_t avg_read_n = avg_n_json ? (size_t)avg_n_json->valueint : 1000;
+    *max_read_ = (int)(*max_total_n_ / avg_read_n);
+    if (*max_read_ < 1000) *max_read_ = 1000;
 
-    float grid_cost_per_read =
-        (avg_read_n / (float)range_kernel_config.anchor_per_block + 1) * F2;
-    float cut_cost_per_read =
-        (avg_read_n / (float)range_kernel_config.blockdim + 1) * (F3 + F4 / 2);
-    *max_read_ = floor(avail_mem_per_stream /
-                 (grid_cost_per_read + cut_cost_per_read + F1 * avg_read_n));
-    *max_total_n_ = *max_read_ * avg_read_n;
+    // Long seg buffer: use overhead budget, ~6 bytes per anchor (f_long + p_long)
+    cJSON *long_seg_json = cJSON_GetObjectItem(json, "long_seg_buffer_size");
+    if (long_seg_json) {
+        *long_seg_buffer_size_ = (size_t)long_seg_json->valueint / (*num_stream_);
+    } else {
+        *long_seg_buffer_size_ = overhead_budget / 10;  // ~6B per anchor + index overhead
+    }
+    if (*long_seg_buffer_size_ < 1000000) *long_seg_buffer_size_ = 1000000;
+
+    fprintf(stderr, "[Info::plmem] Auto-config for %d streams (%.1f GB free, %.1f GB/stream): "
+            "max_total_n=%zu, max_read=%d, long_seg_buf=%zu\n",
+            *num_stream_, gpu_free_mem / (1024.0*1024.0*1024.0),
+            avail_mem_per_stream / (1024.0*1024.0*1024.0),
+            *max_total_n_, *max_read_, *long_seg_buffer_size_);
 }
 
 // intialize and config kernels for gpu blocking setup

@@ -1,13 +1,8 @@
 {
     "num_streams": 2,
-    "//num_streams": "Number of GPU streams. Memory per stream is auto-scaled from VRAM.",
+    "//num_streams": "Number of GPU streams. Memory auto-scales from actual VRAM.",
     "min_n": 512,
     "//min_n": "queries with less anchors will be handled on cpu",
-    "long_seg_buffer_size": 90000000,
-    "//long_seg_buffer_size": "single-stream baseline (auto-scaled by num_streams and VRAM).",
-    "max_total_n": 45000000,
-    "max_read": 45000,
-     "//max_total_n, max_read": "single-stream baseline values. Auto-scaled by num_streams and actual GPU VRAM.",
     "range_kernel": {
         "blockdim": 512,
         "cut_check_anchors": 10,

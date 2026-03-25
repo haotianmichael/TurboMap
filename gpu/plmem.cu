@@ -892,6 +892,7 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     //   Chain anchors (N):  ax(4)+ay(4)+sid(1)+xrev(4)+yrev(4)+range(4)+f(4)+p(2) = 27
     //   Backtrack (N*mb):   ax,ay,xrev,yrev,f,p(22) + zx,zy,v,p_abs(32) + t,u(12) + ax,ay,xrev,yrev_out(16) = 82
     //   Voting (N*mb):      ax,ay,bx,by(32) + mark,anchor_seg,out_pos,votes(16) + keep_bin(1) + seg_start,seg_id,seg_cnt_flat(12) = 61
+    //   CUB sort temp (N*mb): ~16 bytes (double-buffer for int64 key+value pairs)
     //   Long seg data (L):  ax(4)+ay(4)+sid(1)+range(4)+f(4)+p(2) = 19
     //   Long seg index (L): seg_t*2 + map(4) per (long_seg_cutoff*cut_unit) entries = 36/10240 per L
     //   Index/cut:          per-grid(24) + per-cut(12) + per bt_r/vt_r(24+24=48 per mb*G)
@@ -901,7 +902,8 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     size_t chain_per_n = 27;
     size_t bt_per_n    = (size_t)mb * 82;   // backtrack: 82 bytes × micro_batch
     size_t vt_per_n    = (size_t)mb * 61;   // voting: 61 bytes × micro_batch
-    size_t per_anchor_total = chain_per_n + bt_per_n + vt_per_n;
+    size_t cub_per_n   = (size_t)mb * 16;   // CUB sort temp: ~16 bytes × micro_batch (key+value double-buffer)
+    size_t per_anchor_total = chain_per_n + bt_per_n + vt_per_n + cub_per_n;
 
     // L-proportional cost (long segment buffers)
     size_t per_long_entry = 19;  // ax,ay,sid,range,f,p long arrays
@@ -927,12 +929,12 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     double overhead_per_n = grids_per_n * per_grid + cuts_per_n * per_cut;
 
     // Total per anchor: anchor_cost + long_ratio * long_cost + overhead
-    // Solve: N * (per_anchor_total + long_ratio * per_long_entry + overhead_per_n) ≤ avail
-    // Apply 0.95 safety factor for CUB temp buffers and arena alignment padding
+    // Solve: N * total_per_n ≤ avail_mem_per_stream
+    // Apply 0.98 margin for arena alignment padding
     double total_per_n = (double)per_anchor_total
                        + long_ratio * (double)per_long_entry
                        + overhead_per_n;
-    size_t budget = (size_t)(avail_mem_per_stream * 0.95);
+    size_t budget = (size_t)(avail_mem_per_stream * 0.98);
 
     *max_total_n_ = (size_t)(budget / total_per_n);
     // Cap to INT32_MAX safety (anchors are often int-indexed)

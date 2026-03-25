@@ -353,21 +353,11 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     setup_align_phase(dev_mem);
     size_t align_size = dev_mem->arena.offset;
 
-    // ---- Allocate arena using available VRAM ----
-    size_t free_mem = 0, total_mem = 0;
-    cudaMemGetInfo(&free_mem, &total_mem);
-    // Divide remaining free VRAM equally among unallocated streams.
-    // Only reserve 128MB per stream for CUDA runtime/driver overhead.
-    size_t per_stream_reserve = (size_t)128 * 1024 * 1024;
-    // Remaining streams that haven't allocated yet (including this one)
-    int remaining_streams = num_streams;  // conservative: assume all compete
-    size_t budget_per_stream = (free_mem / remaining_streams) - per_stream_reserve;
-
+    // ---- Allocate arena using needed size ----
+    // plmem_config_batch already sized max_total_n to fit in per-stream VRAM,
+    // so just allocate the max of chain and align phase needs + small margin.
     size_t min_arena = (chain_size > align_size ? chain_size : align_size);
-    min_arena += 1 * 1024 * 1024;  // 1 MB safety margin
-
-    // Use as much of the budget as possible
-    size_t arena_size = (budget_per_stream > min_arena) ? budget_per_stream : min_arena;
+    size_t arena_size = min_arena + 4 * 1024 * 1024;  // 4 MB margin for alignment padding
 
     void *arena_base = nullptr;
     cudaMalloc(&arena_base, arena_size);
@@ -386,9 +376,11 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     dev_mem->arena.total_size = arena_size;
     dev_mem->arena.offset     = 0;
 
-    fprintf(stderr, " [Arena] GPU VRAM: %.2f GB total, %.2f GB free, %d streams → %.2f GB/stream\n",
+    size_t free_mem = 0, total_mem = 0;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    fprintf(stderr, " [Arena] GPU VRAM: %.2f GB total, %.2f GB free, %d streams\n",
             total_mem / (1024.0*1024.0*1024.0), free_mem / (1024.0*1024.0*1024.0),
-            num_streams, budget_per_stream / (1024.0*1024.0*1024.0));
+            num_streams);
     fprintf(stderr, " [Arena] Single allocation: %.2f MB (%.2f GB)\n",
             arena_size / (1024.0*1024.0), arena_size / (1024.0*1024.0*1024.0));
     fprintf(stderr, " [Arena] Chain phase needs: %.2f MB (%.2f GB)\n",
@@ -896,45 +888,71 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     size_t usable = (gpu_free_mem > global_reserve) ? (gpu_free_mem - global_reserve) : gpu_free_mem;
     size_t avail_mem_per_stream = usable / (*num_stream_);
 
-    // Per-anchor memory cost for chain phase:
-    // F1 = ax(4)+ay(4)+sid(1)+xrev(4)+yrev(4)+range(4)+f(4)+p(2) = 27 bytes per anchor
-    // Backtrack: micro_batch × anchor × ~54 bytes (ax,ay,xrev,yrev,f,p,zx,zy,v,p_abs,t,u,ax_out,ay_out,xrev_out,yrev_out)
-    // Voting:    micro_batch × anchor × ~41 bytes
-    // Index/cut: per-read overhead (~24B per grid + ~12B per cut)
-    int F1 = 27;  // chain anchor buffers
+    // Exact per-anchor memory costs matching setup_chain_phase() allocations:
+    //   Chain anchors (N):  ax(4)+ay(4)+sid(1)+xrev(4)+yrev(4)+range(4)+f(4)+p(2) = 27
+    //   Backtrack (N*mb):   ax,ay,xrev,yrev,f,p(22) + zx,zy,v,p_abs(32) + t,u(12) + ax,ay,xrev,yrev_out(16) = 82
+    //   Voting (N*mb):      ax,ay,bx,by(32) + mark,anchor_seg,out_pos,votes(16) + keep_bin(1) + seg_start,seg_id,seg_cnt_flat(12) = 61
+    //   Long seg data (L):  ax(4)+ay(4)+sid(1)+range(4)+f(4)+p(2) = 19
+    //   Long seg index (L): seg_t*2 + map(4) per (long_seg_cutoff*cut_unit) entries = 36/10240 per L
+    //   Index/cut:          per-grid(24) + per-cut(12) + per bt_r/vt_r(24+24=48 per mb*G)
     int mb = score_kernel_config.micro_batch;
-    int bt_per_anchor = 4*4 + 2 + 8*4 + 4 + 8 + 4*4;  // ~54 bytes
-    int vt_per_anchor = 8*4 + 4*4 + 1 + 4*3;           // ~49 bytes
-    size_t per_anchor_total = F1 + (size_t)mb * (bt_per_anchor + vt_per_anchor);
 
-    // Long segment buffers: ~27 bytes per long anchor
-    // Reserve ~15% of per-stream VRAM for long_seg + index + cuts + overhead
-    size_t overhead_budget = (size_t)(avail_mem_per_stream * 0.15);
-    size_t anchor_budget   = avail_mem_per_stream - overhead_budget;
+    // N-proportional cost
+    size_t chain_per_n = 27;
+    size_t bt_per_n    = (size_t)mb * 82;   // backtrack: 82 bytes × micro_batch
+    size_t vt_per_n    = (size_t)mb * 61;   // voting: 61 bytes × micro_batch
+    size_t per_anchor_total = chain_per_n + bt_per_n + vt_per_n;
 
-    *max_total_n_ = anchor_budget / per_anchor_total;
+    // L-proportional cost (long segment buffers)
+    size_t per_long_entry = 19;  // ax,ay,sid,range,f,p long arrays
+
+    // Avg anchors per read (for index/cut overhead estimate)
+    cJSON *avg_n_json = cJSON_GetObjectItem(json, "avg_read_n");
+    size_t avg_read_n = avg_n_json ? (size_t)avg_n_json->valueint : 1000;
+
+    // Long seg buffer ratio: L as fraction of N.
+    // Default L = 2*N (empirically reasonable for ONT data).
+    cJSON *long_seg_json = cJSON_GetObjectItem(json, "long_seg_buffer_size");
+    double long_ratio = 2.0;  // L = long_ratio * N
+
+    // Per-read overhead (index + cut + bt_r + vt_r arrays):
+    //   G ≈ N/anchor_per_block + N/avg_read_n
+    //   C ≈ N/blockdim + N/avg_read_n
+    //   per G: 24 (index) + mb*24 (bt_r) + mb*24 (vt_r) = 24 + 48*mb
+    //   per C: 8 (d_cut) + 4*sizeof(seg_t)/(mid_seg_cutoff+1) ≈ 12
+    double grids_per_n = 1.0 / range_kernel_config.anchor_per_block + 1.0 / avg_read_n;
+    double cuts_per_n  = 1.0 / range_kernel_config.blockdim + 1.0 / avg_read_n;
+    size_t per_grid = 24 + (size_t)mb * 48;
+    size_t per_cut  = 12;
+    double overhead_per_n = grids_per_n * per_grid + cuts_per_n * per_cut;
+
+    // Total per anchor: anchor_cost + long_ratio * long_cost + overhead
+    // Solve: N * (per_anchor_total + long_ratio * per_long_entry + overhead_per_n) ≤ avail
+    // Apply 0.95 safety factor for CUB temp buffers and arena alignment padding
+    double total_per_n = (double)per_anchor_total
+                       + long_ratio * (double)per_long_entry
+                       + overhead_per_n;
+    size_t budget = (size_t)(avail_mem_per_stream * 0.95);
+
+    *max_total_n_ = (size_t)(budget / total_per_n);
     // Cap to INT32_MAX safety (anchors are often int-indexed)
     if (*max_total_n_ > (size_t)2000000000) *max_total_n_ = 2000000000;
 
-    // Estimate avg anchors per read (~1000 for ONT, configurable via JSON)
-    cJSON *avg_n_json = cJSON_GetObjectItem(json, "avg_read_n");
-    size_t avg_read_n = avg_n_json ? (size_t)avg_n_json->valueint : 1000;
     *max_read_ = (int)(*max_total_n_ / avg_read_n);
     if (*max_read_ < 1000) *max_read_ = 1000;
 
-    // Long seg buffer: use overhead budget, ~6 bytes per anchor (f_long + p_long)
-    cJSON *long_seg_json = cJSON_GetObjectItem(json, "long_seg_buffer_size");
+    // Long seg buffer size
     if (long_seg_json) {
         *long_seg_buffer_size_ = (size_t)long_seg_json->valueint / (*num_stream_);
     } else {
-        *long_seg_buffer_size_ = overhead_budget / 10;  // ~6B per anchor + index overhead
+        *long_seg_buffer_size_ = (size_t)(*max_total_n_ * long_ratio);
     }
     if (*long_seg_buffer_size_ < 1000000) *long_seg_buffer_size_ = 1000000;
 
-    fprintf(stderr, "[Info::plmem] Auto-config for %d streams (%.1f GB free, %.1f GB/stream): "
-            "max_total_n=%zu, max_read=%d, long_seg_buf=%zu\n",
+    fprintf(stderr, "[Info::plmem] Auto-config for %d streams (%.1f GB free, %.1f GB/stream, "
+            "%.0f B/anchor): max_total_n=%zu, max_read=%d, long_seg_buf=%zu\n",
             *num_stream_, gpu_free_mem / (1024.0*1024.0*1024.0),
-            avail_mem_per_stream / (1024.0*1024.0*1024.0),
+            avail_mem_per_stream / (1024.0*1024.0*1024.0), total_per_n,
             *max_total_n_, *max_read_, *long_seg_buffer_size_);
 }
 

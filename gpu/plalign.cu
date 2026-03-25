@@ -469,8 +469,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t cigar_buf_total_tasks   = (size_t)dev_mem->max_align_tasks;
     size_t long_batch_persistent   = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;
 
+    // Batch count estimates (actual count may differ due to dual-stream batch splitting)
     int total_batches_short = n_short_tasks > 0 ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
     int total_batches_long = n_long_tasks > 0 ? (int)((n_long_tasks + long_batch_persistent - 1) / long_batch_persistent) : 0;
+    // Ensure at least 2 batches per phase for dual-stream overlap
+    if (total_batches_short == 1 && n_short_tasks > 1) total_batches_short = 2;
+    if (total_batches_long == 1 && n_long_tasks > 1) total_batches_long = 2;
     int total_batches = total_batches_short + total_batches_long;
     fprintf(stderr, "[Info::%s]   Short: %d kernel launches × %zu tasks/launch (max_align_tasks=%zu)\n",
             __func__, total_batches_short, short_batch_persistent, (size_t)dev_mem->max_align_tasks);
@@ -531,6 +535,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         size_t current_batch_size = (phase == 0) ? short_batch_persistent : long_batch_persistent;
         const char *phase_name = (phase == 0) ? "Short Tasks" : "Long Tasks";
 
+        // Ensure at least 2 batches per phase for dual-stream H2D/compute overlap.
+        // Without this, small task counts fit in one batch and xfer_stream is never used.
+        if (n_tasks_in_phase > 1 && current_batch_size >= (size_t)n_tasks_in_phase) {
+            current_batch_size = (n_tasks_in_phase + 1) / 2;
+        }
+
         // Dynamic backtrack buffer sizing based on phase
         size_t current_max_antidiag = (phase == 0) ? (2 * short_task_max_len) : (2 * dev_mem->max_align_query_len);
         size_t current_max_backtrack_size = current_max_antidiag * 752;  // 752 = bandwidth + 1
@@ -538,7 +548,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
         if (n_tasks_in_phase == 0) continue;  // Skip empty phase
 
-        fprintf(stderr, "[Info::%s] === Processing %s (phase %d/2) ===\n", __func__, phase_name, phase + 1);
+        fprintf(stderr, "[Info::%s] === Processing %s (phase %d/2): %d tasks, batch_size=%zu ===\n",
+                __func__, phase_name, phase + 1, n_tasks_in_phase, current_batch_size);
 
         // Problem: result buffers are 120,000 elements but we only clear phase_batch_size
         // This causes long phase to read stale data from short phase!

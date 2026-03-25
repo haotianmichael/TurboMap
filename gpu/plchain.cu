@@ -472,14 +472,6 @@ cudaStream_t gpu_get_cudastream(int stream_id) {
     return stream_setup.streams[stream_id].cudastream;
 }
 
-cudaStream_t gpu_get_align_xfer_stream(int stream_id) {
-    return stream_setup.streams[stream_id].align_xfer_stream;
-}
-
-cudaEvent_t gpu_get_align_h2d_event(int stream_id) {
-    return stream_setup.streams[stream_id].align_h2d_event;
-}
-
 void init_stream_gpu(size_t *total_n, int *max_reads, int *min_n, char gpu_config_file[], Misc misc) {
     plmem_stream_initialize(total_n, max_reads, min_n, gpu_config_file);
     plrange_upload_misc(misc);

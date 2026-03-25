@@ -418,16 +418,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             __func__, n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
 
     int kernel_threads = 256;
-    // Ping-pong device input buffers for dual-stream H2D overlap
-    uint8_t  *d_unpacked_query_ab[2]  = { dev_mem->d_align_unpacked_query,  dev_mem->d_align_unpacked_query_b };
-    uint8_t  *d_unpacked_target_ab[2] = { dev_mem->d_align_unpacked_target, dev_mem->d_align_unpacked_target_b };
-    uint32_t *d_query_offsets_ab[2]   = { dev_mem->d_align_query_offsets,   dev_mem->d_align_query_offsets_b };
-    uint32_t *d_target_offsets_ab[2]  = { dev_mem->d_align_target_offsets,  dev_mem->d_align_target_offsets_b };
-    uint32_t *d_query_lens_ab[2]      = { dev_mem->d_align_query_lens,      dev_mem->d_align_query_lens_b };
-    uint32_t *d_target_lens_ab[2]     = { dev_mem->d_align_target_lens,     dev_mem->d_align_target_lens_b };
-    int32_t  *d_flag_ab[2]            = { (int32_t*)dev_mem->d_align_flag,  dev_mem->d_align_flag_b };
+    uint8_t *d_unpacked_query = dev_mem->d_align_unpacked_query;
+    uint8_t *d_unpacked_target = dev_mem->d_align_unpacked_target;
     uint32_t *d_packed_query = dev_mem->d_align_packed_query;
     uint32_t *d_packed_target = dev_mem->d_align_packed_target;
+    uint32_t *d_query_offsets = dev_mem->d_align_query_offsets;
+    uint32_t *d_target_offsets = dev_mem->d_align_target_offsets;
+    uint32_t *d_query_lens = dev_mem->d_align_query_lens;
+    uint32_t *d_target_lens = dev_mem->d_align_target_lens;
+    int32_t *d_flag = dev_mem->d_align_flag;
     void *d_ksw_temp_buffer = dev_mem->d_align_ksw_temp_buffer;
     size_t ksw_temp_per_task = dev_mem->align_ksw_temp_per_task;
     uint8_t *d_backtrack_p = dev_mem->d_align_backtrack_p;
@@ -450,8 +449,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int  *d_task_counter = dev_mem->d_align_task_counter;
     int   n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
     cudaStream_t align_stream = gpu_get_cudastream(stream_id);
-    cudaStream_t xfer_stream  = gpu_get_align_xfer_stream(stream_id);
-    cudaEvent_t  h2d_event    = gpu_get_align_h2d_event(stream_id);
     // P1/P2/P3 device buffers
     uint32_t *d_compact_cigar   = dev_mem->d_align_compact_cigar;
     uint32_t *d_compact_offsets = dev_mem->d_align_compact_offsets;
@@ -469,12 +466,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t cigar_buf_total_tasks   = (size_t)dev_mem->max_align_tasks;
     size_t long_batch_persistent   = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;
 
-    // Batch count estimates (actual count may differ due to dual-stream batch splitting)
     int total_batches_short = n_short_tasks > 0 ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
     int total_batches_long = n_long_tasks > 0 ? (int)((n_long_tasks + long_batch_persistent - 1) / long_batch_persistent) : 0;
-    // Ensure at least 2 batches per phase for dual-stream overlap
-    if (total_batches_short == 1 && n_short_tasks > 1) total_batches_short = 2;
-    if (total_batches_long == 1 && n_long_tasks > 1) total_batches_long = 2;
     int total_batches = total_batches_short + total_batches_long;
     fprintf(stderr, "[Info::%s]   Short: %d kernel launches × %zu tasks/launch (max_align_tasks=%zu)\n",
             __func__, total_batches_short, short_batch_persistent, (size_t)dev_mem->max_align_tasks);
@@ -535,12 +528,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         size_t current_batch_size = (phase == 0) ? short_batch_persistent : long_batch_persistent;
         const char *phase_name = (phase == 0) ? "Short Tasks" : "Long Tasks";
 
-        // Ensure at least 2 batches per phase for dual-stream H2D/compute overlap.
-        // Without this, small task counts fit in one batch and xfer_stream is never used.
-        if (n_tasks_in_phase > 1 && current_batch_size >= (size_t)n_tasks_in_phase) {
-            current_batch_size = (n_tasks_in_phase + 1) / 2;
-        }
-
         // Dynamic backtrack buffer sizing based on phase
         size_t current_max_antidiag = (phase == 0) ? (2 * short_task_max_len) : (2 * dev_mem->max_align_query_len);
         size_t current_max_backtrack_size = current_max_antidiag * 752;  // 752 = bandwidth + 1
@@ -548,8 +535,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
         if (n_tasks_in_phase == 0) continue;  // Skip empty phase
 
-        fprintf(stderr, "[Info::%s] === Processing %s (phase %d/2): %d tasks, batch_size=%zu ===\n",
-                __func__, phase_name, phase + 1, n_tasks_in_phase, current_batch_size);
+        fprintf(stderr, "[Info::%s] === Processing %s (phase %d/2) ===\n", __func__, phase_name, phase + 1);
 
         // Problem: result buffers are 120,000 elements but we only clear phase_batch_size
         // This causes long phase to read stale data from short phase!
@@ -582,100 +568,119 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         cudaMemset(d_mte_q, 0, max_align_tasks * sizeof(int32_t));*/
 
         int tasks_processed_in_phase = 0;
-        int ping = 0;  // ping-pong index for double-buffered input
-        bool next_prefetched = false;  // true if next batch H2D is in-flight on xfer_stream
-        size_t prefetch_total_query_bytes = 0, prefetch_total_target_bytes = 0;
-        size_t h_staging_bytes = dev_mem->h_align_staging_bytes;
-
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
             int batch_size = (tasks_processed_in_phase + current_batch_size <= n_tasks_in_phase) ?
                              current_batch_size : (n_tasks_in_phase - tasks_processed_in_phase);
             batch_num++;
 
-            // ---- Current batch's device pointers (ping buffer) ----
-            uint8_t  *cur_d_unpacked_query  = d_unpacked_query_ab[ping];
-            uint8_t  *cur_d_unpacked_target = d_unpacked_target_ab[ping];
-            uint32_t *cur_d_query_offsets   = d_query_offsets_ab[ping];
-            uint32_t *cur_d_target_offsets  = d_target_offsets_ab[ping];
-            uint32_t *cur_d_query_lens      = d_query_lens_ab[ping];
-            uint32_t *cur_d_target_lens     = d_target_lens_ab[ping];
-            int32_t  *cur_d_flag            = d_flag_ab[ping];
+            // Clear ONLY result buffers before each batch to prevent reading stale data
+            // If a task fails (zdropped etc), kernel may not write to result buffers
+            // Without clearing, we'd read previous batch's stale results
+            // Note: backtrack buffers don't need clearing as they're fully written by kernel
+            /*cudaMemset(d_scores, 0, batch_size * sizeof(int32_t));
+            cudaMemset(d_query_ends, 0, batch_size * sizeof(int32_t));
+            cudaMemset(d_target_ends, 0, batch_size * sizeof(int32_t));
+            cudaMemset(d_mqe, 0, batch_size * sizeof(int32_t));
+            cudaMemset(d_mqe_t, 0, batch_size * sizeof(int32_t));
+            cudaMemset(d_mte, 0, batch_size * sizeof(int32_t));
+            cudaMemset(d_mte_q, 0, batch_size * sizeof(int32_t));
+            cudaMemset(d_cigar_lengths, 0, batch_size * sizeof(int));*/
 
-            size_t total_query_bytes, total_target_bytes;
+            // Calculate memory requirements for this batch
+            size_t total_query_bytes = 0, total_target_bytes = 0;
+            uint32_t max_query_len = 0;
 
-            if (next_prefetched) {
-                // H2D already issued on xfer_stream in previous iteration.
-                cudaStreamWaitEvent(align_stream, h2d_event, 0);
-                total_query_bytes = prefetch_total_query_bytes;
-                total_target_bytes = prefetch_total_target_bytes;
-                next_prefetched = false;
-            } else {
-                // First batch: prepare + H2D on align_stream directly
-                uint8_t *h_uq = dev_mem->h_align_unpacked_query[ping];
-                uint8_t *h_ut = dev_mem->h_align_unpacked_target[ping];
-                total_query_bytes = 0;
-                total_target_bytes = 0;
+            // Calculate offsets and prepare sequences for this batch
+            for (int i = 0; i < batch_size; i++) {
+                int task_idx = current_task_indices[batch_start + i];
 
-                for (int i = 0; i < batch_size; i++) {
-                    int task_idx = current_task_indices[batch_start + i];
-                    if (tasks[task_idx].qlen > max_query_len_limit) tasks[task_idx].qlen = max_query_len_limit;
-                    if (tasks[task_idx].tlen > max_query_len_limit) tasks[task_idx].tlen = max_query_len_limit;
-                    size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
-                    size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
-                    h_query_offsets[i] = total_query_bytes;
-                    h_target_offsets[i] = total_target_bytes;
-                    h_query_lens[i] = tasks[task_idx].qlen;
-                    h_target_lens[i] = tasks[task_idx].tlen;
-                    h_flag[i] = tasks[task_idx].flag;
-                    total_query_bytes += qlen_aligned;
-                    total_target_bytes += tlen_aligned;
-                    h_task_to_align_id[i] = i;
+                // Validate sequence lengths against buffer limits
+                if (tasks[task_idx].qlen > max_query_len_limit) {
+                    fprintf(stderr, "[WARNING] Task %d: qlen=%d exceeds max_query_len=%zu, clamping\n",
+                            task_idx, tasks[task_idx].qlen, max_query_len_limit);
+                    tasks[task_idx].qlen = max_query_len_limit;
+                }
+                if (tasks[task_idx].tlen > max_query_len_limit) {
+                    fprintf(stderr, "[WARNING] Task %d: tlen=%d exceeds max_query_len=%zu, clamping\n",
+                            task_idx, tasks[task_idx].tlen, max_query_len_limit);
+                    tasks[task_idx].tlen = max_query_len_limit;
                 }
 
-                // Fill pinned staging buffers (no alloc, pre-allocated)
-                const uint8_t N_BASE = 4;
-                for (int i = 0; i < batch_size; i++) {
-                    int task_idx = current_task_indices[batch_start + i];
-                    memcpy(h_uq + h_query_offsets[i],
-                           seq_buffer + tasks[task_idx].qseq_offset, tasks[task_idx].qlen);
-                    memcpy(h_ut + h_target_offsets[i],
-                           seq_buffer + tasks[task_idx].tseq_offset, tasks[task_idx].tlen);
-                    size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
-                    size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
-                    for (size_t j = tasks[task_idx].qlen; j < qlen_aligned; j++)
-                        h_uq[h_query_offsets[i] + j] = N_BASE;
-                    for (size_t j = tasks[task_idx].tlen; j < tlen_aligned; j++)
-                        h_ut[h_target_offsets[i] + j] = N_BASE;
+                // Align to 8-byte boundary for AGATHA
+                size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
+                size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
+
+                h_query_offsets[i] = total_query_bytes;
+                h_target_offsets[i] = total_target_bytes;
+                h_query_lens[i] = tasks[task_idx].qlen;
+                h_target_lens[i] = tasks[task_idx].tlen;
+                h_flag[i] = tasks[task_idx].flag;
+
+                total_query_bytes += qlen_aligned;
+                total_target_bytes += tlen_aligned;
+
+                if (tasks[task_idx].qlen > max_query_len) {
+                    max_query_len = tasks[task_idx].qlen;
                 }
 
-                // H2D on align_stream from pinned memory (truly async DMA)
-                cudaMemcpyAsync(cur_d_unpacked_query, h_uq,
-                                total_query_bytes, cudaMemcpyHostToDevice, align_stream);
-                cudaMemcpyAsync(cur_d_unpacked_target, h_ut,
-                                total_target_bytes, cudaMemcpyHostToDevice, align_stream);
-                cudaMemcpyAsync(cur_d_query_offsets, h_query_offsets,
-                                batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
-                cudaMemcpyAsync(cur_d_target_offsets, h_target_offsets,
-                                batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
-                cudaMemcpyAsync(cur_d_query_lens, h_query_lens,
-                                batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
-                cudaMemcpyAsync(cur_d_target_lens, h_target_lens,
-                                batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
-                cudaMemcpyAsync(cur_d_flag, h_flag,
-                                batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
+                // Store task-to-alignment mapping
+                h_task_to_align_id[i] = i;
             }
 
 
-            // Launch packing kernel (reads cur_d_unpacked, writes d_packed)
+            // Prepare unpacked sequences for this batch
+            uint8_t *h_unpacked_query = (uint8_t*)calloc(total_query_bytes, 1);
+            uint8_t *h_unpacked_target = (uint8_t*)calloc(total_target_bytes, 1);
+
+            const uint8_t N_BASE = 4;
+            for (int i = 0; i < batch_size; i++) {
+                int task_idx = current_task_indices[batch_start + i];
+                // Copy sequences
+                memcpy(h_unpacked_query + h_query_offsets[i],
+                       seq_buffer + tasks[task_idx].qseq_offset, tasks[task_idx].qlen);
+                memcpy(h_unpacked_target + h_target_offsets[i],
+                       seq_buffer + tasks[task_idx].tseq_offset, tasks[task_idx].tlen);
+
+                // Pad with N (0x0F)
+                size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
+                size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
+                for (int j = tasks[task_idx].qlen; j < qlen_aligned; j++) {
+                    h_unpacked_query[h_query_offsets[i] + j] = N_BASE;
+                }
+                for (int j = tasks[task_idx].tlen; j < tlen_aligned; j++) {
+                    h_unpacked_target[h_target_offsets[i] + j] = N_BASE;
+                }
+            }
+
+
+            // Copy batch data to GPU (async on align_stream so chain stream stays free)
+            cudaMemcpyAsync(d_unpacked_query, h_unpacked_query,
+                            total_query_bytes, cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_unpacked_target, h_unpacked_target,
+                            total_target_bytes, cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_query_offsets, h_query_offsets,
+                            batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_target_offsets, h_target_offsets,
+                            batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_query_lens, h_query_lens,
+                            batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_target_lens, h_target_lens,
+                            batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_flag, h_flag,
+                            batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
+
+
+
+            // Launch packing kernel
             int query_tasks_per_thread = (int)ceil((double)total_query_bytes /
                                                   (8 * kernel_threads * kernel_blocks));
             int target_tasks_per_thread = (int)ceil((double)total_target_bytes /
                                                    (8 * kernel_threads * kernel_blocks));
 
             gasal_pack_kernel<<<kernel_blocks, kernel_threads, 0, align_stream>>>(
-                (uint32_t*)cur_d_unpacked_query,
-                (uint32_t*)cur_d_unpacked_target,
+                (uint32_t*)d_unpacked_query,
+                (uint32_t*)d_unpacked_target,
                 d_packed_query,
                 d_packed_target,
                 query_tasks_per_thread,
@@ -685,17 +690,30 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             );
 
             // ===== Persistent KSW Kernel (align + backtrack in one launch) =====
+            // Phase 0 (short tasks ≤1000bp): CUDASW4-style column-parallel kernel
+            //   - Row-major backtrack: bt_size = max_qlen × max_tlen
+            //   - No Z-drop, no banding, full DP in registers
+            //   - temp buffer: only unpacked sequences (qlen + tlen bytes)
+            // Phase 1 (long tasks >1000bp): Original anti-diagonal kernel
+            //   - Anti-diagonal backtrack with banding
+            //   - Z-drop, Suzuki-Kasahara formulation
             size_t bt_p_total_bytes = (size_t)n_concurrent_blocks *
                                       dev_mem->max_align_backtrack_size;
+
+            // For the column-parallel kernel (short tasks), backtrack is row-major:
+            // bt_size_per_slot = short_task_max_len × short_task_max_len
             size_t col_bt_size = short_task_max_len * short_task_max_len;
 
             size_t max_slots_this_phase;
             if (phase == 0) {
+                // Column-parallel: row-major backtrack
                 max_slots_this_phase = bt_p_total_bytes / col_bt_size;
+                // Also cap by temp buffer: total_temp / per_slot_temp
                 size_t temp_slots = dev_mem->short_task_batch_size;
                 if (temp_slots < max_slots_this_phase)
                     max_slots_this_phase = temp_slots;
             } else {
+                // Anti-diagonal: banded backtrack
                 max_slots_this_phase = bt_p_total_bytes /
                                        (size_t)current_max_backtrack_size;
             }
@@ -707,9 +725,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 phase_concurrent_slots = batch_size;
             if (phase_concurrent_slots < 1) phase_concurrent_slots = 1;
 
+            // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
             if (phase == 0) {
+                // ===== CUDASW4-style column-parallel kernel (multi-warp) =====
                 int col_warps_per_block = KSW2_WARPS_PER_BLOCK;
                 int col_threads_per_block = 32 * col_warps_per_block;
                 int col_n_blocks = (phase_concurrent_slots + col_warps_per_block - 1)
@@ -723,37 +743,38 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     d_task_counter,
                     d_packed_query,
                     d_packed_target,
-                    cur_d_query_lens,
-                    cur_d_target_lens,
-                    cur_d_query_offsets,
-                    cur_d_target_offsets,
+                    d_query_lens,
+                    d_target_lens,
+                    d_query_offsets,
+                    d_target_offsets,
                     (gasal_res_t*)device_res,
                     d_mat,
                     d_backtrack_p,
                     (int)col_bt_size,
                     d_ksw_temp_buffer,
-                    cur_d_flag,
+                    d_flag,
                     ksw_temp_per_task,
                     batch_size,
-                    phase_concurrent_slots,
-                    5,
+                    phase_concurrent_slots,  // max_slots
+                    5,              // m = alphabet size (ACGTN)
                     opt->end_bonus,
                     cigar_buffer ? d_cigar_buffer  : NULL,
                     cigar_buffer ? d_cigar_lengths : NULL,
                     (int)current_max_cigar_len
                 );
             } else {
-                int parallel_threads = 32;
+                // ===== Original anti-diagonal kernel (long tasks) =====
+                int parallel_threads = 32;   // one warp per block
                 size_t parallel_smem = 3072;
                 ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
                                               parallel_smem, align_stream>>>(
                     d_task_counter,
                     d_packed_query,
                     d_packed_target,
-                    cur_d_query_lens,
-                    cur_d_target_lens,
-                    cur_d_query_offsets,
-                    cur_d_target_offsets,
+                    d_query_lens,
+                    d_target_lens,
+                    d_query_offsets,
+                    d_target_offsets,
                     (gasal_res_t*)device_res,
                     d_mat,
                     d_backtrack_p,
@@ -762,10 +783,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     (int)current_max_backtrack_size,
                     (int)current_max_antidiag,
                     d_ksw_temp_buffer,
-                    cur_d_flag,
+                    d_flag,
                     ksw_temp_per_task,
                     batch_size,
-                    5,
+                    5,              // m = alphabet size (ACGTN)
                     opt->zdrop,
                     opt->end_bonus,
                     cigar_buffer ? d_cigar_buffer  : NULL,
@@ -781,28 +802,33 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
 
             // P1/P2/P3: GPU compaction + fix_cigar + stats before D2H
+            // This eliminates the 960MB stride CIGAR D2H transfer and the CPU mm_fix_cigar/mm_update_extra loop.
             if (cigar_buffer) {
+                // Step A: compute per-task compact offsets via exclusive prefix sum
                 cub::DeviceScan::ExclusiveSum(d_cub_tmp, cub_tmp_size,
                                               d_cigar_lengths, (int*)d_compact_offsets,
                                               batch_size, align_stream);
 
+                // Step B: scatter stride CIGAR → compact CIGAR
                 compact_cigar_kernel<<<batch_size, 256, 0, align_stream>>>(
                     d_cigar_buffer, d_compact_cigar, d_compact_offsets,
                     d_cigar_lengths, (int)current_max_cigar_len
                 );
 
-                // fix_cigar reads cur_d_unpacked and cur_d_offsets (still valid on ping buffer)
+                // Step C: fix CIGAR in-place + compute alignment stats (one thread per task block)
+                // Sequences still valid in d_unpacked_query/target (same stream, not yet overwritten)
                 gpu_fix_cigar_and_stats<<<batch_size, 1, 0, align_stream>>>(
                     d_compact_cigar, d_compact_offsets, d_cigar_lengths,
-                    cur_d_unpacked_query, cur_d_unpacked_target,
-                    cur_d_query_offsets, cur_d_target_offsets,
+                    d_unpacked_query, d_unpacked_target,
+                    d_query_offsets, d_target_offsets,
                     d_mat, opt->q, opt->e, !(opt->flag & MM_F_SR),
                     d_blen, d_mlen, d_n_ambi, d_dp_max, d_gpu_stats_valid,
                     batch_size
                 );
             }
 
-            // D2H small arrays
+            // D2H Sync 1: small arrays — CIGAR lengths, scores, endpoints, GPU stats
+            // The compact CIGAR bulk D2H happens after we know total_cigar_ops (see Sync 2 below).
             if (cigar_buffer) {
                 cudaMemcpyAsync(h_cigar_lengths, d_cigar_lengths,
                                 batch_size * sizeof(int), cudaMemcpyDeviceToHost, align_stream);
@@ -813,6 +839,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 cudaMemcpyAsync(h_gpu_stats_valid, d_gpu_stats_valid,
                                 batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             }
+            // Copy score/endpoint results back (async, ordered after kernel via align_stream)
             cudaMemcpyAsync(h_scores,      d_scores,      batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_query_ends,  d_query_ends,  batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_target_ends, d_target_ends, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
@@ -821,91 +848,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemcpyAsync(h_mte,   d_mte,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_mte_q, d_mte_q, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
 
-            // ======== DUAL-STREAM: prefetch next batch while GPU computes ========
-            // While align kernel + compaction + D2H run on align_stream,
-            // prepare the next batch on CPU and H2D it into buf[pong] on xfer_stream.
-            int next_batch_start = tasks_processed_in_phase + batch_size;
-            int next_batch_size = 0;
-            if (next_batch_start < n_tasks_in_phase) {
-                next_batch_size = (next_batch_start + current_batch_size <= n_tasks_in_phase) ?
-                                  (int)current_batch_size : (n_tasks_in_phase - next_batch_start);
-                int pong = 1 - ping;
-                uint8_t  *next_d_unpacked_query  = d_unpacked_query_ab[pong];
-                uint8_t  *next_d_unpacked_target = d_unpacked_target_ab[pong];
-                uint32_t *next_d_query_offsets   = d_query_offsets_ab[pong];
-                uint32_t *next_d_target_offsets  = d_target_offsets_ab[pong];
-                uint32_t *next_d_query_lens      = d_query_lens_ab[pong];
-                uint32_t *next_d_target_lens     = d_target_lens_ab[pong];
-                int32_t  *next_d_flag            = d_flag_ab[pong];
-
-                // Sync xfer_stream before overwriting shared metadata buffers
-                // (previous prefetch H2D may still be reading h_query_offsets etc.)
-                cudaStreamSynchronize(xfer_stream);
-
-                // CPU: prepare next batch metadata + sequences
-                size_t next_total_query_bytes = 0, next_total_target_bytes = 0;
-                for (int i = 0; i < next_batch_size; i++) {
-                    int task_idx = current_task_indices[next_batch_start + i];
-                    if (tasks[task_idx].qlen > max_query_len_limit) {
-                        tasks[task_idx].qlen = max_query_len_limit;
-                    }
-                    if (tasks[task_idx].tlen > max_query_len_limit) {
-                        tasks[task_idx].tlen = max_query_len_limit;
-                    }
-                    size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
-                    size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
-                    h_query_offsets[i] = next_total_query_bytes;
-                    h_target_offsets[i] = next_total_target_bytes;
-                    h_query_lens[i] = tasks[task_idx].qlen;
-                    h_target_lens[i] = tasks[task_idx].tlen;
-                    h_flag[i] = tasks[task_idx].flag;
-                    next_total_query_bytes += qlen_aligned;
-                    next_total_target_bytes += tlen_aligned;
-                    h_task_to_align_id[i] = i;
-                }
-
-                // Use pre-allocated pinned staging buffers (no alloc, truly async DMA)
-                uint8_t *next_h_uq = dev_mem->h_align_unpacked_query[pong];
-                uint8_t *next_h_ut = dev_mem->h_align_unpacked_target[pong];
-                const uint8_t N_BASE_PF = 4;
-                for (int i = 0; i < next_batch_size; i++) {
-                    int task_idx = current_task_indices[next_batch_start + i];
-                    memcpy(next_h_uq + h_query_offsets[i],
-                           seq_buffer + tasks[task_idx].qseq_offset, tasks[task_idx].qlen);
-                    memcpy(next_h_ut + h_target_offsets[i],
-                           seq_buffer + tasks[task_idx].tseq_offset, tasks[task_idx].tlen);
-                    size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
-                    size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
-                    for (size_t j = tasks[task_idx].qlen; j < qlen_aligned; j++)
-                        next_h_uq[h_query_offsets[i] + j] = N_BASE_PF;
-                    for (size_t j = tasks[task_idx].tlen; j < tlen_aligned; j++)
-                        next_h_ut[h_target_offsets[i] + j] = N_BASE_PF;
-                }
-
-                // H2D on xfer_stream (overlaps with align kernel on align_stream)
-                cudaMemcpyAsync(next_d_unpacked_query, next_h_uq,
-                                next_total_query_bytes, cudaMemcpyHostToDevice, xfer_stream);
-                cudaMemcpyAsync(next_d_unpacked_target, next_h_ut,
-                                next_total_target_bytes, cudaMemcpyHostToDevice, xfer_stream);
-                cudaMemcpyAsync(next_d_query_offsets, h_query_offsets,
-                                next_batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, xfer_stream);
-                cudaMemcpyAsync(next_d_target_offsets, h_target_offsets,
-                                next_batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, xfer_stream);
-                cudaMemcpyAsync(next_d_query_lens, h_query_lens,
-                                next_batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, xfer_stream);
-                cudaMemcpyAsync(next_d_target_lens, h_target_lens,
-                                next_batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, xfer_stream);
-                cudaMemcpyAsync(next_d_flag, h_flag,
-                                next_batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, xfer_stream);
-                cudaEventRecord(h2d_event, xfer_stream);
-
-                // Store prefetch sizes for next iteration (pinned buffers are persistent)
-                prefetch_total_query_bytes = next_total_query_bytes;
-                prefetch_total_target_bytes = next_total_target_bytes;
-                next_prefetched = true;
-            }
-
-            // Sync 1: wait for all compute + D2H on align_stream
+            // Sync 1: wait for small arrays (D2H above) to arrive on host
             cudaStreamSynchronize(align_stream);
             kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
@@ -1017,14 +960,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
 
 
-            // Pinned staging buffers are persistent — no free needed.
+            // Cleanup batch buffers
+            free(h_unpacked_query);
+            free(h_unpacked_target);
 
             // Update progress
             tasks_processed_in_phase += batch_size;
             total_tasks_processed += batch_size;
-
-            // Swap ping-pong for next iteration
-            ping = 1 - ping;
 
             // Progress bar (show phase-specific progress)
             int percent = (tasks_processed_in_phase * 100) / n_tasks_in_phase;
@@ -1041,9 +983,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     total_tasks_processed, n_tasks, batch_num, total_batches);
             fflush(stderr);
         }  // End of batch loop within phase
-
-        // Ensure xfer_stream is idle before phase transition (pinned buffers are persistent)
-        cudaStreamSynchronize(xfer_stream);
 
         // Phase completion message
         fprintf(stderr, "\n[Info::%s] === %s completed: %d tasks processed ===\n",

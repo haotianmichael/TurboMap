@@ -236,14 +236,6 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_query_lens      = (uint32_t*)arena_alloc(a, metadata_size);
     dev_mem->d_align_target_lens     = (uint32_t*)arena_alloc(a, metadata_size);
     dev_mem->d_align_flag            = (int32_t*)arena_alloc(a, metadata_size);
-    // Buffer B (ping-pong partner for dual-stream H2D overlap)
-    dev_mem->d_align_unpacked_query_b  = (uint8_t*)arena_alloc(a, seq_unpacked_size);
-    dev_mem->d_align_unpacked_target_b = (uint8_t*)arena_alloc(a, seq_unpacked_size);
-    dev_mem->d_align_query_offsets_b   = (uint32_t*)arena_alloc(a, metadata_size);
-    dev_mem->d_align_target_offsets_b  = (uint32_t*)arena_alloc(a, metadata_size);
-    dev_mem->d_align_query_lens_b      = (uint32_t*)arena_alloc(a, metadata_size);
-    dev_mem->d_align_target_lens_b     = (uint32_t*)arena_alloc(a, metadata_size);
-    dev_mem->d_align_flag_b            = (int32_t*)arena_alloc(a, metadata_size);
 
     // ---- Global DP buffer ----
     size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_query_len * 4;
@@ -484,22 +476,8 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         cudaMallocHost(&dev_mem->h_align_flag,             mbs * sizeof(int32_t));
         cudaMallocHost(&dev_mem->h_align_task_to_align_id, mbs * sizeof(int32_t));
 
-        // Pinned sequence staging buffers (2 sets for dual-stream ping-pong)
-        // Size: max possible per-batch sequence bytes (capped by device buffer)
-        size_t short_max_seq = short_bp * (((dev_mem->short_task_max_len + 7) / 8) * 8);
-        size_t long_max_seq  = long_bp  * (((dev_mem->max_align_query_len + 7) / 8) * 8);
-        size_t staging = (short_max_seq > long_max_seq) ? short_max_seq : long_max_seq;
-        if (staging > dev_mem->max_align_seq_bytes)
-            staging = dev_mem->max_align_seq_bytes;
-        dev_mem->h_align_staging_bytes = staging;
-        for (int p = 0; p < 2; p++) {
-            cudaMallocHost(&dev_mem->h_align_unpacked_query[p],  staging);
-            cudaMallocHost(&dev_mem->h_align_unpacked_target[p], staging);
-        }
-
-        fprintf(stderr, " [Arena] Pinned host buffers: %.2f MB (max_batch=%zu, staging=%.1f MB × 4)\n",
-                (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0), mbs,
-                staging / (1024.0*1024.0));
+        fprintf(stderr, " [Arena] Pinned host buffers: %.2f MB (max_batch=%zu)\n",
+                (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0), mbs);
     }
 
     cudaCheck();
@@ -534,10 +512,6 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFreeHost(dev_mem->h_align_target_lens);
     cudaFreeHost(dev_mem->h_align_flag);
     cudaFreeHost(dev_mem->h_align_task_to_align_id);
-    for (int p = 0; p < 2; p++) {
-        cudaFreeHost(dev_mem->h_align_unpacked_query[p]);
-        cudaFreeHost(dev_mem->h_align_unpacked_target[p]);
-    }
     cudaCheck();
 }
 
@@ -1003,10 +977,8 @@ void plmem_stream_initialize(size_t *max_total_n_,
     for (int i = 0; i < num_stream; i++) {
         stream_setup.streams[i].busy = false;
         cudaStreamCreate(&stream_setup.streams[i].cudastream);
-        cudaStreamCreate(&stream_setup.streams[i].align_xfer_stream);
         cudaEventCreate(&stream_setup.streams[i].stopevent);
         cudaEventCreate(&stream_setup.streams[i].startevent);
-        cudaEventCreateWithFlags(&stream_setup.streams[i].align_h2d_event, cudaEventDisableTiming);
         cudaCheck();
         stream_setup.streams[i].dev_mem.buffer_size_long = long_seg_buffer_size;
         // one stream has multiple host mems
@@ -1045,10 +1017,8 @@ void plmem_stream_cleanup() {
     cudaCheck();
     for (int i = 0; i < stream_setup.num_stream; i++) {
         cudaStreamDestroy(stream_setup.streams[i].cudastream);
-        cudaStreamDestroy(stream_setup.streams[i].align_xfer_stream);
         cudaEventDestroy(stream_setup.streams[i].stopevent);
         cudaEventDestroy(stream_setup.streams[i].startevent);
-        cudaEventDestroy(stream_setup.streams[i].align_h2d_event);
         cudaCheck();
         // free multiple host mems
         for (int j = 0; j < score_kernel_config.micro_batch; j++) {

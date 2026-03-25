@@ -573,12 +573,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         int tasks_processed_in_phase = 0;
         int ping = 0;  // ping-pong index for double-buffered input
         bool next_prefetched = false;  // true if next batch H2D is in-flight on xfer_stream
-        uint8_t *cur_h_unpacked_query = NULL;   // current batch's host buf (to free after sync)
-        uint8_t *cur_h_unpacked_target = NULL;
-        uint8_t *prefetch_h_unpacked_query = NULL;  // next batch's host buf (in-flight on xfer_stream)
-        uint8_t *prefetch_h_unpacked_target = NULL;
         size_t prefetch_total_query_bytes = 0, prefetch_total_target_bytes = 0;
-        int prefetch_batch_size = 0;
+        size_t h_staging_bytes = dev_mem->h_align_staging_bytes;
 
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
@@ -586,7 +582,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                              current_batch_size : (n_tasks_in_phase - tasks_processed_in_phase);
             batch_num++;
 
-            // ---- Determine current batch's device pointers (ping buffer) ----
+            // ---- Current batch's device pointers (ping buffer) ----
             uint8_t  *cur_d_unpacked_query  = d_unpacked_query_ab[ping];
             uint8_t  *cur_d_unpacked_target = d_unpacked_target_ab[ping];
             uint32_t *cur_d_query_offsets   = d_query_offsets_ab[ping];
@@ -598,35 +594,22 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             size_t total_query_bytes, total_target_bytes;
 
             if (next_prefetched) {
-                // H2D was already issued on xfer_stream in previous iteration.
-                // Make align_stream wait for it before using the data.
+                // H2D already issued on xfer_stream in previous iteration.
                 cudaStreamWaitEvent(align_stream, h2d_event, 0);
                 total_query_bytes = prefetch_total_query_bytes;
                 total_target_bytes = prefetch_total_target_bytes;
-                // The prefetched host buffers become the current batch's buffers
-                cur_h_unpacked_query = prefetch_h_unpacked_query;
-                cur_h_unpacked_target = prefetch_h_unpacked_target;
-                prefetch_h_unpacked_query = NULL;
-                prefetch_h_unpacked_target = NULL;
                 next_prefetched = false;
             } else {
-                // First batch (or fallback): prepare + H2D on align_stream directly
+                // First batch: prepare + H2D on align_stream directly
+                uint8_t *h_uq = dev_mem->h_align_unpacked_query[ping];
+                uint8_t *h_ut = dev_mem->h_align_unpacked_target[ping];
                 total_query_bytes = 0;
                 total_target_bytes = 0;
-                uint32_t max_query_len = 0;
 
                 for (int i = 0; i < batch_size; i++) {
                     int task_idx = current_task_indices[batch_start + i];
-                    if (tasks[task_idx].qlen > max_query_len_limit) {
-                        fprintf(stderr, "[WARNING] Task %d: qlen=%d exceeds max_query_len=%zu, clamping\n",
-                                task_idx, tasks[task_idx].qlen, max_query_len_limit);
-                        tasks[task_idx].qlen = max_query_len_limit;
-                    }
-                    if (tasks[task_idx].tlen > max_query_len_limit) {
-                        fprintf(stderr, "[WARNING] Task %d: tlen=%d exceeds max_query_len=%zu, clamping\n",
-                                task_idx, tasks[task_idx].tlen, max_query_len_limit);
-                        tasks[task_idx].tlen = max_query_len_limit;
-                    }
+                    if (tasks[task_idx].qlen > max_query_len_limit) tasks[task_idx].qlen = max_query_len_limit;
+                    if (tasks[task_idx].tlen > max_query_len_limit) tasks[task_idx].tlen = max_query_len_limit;
                     size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
                     size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
                     h_query_offsets[i] = total_query_bytes;
@@ -636,31 +619,29 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     h_flag[i] = tasks[task_idx].flag;
                     total_query_bytes += qlen_aligned;
                     total_target_bytes += tlen_aligned;
-                    if (tasks[task_idx].qlen > max_query_len) max_query_len = tasks[task_idx].qlen;
                     h_task_to_align_id[i] = i;
                 }
 
-                uint8_t *h_unpacked_query = (uint8_t*)calloc(total_query_bytes, 1);
-                uint8_t *h_unpacked_target = (uint8_t*)calloc(total_target_bytes, 1);
+                // Fill pinned staging buffers (no alloc, pre-allocated)
                 const uint8_t N_BASE = 4;
                 for (int i = 0; i < batch_size; i++) {
                     int task_idx = current_task_indices[batch_start + i];
-                    memcpy(h_unpacked_query + h_query_offsets[i],
+                    memcpy(h_uq + h_query_offsets[i],
                            seq_buffer + tasks[task_idx].qseq_offset, tasks[task_idx].qlen);
-                    memcpy(h_unpacked_target + h_target_offsets[i],
+                    memcpy(h_ut + h_target_offsets[i],
                            seq_buffer + tasks[task_idx].tseq_offset, tasks[task_idx].tlen);
                     size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
                     size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
                     for (size_t j = tasks[task_idx].qlen; j < qlen_aligned; j++)
-                        h_unpacked_query[h_query_offsets[i] + j] = N_BASE;
+                        h_uq[h_query_offsets[i] + j] = N_BASE;
                     for (size_t j = tasks[task_idx].tlen; j < tlen_aligned; j++)
-                        h_unpacked_target[h_target_offsets[i] + j] = N_BASE;
+                        h_ut[h_target_offsets[i] + j] = N_BASE;
                 }
 
-                // H2D on align_stream (first batch, no overlap)
-                cudaMemcpyAsync(cur_d_unpacked_query, h_unpacked_query,
+                // H2D on align_stream from pinned memory (truly async DMA)
+                cudaMemcpyAsync(cur_d_unpacked_query, h_uq,
                                 total_query_bytes, cudaMemcpyHostToDevice, align_stream);
-                cudaMemcpyAsync(cur_d_unpacked_target, h_unpacked_target,
+                cudaMemcpyAsync(cur_d_unpacked_target, h_ut,
                                 total_target_bytes, cudaMemcpyHostToDevice, align_stream);
                 cudaMemcpyAsync(cur_d_query_offsets, h_query_offsets,
                                 batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
@@ -672,10 +653,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                                 batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
                 cudaMemcpyAsync(cur_d_flag, h_flag,
                                 batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
-
-                // Track for freeing after sync
-                cur_h_unpacked_query = h_unpacked_query;
-                cur_h_unpacked_target = h_unpacked_target;
             }
 
 
@@ -850,6 +827,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 uint32_t *next_d_target_lens     = d_target_lens_ab[pong];
                 int32_t  *next_d_flag            = d_flag_ab[pong];
 
+                // Sync xfer_stream before overwriting shared metadata buffers
+                // (previous prefetch H2D may still be reading h_query_offsets etc.)
+                cudaStreamSynchronize(xfer_stream);
+
                 // CPU: prepare next batch metadata + sequences
                 size_t next_total_query_bytes = 0, next_total_target_bytes = 0;
                 for (int i = 0; i < next_batch_size; i++) {
@@ -872,27 +853,28 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     h_task_to_align_id[i] = i;
                 }
 
-                uint8_t *next_h_unpacked_query = (uint8_t*)calloc(next_total_query_bytes, 1);
-                uint8_t *next_h_unpacked_target = (uint8_t*)calloc(next_total_target_bytes, 1);
+                // Use pre-allocated pinned staging buffers (no alloc, truly async DMA)
+                uint8_t *next_h_uq = dev_mem->h_align_unpacked_query[pong];
+                uint8_t *next_h_ut = dev_mem->h_align_unpacked_target[pong];
                 const uint8_t N_BASE_PF = 4;
                 for (int i = 0; i < next_batch_size; i++) {
                     int task_idx = current_task_indices[next_batch_start + i];
-                    memcpy(next_h_unpacked_query + h_query_offsets[i],
+                    memcpy(next_h_uq + h_query_offsets[i],
                            seq_buffer + tasks[task_idx].qseq_offset, tasks[task_idx].qlen);
-                    memcpy(next_h_unpacked_target + h_target_offsets[i],
+                    memcpy(next_h_ut + h_target_offsets[i],
                            seq_buffer + tasks[task_idx].tseq_offset, tasks[task_idx].tlen);
                     size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
                     size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
                     for (size_t j = tasks[task_idx].qlen; j < qlen_aligned; j++)
-                        next_h_unpacked_query[h_query_offsets[i] + j] = N_BASE_PF;
+                        next_h_uq[h_query_offsets[i] + j] = N_BASE_PF;
                     for (size_t j = tasks[task_idx].tlen; j < tlen_aligned; j++)
-                        next_h_unpacked_target[h_target_offsets[i] + j] = N_BASE_PF;
+                        next_h_ut[h_target_offsets[i] + j] = N_BASE_PF;
                 }
 
                 // H2D on xfer_stream (overlaps with align kernel on align_stream)
-                cudaMemcpyAsync(next_d_unpacked_query, next_h_unpacked_query,
+                cudaMemcpyAsync(next_d_unpacked_query, next_h_uq,
                                 next_total_query_bytes, cudaMemcpyHostToDevice, xfer_stream);
-                cudaMemcpyAsync(next_d_unpacked_target, next_h_unpacked_target,
+                cudaMemcpyAsync(next_d_unpacked_target, next_h_ut,
                                 next_total_target_bytes, cudaMemcpyHostToDevice, xfer_stream);
                 cudaMemcpyAsync(next_d_query_offsets, h_query_offsets,
                                 next_batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, xfer_stream);
@@ -906,13 +888,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                                 next_batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, xfer_stream);
                 cudaEventRecord(h2d_event, xfer_stream);
 
-                // Store prefetch state for next iteration
-                // Free previous prefetch buffers if any (already consumed by current batch)
-                prefetch_h_unpacked_query = next_h_unpacked_query;
-                prefetch_h_unpacked_target = next_h_unpacked_target;
+                // Store prefetch sizes for next iteration (pinned buffers are persistent)
                 prefetch_total_query_bytes = next_total_query_bytes;
                 prefetch_total_target_bytes = next_total_target_bytes;
-                prefetch_batch_size = next_batch_size;
                 next_prefetched = true;
             }
 
@@ -1028,11 +1006,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
 
 
-            // Cleanup current batch's host buffers (H2D is complete after sync)
-            free(cur_h_unpacked_query);
-            free(cur_h_unpacked_target);
-            cur_h_unpacked_query = NULL;
-            cur_h_unpacked_target = NULL;
+            // Pinned staging buffers are persistent — no free needed.
 
             // Update progress
             tasks_processed_in_phase += batch_size;
@@ -1057,16 +1031,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             fflush(stderr);
         }  // End of batch loop within phase
 
-        // Cleanup any remaining prefetch buffers at phase boundary
-        if (prefetch_h_unpacked_query) {
-            // Prefetch was prepared but we exited the loop - need to wait for xfer_stream
-            cudaStreamSynchronize(xfer_stream);
-            free(prefetch_h_unpacked_query);
-            free(prefetch_h_unpacked_target);
-            prefetch_h_unpacked_query = NULL;
-            prefetch_h_unpacked_target = NULL;
-            next_prefetched = false;
-        }
+        // Ensure xfer_stream is idle before phase transition (pinned buffers are persistent)
+        cudaStreamSynchronize(xfer_stream);
 
         // Phase completion message
         fprintf(stderr, "\n[Info::%s] === %s completed: %d tasks processed ===\n",

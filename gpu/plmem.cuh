@@ -316,6 +316,13 @@ typedef struct {
     int32_t  *h_align_flag;
     int32_t  *h_align_task_to_align_id;
 
+    // Pinned host staging buffers for unpacked sequences (dual-stream ping-pong)
+    // Two sets [0/1] for truly async H2D on xfer_stream.
+    // Replaces per-batch calloc/free (pageable memory kills async DMA).
+    uint8_t  *h_align_unpacked_query[2];
+    uint8_t  *h_align_unpacked_target[2];
+    size_t    h_align_staging_bytes;          // size of each staging buffer
+
 } deviceMemPtr;
 
 typedef struct stream_ptr_t{

@@ -484,8 +484,22 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         cudaMallocHost(&dev_mem->h_align_flag,             mbs * sizeof(int32_t));
         cudaMallocHost(&dev_mem->h_align_task_to_align_id, mbs * sizeof(int32_t));
 
-        fprintf(stderr, " [Arena] Pinned host buffers: %.2f MB (max_batch=%zu)\n",
-                (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0), mbs);
+        // Pinned sequence staging buffers (2 sets for dual-stream ping-pong)
+        // Size: max possible per-batch sequence bytes (capped by device buffer)
+        size_t short_max_seq = short_bp * (((dev_mem->short_task_max_len + 7) / 8) * 8);
+        size_t long_max_seq  = long_bp  * (((dev_mem->max_align_query_len + 7) / 8) * 8);
+        size_t staging = (short_max_seq > long_max_seq) ? short_max_seq : long_max_seq;
+        if (staging > dev_mem->max_align_seq_bytes)
+            staging = dev_mem->max_align_seq_bytes;
+        dev_mem->h_align_staging_bytes = staging;
+        for (int p = 0; p < 2; p++) {
+            cudaMallocHost(&dev_mem->h_align_unpacked_query[p],  staging);
+            cudaMallocHost(&dev_mem->h_align_unpacked_target[p], staging);
+        }
+
+        fprintf(stderr, " [Arena] Pinned host buffers: %.2f MB (max_batch=%zu, staging=%.1f MB × 4)\n",
+                (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0), mbs,
+                staging / (1024.0*1024.0));
     }
 
     cudaCheck();
@@ -520,6 +534,10 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFreeHost(dev_mem->h_align_target_lens);
     cudaFreeHost(dev_mem->h_align_flag);
     cudaFreeHost(dev_mem->h_align_task_to_align_id);
+    for (int p = 0; p < 2; p++) {
+        cudaFreeHost(dev_mem->h_align_unpacked_query[p]);
+        cudaFreeHost(dev_mem->h_align_unpacked_target[p]);
+    }
     cudaCheck();
 }
 

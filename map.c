@@ -1384,17 +1384,10 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
         if (has_valid_alignment && task->n_cigar > 0) {
             uint32_t *cigar = gpu_batch->cigar_buffer + task->cigar_offset;
 
-            if (task->task_type == GPU_TASK_LEFT_EXT) {
-                // 左扩展的CIGAR需要反向
-                uint32_t *rev_cigar = (uint32_t*)kmalloc(km, task->n_cigar * sizeof(uint32_t));
-                for (int k = 0; k < task->n_cigar; k++) {
-                    rev_cigar[k] = cigar[task->n_cigar - 1 - k];
-                }
-                mm_append_cigar(r, task->n_cigar, rev_cigar);
-                kfree(km, rev_cigar);
-            } else {
-                mm_append_cigar(r, task->n_cigar, cigar);
-            }
+            // KSW_EZ_REV_CIGAR flag (used by LEFT_EXT) makes the kernel
+            // skip its internal CIGAR reversal, so the CIGAR is already
+            // in the correct appending order.  Do NOT reverse it again.
+            mm_append_cigar(r, task->n_cigar, cigar);
 			// For GAP_FILL tasks: if alignment terminated early, add CIGAR ops to cover unaligned region
             if (task->task_type == GPU_TASK_GAP_FILL && has_valid_alignment) {
                 int aligned_qlen = task->max_q + 1;

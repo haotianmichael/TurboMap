@@ -946,10 +946,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 tasks[task_idx].dp_max          = h_dp_max[align_id];
                 tasks[task_idx].gpu_stats_valid = h_gpu_stats_valid[align_id];
 
-                // Set completion flags
-                // In approx_max mode, use backtrack endpoints (h_query_ends/h_target_ends) to check reach_end
-                // Otherwise use max_q/max_t (which are 0-based indices, compare with len-1)
-                if (tasks[task_idx].flag & KSW_EZ_APPROX_MAX) {
+                // Set completion flags (match CPU ksw2 semantics).
+                // KSW_EZ_RIGHT: reach_end = query end reached (max_q == qlen-1).
+                // Otherwise: reach_end = both ends reached.
+                if (tasks[task_idx].flag & KSW_EZ_RIGHT) {
+                    int mq = (tasks[task_idx].flag & KSW_EZ_APPROX_MAX)
+                           ? h_query_ends[align_id]
+                           : tasks[task_idx].max_q;
+                    tasks[task_idx].reach_end = (mq == tasks[task_idx].qlen - 1);
+                } else if (tasks[task_idx].flag & KSW_EZ_APPROX_MAX) {
                     tasks[task_idx].reach_end = (h_query_ends[align_id] == tasks[task_idx].qlen - 1) &&
                                                 (h_target_ends[align_id] == tasks[task_idx].tlen - 1);
                 } else {

@@ -185,7 +185,7 @@ __global__ void ksw2_col_persistent_kernel(
             int pidx = i / 8;
             int boff = (7 - (i % 8)) * 4;
             uint32_t pv = packed_query_batch[packed_query_off + pidx];
-            qr[qlen - 1 - i] = (pv >> boff) & 0xF;   /* reverse query */
+            qr[i] = (pv >> boff) & 0xF;   /* forward query (no reversal needed for row-major DP) */
         }
         for (int i = lane_id; i < tlen; i += 32) {
             int pidx = i / 8;

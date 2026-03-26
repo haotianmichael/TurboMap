@@ -89,7 +89,8 @@ void gpu_align_copy_param() {
 // This avoids cudaMemcpy host-to-device structure alignment issues
 __global__ void init_gasal_res(gasal_res_t *res,
                                 int32_t *aln_score, int32_t *query_batch_end, int32_t *target_batch_end,
-                                int32_t *mqe, int32_t *mqe_t, int32_t *mte, int32_t *mte_q) {
+                                int32_t *mqe, int32_t *mqe_t, int32_t *mte, int32_t *mte_q,
+                                int32_t *zdropped) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         res->aln_score = aln_score;
         res->query_batch_end = query_batch_end;
@@ -100,6 +101,7 @@ __global__ void init_gasal_res(gasal_res_t *res,
         res->mqe_t = mqe_t;
         res->mte = mte;
         res->mte_q = mte_q;
+        res->zdropped = zdropped;
         res->cigar = NULL;
         res->n_cigar_ops = NULL;
     }
@@ -446,6 +448,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t *d_mqe_t = dev_mem->d_align_mqe_t;
     int32_t *d_mte = dev_mem->d_align_mte;
     int32_t *d_mte_q = dev_mem->d_align_mte_q;
+    int32_t *d_zdropped = dev_mem->d_align_zdropped;
     int  *d_task_counter = dev_mem->d_align_task_counter;
     int   n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
     cudaStream_t align_stream = gpu_get_cudastream(stream_id);
@@ -493,6 +496,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t  *h_mqe_t           = dev_mem->h_align_mqe_t;
     int32_t  *h_mte             = dev_mem->h_align_mte;
     int32_t  *h_mte_q           = dev_mem->h_align_mte_q;
+    int32_t  *h_zdropped        = dev_mem->h_align_zdropped;
     uint32_t *h_query_offsets   = dev_mem->h_align_query_offsets;
     uint32_t *h_target_offsets  = dev_mem->h_align_target_offsets;
     uint32_t *h_query_lens      = dev_mem->h_align_query_lens;
@@ -510,7 +514,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     // Using a kernel avoids host-device structure alignment issues with cudaMemcpy
     // Performance impact: ~5-10 microseconds (negligible compared to alignment kernel runtime)
     init_gasal_res<<<1, 1, 0, align_stream>>>((gasal_res_t*)device_res, d_scores, d_query_ends, d_target_ends,
-                              d_mqe, d_mqe_t, d_mte, d_mte_q);
+                              d_mqe, d_mqe_t, d_mte, d_mte_q, d_zdropped);
     CHECKCUDAERROR(cudaGetLastError());
 
     // ========== TWO-TIER BATCHED PROCESSING LOOP ==========
@@ -757,6 +761,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     batch_size,
                     phase_concurrent_slots,  // max_slots
                     5,              // m = alphabet size (ACGTN)
+                    opt->zdrop,
                     opt->end_bonus,
                     cigar_buffer ? d_cigar_buffer  : NULL,
                     cigar_buffer ? d_cigar_lengths : NULL,
@@ -847,6 +852,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemcpyAsync(h_mqe_t, d_mqe_t, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_mte,   d_mte,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_mte_q, d_mte_q, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+            cudaMemcpyAsync(h_zdropped, d_zdropped, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
 
             // Sync 1: wait for small arrays (D2H above) to arrive on host
             cudaStreamSynchronize(align_stream);
@@ -961,7 +967,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     tasks[task_idx].reach_end = (tasks[task_idx].max_q == tasks[task_idx].qlen - 1) &&
                                                 (tasks[task_idx].max_t == tasks[task_idx].tlen - 1);
                 }
-                tasks[task_idx].zdropped = 0;
+                tasks[task_idx].zdropped = h_zdropped[align_id] ? 1 : 0;
             }
 
 

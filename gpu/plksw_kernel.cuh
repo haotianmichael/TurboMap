@@ -834,6 +834,7 @@ __global__ void ksw_semi_global_kernel(
         device_res->mqe_t[task_id] = ez->mqe_t;
         device_res->mte[task_id] = ez->mte;
         device_res->mte_q[task_id] = ez->mte_q;
+        device_res->zdropped[task_id] = ez->zdropped;
 
         if (with_cigar) {
             backtrack_n_col[task_id] = n_col;
@@ -939,6 +940,7 @@ __global__ void ksw_fused_persistent_kernel(
                 device_res->mqe_t[task_id] = -1;
                 device_res->mte[task_id]   = KSW_NEG_INF;
                 device_res->mte_q[task_id] = -1;
+                device_res->zdropped[task_id] = 0;
                 if (cigar_buffer) cigar_lengths[task_id] = 0;
             }
             __syncwarp();
@@ -1313,6 +1315,7 @@ __global__ void ksw_fused_persistent_kernel(
             device_res->mqe_t[task_id]            = ez_mqe_t;
             device_res->mte[task_id]              = ez_mte;
             device_res->mte_q[task_id]            = ez_mte_q;
+            device_res->zdropped[task_id]         = ez_zdropped;
         }
         // Broadcast backtrack endpoints to all lanes (needed for CIGAR phase check)
         backtrack_q = __shfl_sync(0xffffffff, backtrack_q, 0);

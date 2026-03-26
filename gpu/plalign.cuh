@@ -208,6 +208,7 @@ typedef struct __attribute__((aligned(8))){
 	int32_t *mqe_t;         // target position when reaching end of query
 	int32_t *mte;           // max score when reaching end of target
 	int32_t *mte_q;         // query position when reaching end of target
+	int32_t *zdropped;      // whether z-drop was triggered (per task)
 	uint8_t *cigar;
 	uint32_t *n_cigar_ops;
 }gasal_res_t;

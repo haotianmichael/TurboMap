@@ -17,6 +17,11 @@ typedef struct {
 	int32_t *target_batch_end;
 	int32_t *query_batch_start;
 	int32_t *target_batch_start;
+	int32_t *mqe;
+	int32_t *mqe_t;
+	int32_t *mte;
+	int32_t *mte_q;
+	int32_t *zdropped;
 	uint8_t *cigar;
 	uint32_t *n_cigar_ops;
 }gasal_res_t;
@@ -304,6 +309,7 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_mqe_t            = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
     dev_mem->d_align_mte              = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
     dev_mem->d_align_mte_q            = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    dev_mem->d_align_zdropped         = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
     dev_mem->d_align_task_to_align_id = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
     dev_mem->d_align_mat              = (int8_t*)arena_alloc(a, 25 * sizeof(int8_t));
 
@@ -467,6 +473,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         cudaMallocHost(&dev_mem->h_align_mqe_t,            mbs * sizeof(int32_t));
         cudaMallocHost(&dev_mem->h_align_mte,              mbs * sizeof(int32_t));
         cudaMallocHost(&dev_mem->h_align_mte_q,            mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_zdropped,         mbs * sizeof(int32_t));
         cudaMallocHost(&dev_mem->h_align_query_offsets,    mbs * sizeof(uint32_t));
         cudaMallocHost(&dev_mem->h_align_target_offsets,   mbs * sizeof(uint32_t));
         cudaMallocHost(&dev_mem->h_align_query_lens,       mbs * sizeof(uint32_t));
@@ -504,6 +511,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFreeHost(dev_mem->h_align_mqe_t);
     cudaFreeHost(dev_mem->h_align_mte);
     cudaFreeHost(dev_mem->h_align_mte_q);
+    cudaFreeHost(dev_mem->h_align_zdropped);
     cudaFreeHost(dev_mem->h_align_query_offsets);
     cudaFreeHost(dev_mem->h_align_target_offsets);
     cudaFreeHost(dev_mem->h_align_query_lens);

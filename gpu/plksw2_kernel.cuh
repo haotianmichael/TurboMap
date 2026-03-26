@@ -10,7 +10,7 @@
  *   - Row-major backtrack: bt[qi * tlen + tj] — simpler than anti-diagonal.
  *   - Fused backtrack / CIGAR generation (lane 0 serial).
  *   - Persistent kernel with atomic work-stealing.
- *   - No Z-drop, no banding.
+ *   - Z-drop support (per-row check, early termination). No banding.
  *
  * Backtrack direction byte (same format as original ksw kernel):
  *   bits 0-2: state — 0=diag, 1=E, 2=F, 3=E2, 4=F2
@@ -108,6 +108,7 @@ __global__ void ksw2_col_persistent_kernel(
     int           n_tasks,
     int           max_slots,           /* total available buffer slots    */
     int8_t        m,                   /* alphabet size (5=ACGTN)        */
+    int32_t       zdrop,              /* z-drop threshold (-1 = disabled) */
     int           end_bonus,
     uint32_t     *cigar_buffer,        /* task-indexed (NULL → no CIGAR) */
     int          *cigar_lengths,       /* task-indexed                   */
@@ -148,6 +149,7 @@ __global__ void ksw2_col_persistent_kernel(
                 device_res->mqe_t[task_id] = -1;
                 device_res->mte[task_id]   = KSW_NEG_INF;
                 device_res->mte_q[task_id] = -1;
+                device_res->zdropped[task_id] = 0;
                 if (cigar_buffer) cigar_lengths[task_id] = 0;
             }
             __syncwarp();
@@ -246,6 +248,7 @@ __global__ void ksw2_col_persistent_kernel(
         int32_t ez_mqe   = KSW_NEG_INF, ez_mqe_t = -1;
         int32_t ez_mte   = KSW_NEG_INF, ez_mte_q = -1;
         int32_t ez_score = KSW_NEG_INF;
+        int     ez_zdropped = 0;
 
         /* H_last: the last register's H from the previous row,
          * shuffled to the next lane to provide the diagonal for register 0. */
@@ -454,7 +457,22 @@ __global__ void ksw2_col_persistent_kernel(
                 ez_max   = row_max_val;
                 ez_max_q = qi;
                 ez_max_t = row_max_pos;
+            } else if (zdrop >= 0 && row_max_pos >= 0 &&
+                       row_max_pos >= ez_max_t && qi >= ez_max_q) {
+                /* Z-drop check (minimap2 ksw_apply_zdrop logic):
+                 * If the best score in this row has dropped too far from
+                 * the global maximum, terminate early. Uses e2_pen (the
+                 * larger extension penalty) per minimap2 convention. */
+                int tl = row_max_pos - ez_max_t;
+                int ql = qi - ez_max_q;
+                int l  = (tl > ql) ? (tl - ql) : (ql - tl);
+                if (ez_max - row_max_val > zdrop + l * e2_pen) {
+                    ez_zdropped = 1;
+                }
             }
+
+            /* Early termination on z-drop (all lanes see same value) */
+            if (ez_zdropped) break;
 
             /* mqe warp reduction (only at last query row) */
             if (qi == qlen - 1) {
@@ -493,11 +511,11 @@ __global__ void ksw2_col_persistent_kernel(
         /* ============================================================ */
         int backtrack_q = -1, backtrack_t = -1;
         if (lane_id == 0) {
-            if (!(flag & KSW_EZ_EXTZ_ONLY)) {
+            if (!ez_zdropped && !(flag & KSW_EZ_EXTZ_ONLY)) {
                 /* Global/semi-global: backtrack from corner */
                 backtrack_q = qlen - 1;
                 backtrack_t = tlen - 1;
-            } else if ((flag & KSW_EZ_EXTZ_ONLY) &&
+            } else if (!ez_zdropped && (flag & KSW_EZ_EXTZ_ONLY) &&
                        ez_mqe + end_bonus > ez_max) {
                 backtrack_q = qlen - 1;
                 backtrack_t = ez_mqe_t;
@@ -513,6 +531,7 @@ __global__ void ksw2_col_persistent_kernel(
             device_res->mqe_t[task_id]            = ez_mqe_t;
             device_res->mte[task_id]              = ez_mte;
             device_res->mte_q[task_id]            = ez_mte_q;
+            device_res->zdropped[task_id]         = ez_zdropped;
         }
         backtrack_q = __shfl_sync(0xffffffff, backtrack_q, 0);
         backtrack_t = __shfl_sync(0xffffffff, backtrack_t, 0);

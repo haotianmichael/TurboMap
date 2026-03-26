@@ -239,6 +239,7 @@ typedef struct {
     int32_t *d_align_mqe_t;          // target position when reaching end of query
     int32_t *d_align_mte;            // max score when reaching end of target
     int32_t *d_align_mte_q;          // query position when reaching end of target
+    int32_t *d_align_zdropped;       // z-drop flag per task
     int32_t *d_align_task_to_align_id;
     int8_t *d_align_mat;             // scoring matrix
 
@@ -301,6 +302,7 @@ typedef struct {
     int32_t  *h_align_mqe_t;
     int32_t  *h_align_mte;
     int32_t  *h_align_mte_q;
+    int32_t  *h_align_zdropped;
     uint32_t *h_align_query_offsets;
     uint32_t *h_align_target_offsets;
     uint32_t *h_align_query_lens;

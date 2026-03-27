@@ -1242,6 +1242,9 @@ int mm_split_merge(int n_segs, const char **fn, const mm_mapopt_t *opt, int n_sp
 
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                                    uint8_t *seq_buffer, uint32_t *cigar_buffer, int stream_id);							   
+extern void mm_align1(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi,
+                      int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
+                      int n_a, mm128_t *a, ksw_extz_t *ez, int splice_flag);
 extern void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                              const mm_mapopt_t *opt, const mm_idx_t *mi, 
                              int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
@@ -1459,11 +1462,34 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             case GPU_TASK_GAP_FILL:
                 // Gap填充：更新re1/qe1到gap的终点
                 if (has_valid_alignment && task->zdropped) {
-                    // Z-drop截断
+                    // Z-drop truncation: update coordinates to drop point
                     re1 = task->task_ctx.ref_rs + (task->max_t + 1);
                     qe1 = task->task_ctx.ref_qs + (task->max_q + 1);
                     dropped = 1;
-                    // TODO: 需要调用mm_split_reg处理剩余的anchors
+
+                    // Split remaining anchors into r2 (matches CPU mm_align1 logic)
+                    {
+                        int as1 = task->task_ctx.as1;
+                        int cnt1 = task->task_ctx.cnt1;
+                        int gap_i = task->task_sub_idx;  // gap fill anchor index within as1..as1+cnt1
+                        int rs_gap = task->task_ctx.ref_rs;
+                        int j;
+                        // Find last anchor before the z-drop point
+                        for (j = gap_i - 1; j >= 0; --j)
+                            if ((int32_t)ctx->a[as1 + j].x <= rs_gap + task->max_t)
+                                break;
+                        if (j < 0) j = 0;
+                        if (cnt1 - (j + 1) >= opt->min_cnt) {
+                            mm_reg1_t r2;
+                            memset(&r2, 0, sizeof(mm_reg1_t));
+                            mm_split_reg(r, &r2, as1 + j + 1 - r->as, qlen, ctx->a, !!(opt->flag & MM_F_QSTRAND));
+                            if (r2.cnt > 0) {
+                                ctx->regs0 = mm_insert_reg(&r2, current_reg, &ctx->n_regs, ctx->regs0);
+                                // Update r pointer since realloc may have moved the array
+                                r = &ctx->regs0[current_reg];
+                            }
+                        }
+                    }
 				} else if (!has_valid_alignment) {
                     // 任务失败：需要在CIGAR中添加操作来表示整个gap
                     // 计算gap大小
@@ -1531,12 +1557,12 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                           (gpu_batch->tasks[i+1].read_idx != current_read) ||
                           (gpu_batch->tasks[i+1].reg_idx != current_reg);
 
-        if (is_last_task && !dropped) {
-            // 设置最终边界
+        if (is_last_task) {
+            // Set final boundaries (even for dropped regions — they still need
+            // valid coordinates for the truncated alignment, matching CPU logic)
             r->rs = rs1;
             r->re = re1;
-            
-            // 处理query坐标（考虑反向互补）
+
             int rev = task->task_ctx.rev;
             if (!rev || (opt->flag & MM_F_QSTRAND)) {
                 r->qs = qs1;
@@ -1545,40 +1571,58 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 r->qs = qlen - qe1;
                 r->qe = qlen - qs1;
             }
- 
-            // 调用mm_update_extra更新统计信息
-            // P2/P3 optimisation: GPU already ran fix_cigar+stats for most tasks.
-            // Use GPU results unless leading I/D remains (pass 3b needed) or EQX mode.
-            if (r->p && r->p->n_cigar > 0) {
-                int use_gpu_stats = task->gpu_stats_valid &&
-                                    !(opt->flag & MM_F_EQX);
-                if (use_gpu_stats) {
-                    // GPU fix_cigar (passes 1/2/3a) already applied to CIGAR in-place.
-                    // Precision note: dp_max may differ +/-1 vs CPU (integer vs float log2).
-                    r->blen       = task->blen;
-                    r->mlen       = task->mlen;
-                    r->p->n_ambi  = task->n_ambi;
-                    r->p->dp_max  = task->dp_max;
-                    if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
-                } else {
-                    // CPU fallback: leading-I/D coordinate fix (pass 3b) or EQX mode.
-                    if (qs1 < 0 || qs1 >= qlen || rs1 < 0 || re1 <= rs1) {
-                        fprintf(stderr, "[BUG] mm_update_extra bounds: qs1=%d qe1=%d qlen=%d rs1=%d re1=%d read=%d reg=%d task[%d] type=%d\n",
-                                qs1, qe1, qlen, rs1, re1, current_read, current_reg, i, task->task_type);
+
+            if (!dropped) {
+                // Update alignment statistics
+                // P2/P3 optimisation: GPU already ran fix_cigar+stats for most tasks.
+                // Use GPU results unless leading I/D remains (pass 3b needed) or EQX mode.
+                if (r->p && r->p->n_cigar > 0) {
+                    int use_gpu_stats = task->gpu_stats_valid &&
+                                        !(opt->flag & MM_F_EQX);
+                    if (use_gpu_stats) {
+                        // GPU fix_cigar (passes 1/2/3a) already applied to CIGAR in-place.
+                        // Precision note: dp_max may differ +/-1 vs CPU (integer vs float log2).
+                        r->blen       = task->blen;
+                        r->mlen       = task->mlen;
+                        r->p->n_ambi  = task->n_ambi;
+                        r->p->dp_max  = task->dp_max;
+                        if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
                     } else {
-                    uint8_t *qseq;
-                    if (!rev || (opt->flag & MM_F_QSTRAND)) {
-                        qseq = ctx->qseq0[0] + qs1;
-                    } else {
-                        qseq = ctx->qseq0[1] + qs1;
+                        // CPU fallback: leading-I/D coordinate fix (pass 3b) or EQX mode.
+                        if (qs1 < 0 || qs1 >= qlen || rs1 < 0 || re1 <= rs1) {
+                            fprintf(stderr, "[BUG] mm_update_extra bounds: qs1=%d qe1=%d qlen=%d rs1=%d re1=%d read=%d reg=%d task[%d] type=%d\n",
+                                    qs1, qe1, qlen, rs1, re1, current_read, current_reg, i, task->task_type);
+                        } else {
+                        uint8_t *qseq;
+                        if (!rev || (opt->flag & MM_F_QSTRAND)) {
+                            qseq = ctx->qseq0[0] + qs1;
+                        } else {
+                            qseq = ctx->qseq0[1] + qs1;
+                        }
+                        uint8_t *tseq = (uint8_t*)kmalloc(km, re1 - rs1);
+                        mm_idx_getseq(mi, task->task_ctx.rid, rs1, re1, tseq);
+                        mm_update_extra(r, qseq, tseq, mat, opt->q, opt->e,
+                                       opt->flag & MM_F_EQX, !(opt->flag & MM_F_SR));
+                        if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
+                        kfree(km, tseq);
+                        }  // end bounds-check else
                     }
+                }
+            } else {
+                // Dropped region (z-drop truncated): run mm_update_extra on
+                // the truncated CIGAR so blen/mlen/dp_max are set correctly.
+                if (r->p && r->p->n_cigar > 0 && re1 > rs1 && qs1 >= 0 && qs1 < qlen) {
+                    uint8_t *qseq;
+                    if (!rev || (opt->flag & MM_F_QSTRAND))
+                        qseq = ctx->qseq0[0] + qs1;
+                    else
+                        qseq = ctx->qseq0[1] + qs1;
                     uint8_t *tseq = (uint8_t*)kmalloc(km, re1 - rs1);
                     mm_idx_getseq(mi, task->task_ctx.rid, rs1, re1, tseq);
                     mm_update_extra(r, qseq, tseq, mat, opt->q, opt->e,
                                    opt->flag & MM_F_EQX, !(opt->flag & MM_F_SR));
                     if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
                     kfree(km, tseq);
-                    }  // end bounds-check else
                 }
             }
         }
@@ -1689,9 +1733,9 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
         // This replaces the mm_align1 call with task collection
 		assert(!((opt->flag&MM_F_SPLICE) && (opt->flag&MM_F_SPLICE_FOR) && (opt->flag&MM_F_SPLICE_REV)));
         mm_align1_batched(gpu_batch, km, opt, mi, qlens[0], qseq0, &regs0[i], &r2, n_a, a, read_idx, i);
-        
-        // FIXME: Handle r2.cnt > 0 case after GPU processing
-        // if (r2.cnt > 0) regs0 = mm_insert_reg(&r2, i, &skele_n_regs, regs0);
+        // Note: r2.cnt is always 0 here — mm_align1_batched only collects tasks,
+        // it never calls mm_split_reg.  Z-drop splits are handled during GPU
+        // result processing in gpu_batch_process_results().
     }
 
     *n_regs0 = skele_n_regs;
@@ -1762,6 +1806,30 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     // Submit all tasks to GPU and process results
     nvtxRangePushA("gpu_submit_and_process");
     gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km, stream_id);
+    nvtxRangePop();
+
+    // CPU fallback: align any r2 regions created by z-drop splits during GPU
+    // result processing.  These regions were inserted into ctx->regs0 by
+    // mm_split_reg+mm_insert_reg but have no CIGAR yet (p==NULL).
+    nvtxRangePushA("zdrop_split_cpu_fallback");
+    for (int iread = 0; iread < batch->count; iread++) {
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
+        for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
+            mm_reg1_t *reg = &ctx->regs0[ireg];
+            if (reg->cnt > 0 && reg->p == NULL) {
+                // Unaligned region (from z-drop split) — run CPU mm_align1
+                ksw_extz_t ez;
+                memset(&ez, 0, sizeof(ksw_extz_t));
+                mm_reg1_t r2_cpu;
+                memset(&r2_cpu, 0, sizeof(mm_reg1_t));
+                mm_align1(batch->km, s->p->opt, s->p->mi, ctx->qlen,
+                          ctx->qseq0, reg, &r2_cpu, ctx->n_a, ctx->a,
+                          &ez, s->p->opt->flag);
+                kfree(batch->km, ez.cigar);
+                // r2_cpu from this CPU alignment is not inserted (rare recursive split)
+            }
+        }
+    }
     nvtxRangePop();
 
     nvtxRangePushA("post_align_helper_gpu_loop");

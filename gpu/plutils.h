@@ -85,6 +85,10 @@ typedef struct{
     int32_t rs0, re0;
     int32_t rev;
     int32_t rid;
+
+    // Anchor indices for z-drop split (mm_split_reg)
+    int32_t as1;            // first valid anchor index (after bad-end filtering)
+    int32_t cnt1;           // valid anchor count
 }task_ctx_t;
 
 typedef struct {

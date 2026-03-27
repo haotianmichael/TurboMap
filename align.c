@@ -1332,6 +1332,8 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
 	task_ctx.re0 = re0;
 	task_ctx.rid = rid;
 	task_ctx.rev = rev;
+	task_ctx.as1 = as1;
+	task_ctx.cnt1 = cnt1;
  
 	// Left extension
     // Guard: rs must not exceed re0, or mm_idx_getseq would write (rs-rs0) bytes

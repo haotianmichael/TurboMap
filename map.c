@@ -1245,6 +1245,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 extern void mm_align1(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi,
                       int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
                       int n_a, mm128_t *a, ksw_extz_t *ez, int splice_flag);
+extern int mm_align1_inv(void *km, const mm_mapopt_t *opt, const mm_idx_t *mi,
+                         int qlen, uint8_t *qseq0[2], const mm_reg1_t *r1,
+                         const mm_reg1_t *r2, mm_reg1_t *r_inv, ksw_extz_t *ez);
 extern void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                              const mm_mapopt_t *opt, const mm_idx_t *mi, 
                              int qlen, uint8_t *qseq0[2], mm_reg1_t *r, mm_reg1_t *r2,
@@ -1467,7 +1470,12 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                     qe1 = task->task_ctx.ref_qs + (task->max_q + 1);
                     dropped = 1;
 
-                    // Split remaining anchors into r2 (matches CPU mm_align1 logic)
+                    // Split remaining anchors into r2 (matches CPU mm_align1 logic).
+                    // Note: the GPU always aligns with opt->zdrop, skipping the CPU
+                    // two-pass approach (APPROX_MAX + mm_test_zdrop) that distinguishes
+                    // normal z-drop (zdrop_code=1) from inversion z-drop (zdrop_code=2).
+                    // Therefore r2->split_inv is never set here; inversion detection
+                    // will happen when the CPU fallback re-aligns r2 via mm_align1.
                     {
                         int as1 = task->task_ctx.as1;
                         int cnt1 = task->task_ctx.cnt1;
@@ -1826,7 +1834,24 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
                           ctx->qseq0, reg, &r2_cpu, ctx->n_a, ctx->a,
                           &ez, s->p->opt->flag);
                 kfree(batch->km, ez.cigar);
-                // r2_cpu from this CPU alignment is not inserted (rare recursive split)
+                if (r2_cpu.cnt > 0) {
+                    ctx->regs0 = mm_insert_reg(&r2_cpu, ireg, &ctx->n_regs, ctx->regs0);
+                    reg = &ctx->regs0[ireg]; // realloc may have moved the array
+                }
+                // Handle inversion z-drop: mm_align1 sets split_inv when
+                // mm_test_zdrop detects zdrop_code==2 (matches CPU mm_align_skeleton)
+                if (ireg > 0 && reg->split_inv && !(s->p->opt->flag & MM_F_NO_INV)) {
+                    mm_reg1_t r2_inv;
+                    memset(&r2_inv, 0, sizeof(mm_reg1_t));
+                    ksw_extz_t ez_inv;
+                    memset(&ez_inv, 0, sizeof(ksw_extz_t));
+                    if (mm_align1_inv(batch->km, s->p->opt, s->p->mi, ctx->qlen,
+                                     ctx->qseq0, &ctx->regs0[ireg-1], reg, &r2_inv, &ez_inv)) {
+                        ctx->regs0 = mm_insert_reg(&r2_inv, ireg, &ctx->n_regs, ctx->regs0);
+                        ++ireg; // skip the inserted INV alignment
+                    }
+                    kfree(batch->km, ez_inv.cigar);
+                }
             }
         }
     }

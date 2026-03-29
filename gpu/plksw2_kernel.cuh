@@ -524,7 +524,7 @@ __global__ void ksw2_col_persistent_kernel(
                 backtrack_t = ez_max_t;
             }
 
-            device_res->aln_score[task_id]        = ez_score;
+            device_res->aln_score[task_id]        = ez_zdropped ? ez_max : ez_score;
             device_res->query_batch_end[task_id]  = backtrack_q;
             device_res->target_batch_end[task_id] = backtrack_t;
             device_res->mqe[task_id]              = ez_mqe;

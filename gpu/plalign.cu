@@ -2,7 +2,7 @@
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
-#include "plksw2_kernel.cuh"  // CUDASW4-style column-parallel kernel
+// plksw2_kernel.cuh (CUDASW4-style column-parallel) no longer used; unified anti-diagonal kernel
 #include <cub/device/device_scan.cuh>
 // NVTX3 C API (nvtxRangePushA/nvtxRangePop) already available via cub/detail/nvtx.cuh
 
@@ -693,34 +693,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 total_target_bytes / 4
             );
 
-            // ===== Persistent KSW Kernel (align + backtrack in one launch) =====
-            // Phase 0 (short tasks ≤1000bp): CUDASW4-style column-parallel kernel
-            //   - Row-major backtrack: bt_size = max_qlen × max_tlen
-            //   - No Z-drop, no banding, full DP in registers
-            //   - temp buffer: only unpacked sequences (qlen + tlen bytes)
-            // Phase 1 (long tasks >1000bp): Original anti-diagonal kernel
-            //   - Anti-diagonal backtrack with banding
-            //   - Z-drop, Suzuki-Kasahara formulation
+            // ===== Persistent KSW Kernel (unified anti-diagonal, int32 dual-affine) =====
+            // Both phases use the same fused persistent kernel with direct int32 H/E/F/E2/F2.
+            // Anti-diagonal backtrack with banding for all task sizes.
             size_t bt_p_total_bytes = (size_t)n_concurrent_blocks *
                                       dev_mem->max_align_backtrack_size;
 
-            // For the column-parallel kernel (short tasks), backtrack is row-major:
-            // bt_size_per_slot = short_task_max_len × short_task_max_len
-            size_t col_bt_size = short_task_max_len * short_task_max_len;
-
-            size_t max_slots_this_phase;
-            if (phase == 0) {
-                // Column-parallel: row-major backtrack
-                max_slots_this_phase = bt_p_total_bytes / col_bt_size;
-                // Also cap by temp buffer: total_temp / per_slot_temp
-                size_t temp_slots = dev_mem->short_task_batch_size;
-                if (temp_slots < max_slots_this_phase)
-                    max_slots_this_phase = temp_slots;
-            } else {
-                // Anti-diagonal: banded backtrack
-                max_slots_this_phase = bt_p_total_bytes /
-                                       (size_t)current_max_backtrack_size;
-            }
+            size_t max_slots_this_phase = bt_p_total_bytes /
+                                          (size_t)current_max_backtrack_size;
 
             int phase_concurrent_slots = n_concurrent_blocks;
             if ((size_t)phase_concurrent_slots > max_slots_this_phase)
@@ -732,47 +712,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
-            if (phase == 0) {
-                // ===== CUDASW4-style column-parallel kernel (multi-warp) =====
-                int col_warps_per_block = KSW2_WARPS_PER_BLOCK;
-                int col_threads_per_block = 32 * col_warps_per_block;
-                int col_n_blocks = (phase_concurrent_slots + col_warps_per_block - 1)
-                                   / col_warps_per_block;
-
-                fprintf(stderr, "\n[DEBUG::%s] Phase0 launch: blocks=%d, warps/blk=%d, total_slots=%d, batch=%d, max_bt=%zu\n",
-                        __func__, col_n_blocks, col_warps_per_block,
-                        phase_concurrent_slots, batch_size, col_bt_size);
-                ksw2_col_persistent_kernel<<<col_n_blocks, col_threads_per_block,
-                                             0, align_stream>>>(
-                    d_task_counter,
-                    d_packed_query,
-                    d_packed_target,
-                    d_query_lens,
-                    d_target_lens,
-                    d_query_offsets,
-                    d_target_offsets,
-                    (gasal_res_t*)device_res,
-                    d_mat,
-                    d_backtrack_p,
-                    (int)col_bt_size,
-                    d_ksw_temp_buffer,
-                    d_flag,
-                    ksw_temp_per_task,
-                    batch_size,
-                    phase_concurrent_slots,  // max_slots
-                    5,              // m = alphabet size (ACGTN)
-                    opt->zdrop,
-                    opt->end_bonus,
-                    cigar_buffer ? d_cigar_buffer  : NULL,
-                    cigar_buffer ? d_cigar_lengths : NULL,
-                    (int)current_max_cigar_len
-                );
-            } else {
-                // ===== Original anti-diagonal kernel (long tasks) =====
+            {
                 int parallel_threads = 32;   // one warp per block
-                size_t parallel_smem = 3072;
+                fprintf(stderr, "\n[DEBUG::%s] Phase%d launch: blocks=%d, batch=%d, bt_size=%zu\n",
+                        __func__, phase, phase_concurrent_slots, batch_size,
+                        current_max_backtrack_size);
                 ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
-                                              parallel_smem, align_stream>>>(
+                                              0, align_stream>>>(
                     d_task_counter,
                     d_packed_query,
                     d_packed_target,

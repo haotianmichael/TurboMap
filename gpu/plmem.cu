@@ -248,11 +248,11 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_global_buffer = arena_alloc(a, global_buffer_bytes);
 
     // ---- KSW temp buffer (slot-indexed by blockIdx.x) ----
+    // Layout: 3×H_buf + E + F + E2 + F2 (all int32, tlen+1 each) + qr + target (uint8)
     size_t max_len = dev_mem->max_align_query_len;
-    size_t H_size = max_len * sizeof(int32_t);
-    size_t u8_arrays_size = (max_len + 1) * 7 * sizeof(int8_t);
+    size_t int32_arrays_size = (max_len + 1) * 7 * sizeof(int32_t);  // 3×H + E + F + E2 + F2
     size_t seq_size = max_len * 2 * sizeof(uint8_t);
-    size_t raw_size = H_size + u8_arrays_size + seq_size;
+    size_t raw_size = int32_arrays_size + seq_size;
     dev_mem->align_ksw_temp_per_task = (raw_size + 7) & ~7ULL;
     size_t ksw_temp_bytes = (size_t)dev_mem->n_align_concurrent_blocks *
                             dev_mem->align_ksw_temp_per_task;

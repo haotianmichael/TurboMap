@@ -350,31 +350,38 @@ __global__ void ksw_fused_persistent_kernel(
                     H_val = max(H_val, E2_val);
                     H_val = max(H_val, F2_val);
                 } else if (!right_align) {
-                    if (E_val  > H_val) { H_val = E_val;  d = 1; }
-                    if (F_val  > H_val) { H_val = F_val;  d = 2; }
-                    if (E2_val > H_val) { H_val = E2_val; d = 3; }
-                    if (F2_val > H_val) { H_val = F2_val; d = 4; }
+                    // State mapping must match ksw2 backtrack convention:
+                    // state 1 = horizontal gap (F, target gap) = DEL → --i
+                    // state 2 = vertical gap (E, query gap)   = INS → --j
+                    // state 3 = long horizontal (F2)          = DEL
+                    // state 4 = long vertical (E2)            = INS
+                    if (F_val  > H_val) { H_val = F_val;  d = 1; }
+                    if (E_val  > H_val) { H_val = E_val;  d = 2; }
+                    if (F2_val > H_val) { H_val = F2_val; d = 3; }
+                    if (E2_val > H_val) { H_val = E2_val; d = 4; }
                 } else {
-                    if (!(H_val > E_val))  { H_val = E_val;  d = 1; }
-                    if (!(H_val > F_val))  { H_val = F_val;  d = 2; }
-                    if (!(H_val > E2_val)) { H_val = E2_val; d = 3; }
-                    if (!(H_val > F2_val)) { H_val = F2_val; d = 4; }
+                    if (!(H_val > F_val))  { H_val = F_val;  d = 1; }
+                    if (!(H_val > E_val))  { H_val = E_val;  d = 2; }
+                    if (!(H_val > F2_val)) { H_val = F2_val; d = 3; }
+                    if (!(H_val > E2_val)) { H_val = E2_val; d = 4; }
                 }
 
-                // Backtrack continuation bits
-                // Left-align: extension wins only if strictly better (>)
-                // Right-align: extension wins on tie (>=)
+                // Backtrack continuation bits — must match state numbering:
+                // bit 3 (0x08) = state 1 continuation = F (horizontal gap extension)
+                // bit 4 (0x10) = state 2 continuation = E (vertical gap extension)
+                // bit 5 (0x20) = state 3 continuation = F2 (long horizontal)
+                // bit 6 (0x40) = state 4 continuation = E2 (long vertical)
                 if (with_cigar) {
                     if (!right_align) {
-                        if (e_ext > e_open)                d |= 0x08;
-                        if (f_ext > f_open && t > 0)       d |= 0x10;
-                        if (e2_ext > e2_open)              d |= 0x20;
-                        if (f2_ext > f2_open && t > 0)     d |= 0x40;
+                        if (f_ext > f_open && t > 0)       d |= 0x08;
+                        if (e_ext > e_open)                d |= 0x10;
+                        if (f2_ext > f2_open && t > 0)     d |= 0x20;
+                        if (e2_ext > e2_open)              d |= 0x40;
                     } else {
-                        if (e_ext >= e_open)               d |= 0x08;
-                        if (f_ext >= f_open && t > 0)      d |= 0x10;
-                        if (e2_ext >= e2_open)             d |= 0x20;
-                        if (f2_ext >= f2_open && t > 0)    d |= 0x40;
+                        if (f_ext >= f_open && t > 0)      d |= 0x08;
+                        if (e_ext >= e_open)               d |= 0x10;
+                        if (f2_ext >= f2_open && t > 0)    d |= 0x20;
+                        if (e2_ext >= e2_open)             d |= 0x40;
                     }
                 }
 

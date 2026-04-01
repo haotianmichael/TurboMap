@@ -225,6 +225,7 @@ __global__ void ksw_fused_persistent_kernel(
         int     *off_end = backtrack_off_end + (size_t)slot_id * max_antidiag;
 
         // ========== Main DP Loop: Anti-diagonal Traversal ==========
+        int last_st = -1, last_en = -1;  // previous anti-diagonal band boundaries
         for (int r = 0; r < qlen + tlen - 1; r++) {
             // Band boundaries
             int st = 0, en = tlen - 1;
@@ -284,7 +285,13 @@ __global__ void ksw_fused_persistent_kernel(
                     H_up = H_prev[t];
                 }
                 int32_t e_open  = H_up - qe;
-                int32_t e_ext   = E_arr[t] - e;
+                // E_arr[t] is valid only if t was in band at r-1
+                int32_t e_ext;
+                if (t >= last_st && t <= last_en) {
+                    e_ext = E_arr[t] - e;
+                } else {
+                    e_ext = KSW_NEG_INF;  // out-of-band: no valid E from previous
+                }
                 int32_t E_val   = max(e_open, e_ext);
 
                 // Gap in target (F): horizontal move (i,j-1) -> (i,j)
@@ -296,27 +303,41 @@ __global__ void ksw_fused_persistent_kernel(
                     H_left = H_prev[t - 1];
                 }
                 int32_t f_open  = H_left - qe;
-                int32_t f_ext   = F_arr[t - 1 >= 0 ? t - 1 : 0] - e;
+                // F_arr[t-1] is valid only if t-1 was in band at r-1
+                int32_t f_ext;
                 int32_t F_val;
                 if (t == 0) {
-                    F_val = f_open;  // no F extension from boundary
-                } else {
+                    F_val = f_open;  // boundary: no F extension
+                } else if (t - 1 >= last_st && t - 1 <= last_en) {
+                    f_ext = F_arr[t - 1] - e;
                     F_val = max(f_open, f_ext);
+                } else {
+                    f_ext = KSW_NEG_INF;  // out-of-band: no valid F from previous
+                    F_val = f_open;
                 }
 
                 // Long gap in query (E2)
                 int32_t e2_open = H_up - qe2;
-                int32_t e2_ext  = E2_arr[t] - e2;
+                int32_t e2_ext;
+                if (t >= last_st && t <= last_en) {
+                    e2_ext = E2_arr[t] - e2;
+                } else {
+                    e2_ext = KSW_NEG_INF;
+                }
                 int32_t E2_val  = max(e2_open, e2_ext);
 
                 // Long gap in target (F2)
                 int32_t f2_open = H_left - qe2;
-                int32_t f2_ext  = F2_arr[t - 1 >= 0 ? t - 1 : 0] - e2;
+                int32_t f2_ext;
                 int32_t F2_val;
                 if (t == 0) {
                     F2_val = f2_open;
-                } else {
+                } else if (t - 1 >= last_st && t - 1 <= last_en) {
+                    f2_ext = F2_arr[t - 1] - e2;
                     F2_val = max(f2_open, f2_ext);
+                } else {
+                    f2_ext = KSW_NEG_INF;
+                    F2_val = f2_open;
                 }
 
                 // H[i][j] = max(H_diag + score, E, F, E2, F2)
@@ -440,6 +461,10 @@ __global__ void ksw_fused_persistent_kernel(
                     }
                 }
             }
+
+            // Update band boundaries for next anti-diagonal
+            last_st = st0;
+            last_en = en0;
 
             int zdropped_flag = __shfl_sync(0xffffffff, ez_zdropped, 0);
             if (zdropped_flag) break;

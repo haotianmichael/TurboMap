@@ -1390,39 +1390,13 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
         if (has_valid_alignment && task->n_cigar > 0) {
             uint32_t *cigar = gpu_batch->cigar_buffer + task->cigar_offset;
 
-            // DEBUG: count raw GPU CIGAR bases BEFORE append
-            {
-                static int raw_mismatch_count = 0;
-                int raw_cq = 0, raw_ct = 0;
-                for (int ci = 0; ci < (int)task->n_cigar; ci++) {
-                    uint32_t op = cigar[ci] & 0xf;
-                    int len = cigar[ci] >> 4;
-                    if (op == 0) { raw_cq += len; raw_ct += len; }
-                    else if (op == 1) { raw_cq += len; }
-                    else if (op == 2 || op == 3) { raw_ct += len; }
-                }
-                int exp_q = task->max_q + 1;
-                int exp_t = task->max_t + 1;
-                if (raw_cq != exp_q || raw_ct != exp_t) {
-                    if (++raw_mismatch_count <= 10)
-                        fprintf(stderr, "[DEBUG] RAW_CIGAR mismatch #%d: task[%d] type=%d "
-                                "raw_cq=%d raw_ct=%d exp_q=%d exp_t=%d "
-                                "maxq=%d maxt=%d n_cigar=%d zdrop=%d reach=%d "
-                                "qlen=%d tlen=%d flag=0x%x\n",
-                                raw_mismatch_count, i, task->task_type,
-                                raw_cq, raw_ct, exp_q, exp_t,
-                                task->max_q, task->max_t, task->n_cigar,
-                                task->zdropped, task->reach_end,
-                                task->qlen, task->tlen, task->flag);
-                }
-            }
 
             // KSW_EZ_REV_CIGAR flag (used by LEFT_EXT) makes the kernel
             // skip its internal CIGAR reversal, so the CIGAR is already
             // in the correct appending order.  Do NOT reverse it again.
             mm_append_cigar(r, task->n_cigar, cigar);
 			// For GAP_FILL tasks: if alignment terminated early, add CIGAR ops to cover unaligned region
-            if (task->task_type == GPU_TASK_GAP_FILL && has_valid_alignment) {
+            if (task->task_type == GPU_TASK_GAP_FILL && has_valid_alignment && !task->zdropped) {
                 int aligned_qlen = task->max_q + 1;
                 int aligned_tlen = task->max_t + 1;
                 int expected_qlen = task->task_ctx.ref_qe - task->task_ctx.ref_qs;
@@ -1587,36 +1561,6 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 break;
         }
         
-        // Per-sub-task CIGAR validation: count bases contributed by this sub-task
-        if (r->p && r->p->n_cigar > 0) {
-            // Count CIGAR bases for the sub-task just appended (from prev_n_cigar to current)
-            static int subtask_mismatch_count = 0;
-            int sub_cq = 0, sub_ct = 0;
-            for (int ci = 0; ci < (int)r->p->n_cigar; ci++) {
-                uint32_t op = r->p->cigar[ci] & 0xf;
-                int len = r->p->cigar[ci] >> 4;
-                if (op == 0) { sub_cq += len; sub_ct += len; }
-                else if (op == 1) { sub_cq += len; }
-                else if (op == 2 || op == 3) { sub_ct += len; }
-            }
-            // Compute expected total CIGAR up to this sub-task
-            int exp_q_total = qe1 - qs1;
-            int exp_t_total = re1 - rs1;
-            if (sub_cq != exp_q_total || sub_ct != exp_t_total) {
-                if (++subtask_mismatch_count <= 10)
-                    fprintf(stderr, "[DEBUG] SUBTASK mismatch #%d: task[%d] type=%d sub_idx=%d "
-                            "cigar_total_q=%d cigar_total_t=%d exp_q=%d exp_t=%d "
-                            "maxq=%d maxt=%d zdrop=%d n_cigar=%d reach=%d "
-                            "qs1=%d qe1=%d rs1=%d re1=%d ref_qs=%d ref_qe=%d ref_rs=%d ref_re=%d\n",
-                            subtask_mismatch_count, i, task->task_type, task->task_sub_idx,
-                            sub_cq, sub_ct, exp_q_total, exp_t_total,
-                            task->max_q, task->max_t, task->zdropped, task->n_cigar, task->reach_end,
-                            qs1, qe1, rs1, re1,
-                            task->task_ctx.ref_qs, task->task_ctx.ref_qe,
-                            task->task_ctx.ref_rs, task->task_ctx.ref_re);
-            }
-        }
-
         // 检查是否是当前region的最后一个任务
         int is_last_task = (i == gpu_batch->n_tasks - 1) ||
                           (gpu_batch->tasks[i+1].read_idx != current_read) ||

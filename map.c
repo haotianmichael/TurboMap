@@ -1603,13 +1603,12 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                         } else {
                         // DEBUG: validate CIGAR vs sequence lengths before mm_update_extra
                         {
-                            static int cigar_mismatch_count = 0;
+                            static int nm_count = 0, nm_total = 0;
                             int cigar_qlen = 0, cigar_tlen = 0;
-                            int has_zero_len = 0;
+                            nm_total++;
                             for (int ci = 0; ci < (int)r->p->n_cigar; ci++) {
                                 uint32_t op = r->p->cigar[ci] & 0xf;
                                 int len = r->p->cigar[ci] >> 4;
-                                if (len == 0) has_zero_len = 1;
                                 if (op == 0) { cigar_qlen += len; cigar_tlen += len; }
                                 else if (op == 1) { cigar_qlen += len; }
                                 else if (op == 2) { cigar_tlen += len; }
@@ -1618,13 +1617,14 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             int exp_qlen = qe1 - qs1;
                             int exp_tlen = re1 - rs1;
                             if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
-                                cigar_mismatch_count++;
-                                if (cigar_mismatch_count <= 5) {
-                                    fprintf(stderr, "[DEBUG] CIGAR mismatch #%d: cq=%d ct=%d eq=%d et=%d "
+                                nm_count++;
+                                if (nm_count <= 3)
+                                    fprintf(stderr, "[DEBUG] CIGAR mismatch #%d/%d: cq=%d ct=%d eq=%d et=%d "
                                             "task[%d] type=%d score=%d maxq=%d maxt=%d zdrop=%d\n",
-                                            cigar_mismatch_count, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
+                                            nm_count, nm_total, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
                                             i, task->task_type, task->score, task->max_q, task->max_t, task->zdropped);
-                                }
+                                else if (nm_count % 1000 == 0)
+                                    fprintf(stderr, "[DEBUG] CIGAR mismatch count: %d / %d checked\n", nm_count, nm_total);
                                 goto skip_update_extra;
                             }
                         }

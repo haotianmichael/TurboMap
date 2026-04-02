@@ -833,23 +833,47 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
 
             // Sync 2: D2H compact CIGAR (only actual data, no stride padding)
-            // Compute host-side prefix offsets from h_cigar_lengths, then copy only total_cigar_ops entries.
+            // IMPORTANT: d_compact_offsets were computed BEFORE gpu_fix_cigar, which may
+            // shrink CIGARs in-place. The data in d_compact_cigar is still at the ORIGINAL
+            // offsets. We must copy d_compact_offsets from GPU rather than recomputing from
+            // the updated h_cigar_lengths, which would produce wrong (shifted) offsets.
             int total_cigar_ops = 0;
             if (cigar_buffer) {
+                // Validate cigar lengths
                 for (int i = 0; i < batch_size; i++) {
-                    h_compact_offsets[i] = (uint32_t)total_cigar_ops;
                     int clen = h_cigar_lengths[i];
                     if (clen < 0 || clen > (int)current_max_cigar_len) {
                         fprintf(stderr, "\n[DEBUG::%s] CORRUPT cigar_length[%d]=%d (max=%zu), clamping to 0\n",
                                 __func__, i, clen, current_max_cigar_len);
                         h_cigar_lengths[i] = 0;
-                        clen = 0;
                     }
-                    total_cigar_ops += clen;
                 }
+
+                // Copy the GPU-computed compact offsets (which match the actual data layout)
+                cudaMemcpyAsync(h_compact_offsets, d_compact_offsets,
+                                batch_size * sizeof(uint32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaStreamSynchronize(align_stream);
+
+                // Compute total data extent: last task's offset + original (pre-fix) length
+                // We need the original length to know the data extent, but we only have the
+                // updated length. Use the GPU offsets: the extent is offset[last] + original_len[last].
+                // Since we can't recover original_len, use offset[last] + max of updated lengths
+                // as a safe upper bound. Or simply: last offset + current_max_cigar_len as safe bound.
+                // Better approach: the total extent equals the sum of ORIGINAL lengths, which is
+                // d_compact_offsets[batch_size-1] + original_length[batch_size-1].
+                // Since original_length >= updated_length, we can use:
+                //   total_extent = h_compact_offsets[batch_size-1] + current_max_cigar_len
+                // But that's wasteful. Instead, the data we need for each task is at
+                // h_compact_offsets[i] with h_cigar_lengths[i] (updated) entries.
+                // Find the maximum extent needed:
+                uint32_t max_extent = 0;
+                for (int i = 0; i < batch_size; i++) {
+                    uint32_t end = h_compact_offsets[i] + (uint32_t)h_cigar_lengths[i];
+                    if (end > max_extent) max_extent = end;
+                }
+                total_cigar_ops = (int)max_extent;
+
                 if (total_cigar_ops > 0) {
-                    // Transfer only the compacted, fixed CIGAR data — typically 10-40× smaller than stride layout
-                    // Use async + stream sync to avoid blocking other streams
                     cudaMemcpyAsync(h_compact_cigar, d_compact_cigar,
                                total_cigar_ops * sizeof(uint32_t), cudaMemcpyDeviceToHost, align_stream);
                     cudaStreamSynchronize(align_stream);

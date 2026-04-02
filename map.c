@@ -1560,6 +1560,36 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 break;
         }
         
+        // Per-sub-task CIGAR validation: count bases contributed by this sub-task
+        if (r->p && r->p->n_cigar > 0) {
+            // Count CIGAR bases for the sub-task just appended (from prev_n_cigar to current)
+            static int subtask_mismatch_count = 0;
+            int sub_cq = 0, sub_ct = 0;
+            for (int ci = 0; ci < (int)r->p->n_cigar; ci++) {
+                uint32_t op = r->p->cigar[ci] & 0xf;
+                int len = r->p->cigar[ci] >> 4;
+                if (op == 0) { sub_cq += len; sub_ct += len; }
+                else if (op == 1) { sub_cq += len; }
+                else if (op == 2 || op == 3) { sub_ct += len; }
+            }
+            // Compute expected total CIGAR up to this sub-task
+            int exp_q_total = qe1 - qs1;
+            int exp_t_total = re1 - rs1;
+            if (sub_cq != exp_q_total || sub_ct != exp_t_total) {
+                if (++subtask_mismatch_count <= 10)
+                    fprintf(stderr, "[DEBUG] SUBTASK mismatch #%d: task[%d] type=%d sub_idx=%d "
+                            "cigar_total_q=%d cigar_total_t=%d exp_q=%d exp_t=%d "
+                            "maxq=%d maxt=%d zdrop=%d n_cigar=%d reach=%d "
+                            "qs1=%d qe1=%d rs1=%d re1=%d ref_qs=%d ref_qe=%d ref_rs=%d ref_re=%d\n",
+                            subtask_mismatch_count, i, task->task_type, task->task_sub_idx,
+                            sub_cq, sub_ct, exp_q_total, exp_t_total,
+                            task->max_q, task->max_t, task->zdropped, task->n_cigar, task->reach_end,
+                            qs1, qe1, rs1, re1,
+                            task->task_ctx.ref_qs, task->task_ctx.ref_qe,
+                            task->task_ctx.ref_rs, task->task_ctx.ref_re);
+            }
+        }
+
         // 检查是否是当前region的最后一个任务
         int is_last_task = (i == gpu_batch->n_tasks - 1) ||
                           (gpu_batch->tasks[i+1].read_idx != current_read) ||

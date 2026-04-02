@@ -1619,16 +1619,11 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             int exp_tlen = re1 - rs1;
                             if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
                                 cigar_mismatch_count++;
-                                if (cigar_mismatch_count <= 3) {
+                                if (cigar_mismatch_count <= 5) {
                                     fprintf(stderr, "[DEBUG] CIGAR mismatch #%d: cq=%d ct=%d eq=%d et=%d "
-                                            "n_cigar=%d task[%d] type=%d score=%d zlen=%d\n",
+                                            "task[%d] type=%d score=%d maxq=%d maxt=%d zdrop=%d\n",
                                             cigar_mismatch_count, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
-                                            r->p->n_cigar, i, task->task_type, task->score, has_zero_len);
-                                    for (int ci = 0; ci < (int)r->p->n_cigar && ci < 6; ci++)
-                                        fprintf(stderr, "  [%d]=%d%c", ci, r->p->cigar[ci]>>4, "MIDNSHP=X"[r->p->cigar[ci]&0xf]);
-                                    fprintf(stderr, "\n");
-                                } else if (cigar_mismatch_count == 4) {
-                                    fprintf(stderr, "[DEBUG] suppressing further CIGAR mismatch details (count=%d)\n", cigar_mismatch_count);
+                                            i, task->task_type, task->score, task->max_q, task->max_t, task->zdropped);
                                 }
                                 goto skip_update_extra;
                             }

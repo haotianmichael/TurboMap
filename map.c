@@ -1603,30 +1603,33 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                         } else {
                         // DEBUG: validate CIGAR vs sequence lengths before mm_update_extra
                         {
+                            static int cigar_mismatch_count = 0;
                             int cigar_qlen = 0, cigar_tlen = 0;
+                            int has_zero_len = 0;
                             for (int ci = 0; ci < (int)r->p->n_cigar; ci++) {
                                 uint32_t op = r->p->cigar[ci] & 0xf;
                                 int len = r->p->cigar[ci] >> 4;
-                                if (op == 0) { cigar_qlen += len; cigar_tlen += len; } // M
-                                else if (op == 1) { cigar_qlen += len; }               // I
-                                else if (op == 2) { cigar_tlen += len; }               // D
-                                else if (op == 3) { cigar_tlen += len; }               // N
+                                if (len == 0) has_zero_len = 1;
+                                if (op == 0) { cigar_qlen += len; cigar_tlen += len; }
+                                else if (op == 1) { cigar_qlen += len; }
+                                else if (op == 2) { cigar_tlen += len; }
+                                else if (op == 3) { cigar_tlen += len; }
                             }
                             int exp_qlen = qe1 - qs1;
                             int exp_tlen = re1 - rs1;
                             if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
-                                fprintf(stderr, "[DEBUG] CIGAR mismatch: cigar_q=%d cigar_t=%d exp_q=%d exp_t=%d "
-                                        "qs1=%d qe1=%d rs1=%d re1=%d n_cigar=%d read=%d reg=%d task[%d] type=%d score=%d max_q=%d max_t=%d\n",
-                                        cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
-                                        qs1, qe1, rs1, re1, r->p->n_cigar,
-                                        current_read, current_reg, i, task->task_type,
-                                        task->score, task->max_q, task->max_t);
-                                // Print first 10 CIGAR ops
-                                for (int ci = 0; ci < (int)r->p->n_cigar && ci < 10; ci++) {
-                                    fprintf(stderr, "  cigar[%d]: %d%c\n", ci,
-                                            r->p->cigar[ci] >> 4, "MIDNSHP=X"[r->p->cigar[ci] & 0xf]);
+                                cigar_mismatch_count++;
+                                if (cigar_mismatch_count <= 3) {
+                                    fprintf(stderr, "[DEBUG] CIGAR mismatch #%d: cq=%d ct=%d eq=%d et=%d "
+                                            "n_cigar=%d task[%d] type=%d score=%d zlen=%d\n",
+                                            cigar_mismatch_count, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
+                                            r->p->n_cigar, i, task->task_type, task->score, has_zero_len);
+                                    for (int ci = 0; ci < (int)r->p->n_cigar && ci < 6; ci++)
+                                        fprintf(stderr, "  [%d]=%d%c", ci, r->p->cigar[ci]>>4, "MIDNSHP=X"[r->p->cigar[ci]&0xf]);
+                                    fprintf(stderr, "\n");
+                                } else if (cigar_mismatch_count == 4) {
+                                    fprintf(stderr, "[DEBUG] suppressing further CIGAR mismatch details (count=%d)\n", cigar_mismatch_count);
                                 }
-                                // Skip mm_update_extra to avoid crash
                                 goto skip_update_extra;
                             }
                         }
@@ -1652,6 +1655,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 if (r->p && r->p->n_cigar > 0 && re1 > rs1 && qs1 >= 0 && qs1 < qlen) {
                     // DEBUG: validate CIGAR for dropped region
                     {
+                        static int drop_mismatch_count = 0;
                         int cigar_qlen = 0, cigar_tlen = 0;
                         for (int ci = 0; ci < (int)r->p->n_cigar; ci++) {
                             uint32_t op = r->p->cigar[ci] & 0xf;
@@ -1663,11 +1667,9 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                         int exp_qlen = qe1 - qs1;
                         int exp_tlen = re1 - rs1;
                         if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
-                            fprintf(stderr, "[DEBUG] DROPPED CIGAR mismatch: cigar_q=%d cigar_t=%d exp_q=%d exp_t=%d "
-                                    "qs1=%d qe1=%d rs1=%d re1=%d n_cigar=%d read=%d reg=%d task[%d] type=%d\n",
-                                    cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
-                                    qs1, qe1, rs1, re1, r->p->n_cigar,
-                                    current_read, current_reg, i, task->task_type);
+                            if (++drop_mismatch_count <= 3)
+                                fprintf(stderr, "[DEBUG] DROPPED mismatch #%d: cq=%d ct=%d eq=%d et=%d task[%d]\n",
+                                        drop_mismatch_count, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen, i);
                             goto skip_dropped_update;
                         }
                     }

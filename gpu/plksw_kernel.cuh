@@ -211,9 +211,10 @@ __global__ void ksw_fused_persistent_kernel(
         int last_H0_t = 0;
         int32_t H0 = 0;
 
+        // n_col: max band width for direction byte storage per anti-diagonal.
+        // No SIMD padding needed (unlike SSE kernel) — must match plalign.cu allocation.
         int n_col = (qlen < tlen) ? qlen : tlen;
         n_col = (n_col < w + 1) ? n_col : (w + 1);
-        n_col = ((n_col + 15) / 16 + 1) * 16;
 
         int with_cigar = !(flag & KSW_EZ_SCORE_ONLY);
         int approx_max = !!(flag & KSW_EZ_APPROX_MAX);

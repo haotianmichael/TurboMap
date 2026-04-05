@@ -1299,6 +1299,14 @@ static int task_compare(const void *a, const void *b) {
     return ta->task_sub_idx - tb->task_sub_idx;
 }
 
+static int g_nm_count = 0, g_nm_total = 0;
+static int g_drop_nm_count = 0;
+static int g_nm_atexit_registered = 0;
+static void g_nm_atexit_handler(void) {
+    fprintf(stderr, "[DEBUG] === FINAL: %d normal mismatches / %d checked, %d dropped mismatches ===\n",
+            g_nm_count, g_nm_total, g_drop_nm_count);
+}
+
 static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                        const mm_mapopt_t *opt,
                                        const mm_idx_t *mi, void *km)
@@ -1604,9 +1612,9 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                         } else {
                         // DEBUG: validate CIGAR vs sequence lengths before mm_update_extra
                         {
-                            static int nm_count = 0, nm_total = 0;
+                            if (!g_nm_atexit_registered) { g_nm_atexit_registered = 1; atexit(g_nm_atexit_handler); }
                             int cigar_qlen = 0, cigar_tlen = 0;
-                            nm_total++;
+                            g_nm_total++;
                             for (int ci = 0; ci < (int)r->p->n_cigar; ci++) {
                                 uint32_t op = r->p->cigar[ci] & 0xf;
                                 int len = r->p->cigar[ci] >> 4;
@@ -1618,14 +1626,11 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             int exp_qlen = qe1 - qs1;
                             int exp_tlen = re1 - rs1;
                             if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
-                                nm_count++;
-                                if (nm_count <= 3)
-                                    fprintf(stderr, "[DEBUG] CIGAR mismatch #%d/%d: cq=%d ct=%d eq=%d et=%d "
-                                            "task[%d] type=%d score=%d maxq=%d maxt=%d zdrop=%d\n",
-                                            nm_count, nm_total, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
-                                            i, task->task_type, task->score, task->max_q, task->max_t, task->zdropped);
-                                else if (nm_count % 1000 == 0)
-                                    fprintf(stderr, "[DEBUG] CIGAR mismatch count: %d / %d checked\n", nm_count, nm_total);
+                                g_nm_count++;
+                                fprintf(stderr, "[DEBUG] CIGAR mismatch #%d/%d: cq=%d ct=%d eq=%d et=%d "
+                                        "task[%d] type=%d score=%d maxq=%d maxt=%d zdrop=%d\n",
+                                        g_nm_count, g_nm_total, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
+                                        i, task->task_type, task->score, task->max_q, task->max_t, task->zdropped);
                                 goto skip_update_extra;
                             }
                         }
@@ -1651,7 +1656,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 if (r->p && r->p->n_cigar > 0 && re1 > rs1 && qs1 >= 0 && qs1 < qlen) {
                     // DEBUG: validate CIGAR for dropped region
                     {
-                        static int drop_mismatch_count = 0;
+                        // use global g_drop_nm_count
                         int cigar_qlen = 0, cigar_tlen = 0;
                         for (int ci = 0; ci < (int)r->p->n_cigar; ci++) {
                             uint32_t op = r->p->cigar[ci] & 0xf;
@@ -1663,9 +1668,9 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                         int exp_qlen = qe1 - qs1;
                         int exp_tlen = re1 - rs1;
                         if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
-                            if (++drop_mismatch_count <= 3)
-                                fprintf(stderr, "[DEBUG] DROPPED mismatch #%d: cq=%d ct=%d eq=%d et=%d task[%d]\n",
-                                        drop_mismatch_count, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen, i);
+                            ++g_drop_nm_count;
+                            fprintf(stderr, "[DEBUG] DROPPED mismatch #%d: cq=%d ct=%d eq=%d et=%d task[%d]\n",
+                                    g_drop_nm_count, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen, i);
                             goto skip_dropped_update;
                         }
                     }

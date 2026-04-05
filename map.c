@@ -1325,6 +1325,11 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
     int dropped = 0;
     int8_t mat[25];
     int initialized = 0;
+
+    // Per-subtask tracking for mismatch diagnostics
+    #define MAX_SUBTASK_TRACE 32
+    struct { int type, sub_idx, cq, ct, n_cigar; int32_t max_q, max_t; int reach_end, zdrop; } subtask_trace[MAX_SUBTASK_TRACE];
+    int n_subtasks = 0;
     
     ksw_gen_simple_mat(5, mat, opt->a, opt->b, opt->sc_ambi);
     
@@ -1356,7 +1361,8 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             
             dropped = 0;
             initialized = 0;
-            
+            n_subtasks = 0;
+
             // 确保r->p已分配
             if (!r->p) {
                 uint32_t capacity = sizeof(mm_extra_t)/4 + 100;
@@ -1455,8 +1461,9 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                // 只有在有有效对齐结果时才更新坐标
                 if (has_valid_alignment) {
                     if (task->reach_end) {
-                        // 扩展到了对齐区域的起点
-                        rs1 = task->task_ctx.rs0;
+                        // reach_end: query fully consumed, use mqe_t for target
+                        // CPU: rs1 = rs - (mqe_t + 1), qs1 = qs - (qs - qs0) = qs0
+                        rs1 = task->task_ctx.ref_rs - (task->mqe_t + 1);
                         qs1 = task->task_ctx.qs0;
                     } else {
                         // 部分扩展
@@ -1556,8 +1563,9 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
 				 // 只有在有有效对齐结果时才更新坐标
                 if (has_valid_alignment) {
                     if (task->reach_end) {
-                        // 扩展到了对齐区域的终点
-                        re1 = task->task_ctx.re0;
+                        // reach_end: query fully consumed, use mqe_t for target
+                        // CPU: re1 = re + (mqe_t + 1), qe1 = qe + (qe0 - qe) = qe0
+                        re1 = task->task_ctx.ref_rs + (task->mqe_t + 1);
                         qe1 = task->task_ctx.qe0;
                     } else {
                         // 部分扩展：从ref_rs/ref_qs（起始位置）对齐了max_t/max_q个字符
@@ -1569,6 +1577,31 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 break;
         }
         
+        // Record subtask info for mismatch diagnostics
+        if (n_subtasks < MAX_SUBTASK_TRACE) {
+            int sq = 0, st = 0;
+            if (has_valid_alignment && task->n_cigar > 0) {
+                uint32_t *cigar = gpu_batch->cigar_buffer + task->cigar_offset;
+                for (int ci = 0; ci < task->n_cigar; ci++) {
+                    uint32_t op = cigar[ci] & 0xf;
+                    int len = cigar[ci] >> 4;
+                    if (op == 0) { sq += len; st += len; }
+                    else if (op == 1) { sq += len; }
+                    else if (op == 2 || op == 3) { st += len; }
+                }
+            }
+            subtask_trace[n_subtasks].type = task->task_type;
+            subtask_trace[n_subtasks].sub_idx = task->task_sub_idx;
+            subtask_trace[n_subtasks].cq = sq;
+            subtask_trace[n_subtasks].ct = st;
+            subtask_trace[n_subtasks].n_cigar = task->n_cigar;
+            subtask_trace[n_subtasks].max_q = task->max_q;
+            subtask_trace[n_subtasks].max_t = task->max_t;
+            subtask_trace[n_subtasks].reach_end = task->reach_end;
+            subtask_trace[n_subtasks].zdrop = task->zdropped;
+            n_subtasks++;
+        }
+
         // 检查是否是当前region的最后一个任务
         int is_last_task = (i == gpu_batch->n_tasks - 1) ||
                           (gpu_batch->tasks[i+1].read_idx != current_read) ||
@@ -1628,9 +1661,22 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
                                 g_nm_count++;
                                 fprintf(stderr, "[DEBUG] CIGAR mismatch #%d/%d: cq=%d ct=%d eq=%d et=%d "
-                                        "task[%d] type=%d score=%d maxq=%d maxt=%d zdrop=%d\n",
+                                        "task[%d] type=%d score=%d maxq=%d maxt=%d zdrop=%d reach=%d "
+                                        "rs1=%d re1=%d qs1=%d qe1=%d\n",
                                         g_nm_count, g_nm_total, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
-                                        i, task->task_type, task->score, task->max_q, task->max_t, task->zdropped);
+                                        i, task->task_type, task->score, task->max_q, task->max_t, task->zdropped,
+                                        task->reach_end, rs1, re1, qs1, qe1);
+                                if (g_nm_count <= 5) {
+                                    fprintf(stderr, "  subtasks(%d):", n_subtasks);
+                                    for (int si = 0; si < n_subtasks; si++)
+                                        fprintf(stderr, " [t%d.%d cq=%d ct=%d nc=%d mq=%d mt=%d re=%d zd=%d]",
+                                                subtask_trace[si].type, subtask_trace[si].sub_idx,
+                                                subtask_trace[si].cq, subtask_trace[si].ct,
+                                                subtask_trace[si].n_cigar,
+                                                subtask_trace[si].max_q, subtask_trace[si].max_t,
+                                                subtask_trace[si].reach_end, subtask_trace[si].zdrop);
+                                    fprintf(stderr, "\n");
+                                }
                                 goto skip_update_extra;
                             }
                         }

@@ -1623,26 +1623,16 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             }
 
             if (!dropped) {
-                // Update alignment statistics
-                // P2/P3 optimisation: GPU already ran fix_cigar+stats for most tasks.
-                // Use GPU results unless leading I/D remains (pass 3b needed) or EQX mode.
+                // Always run mm_update_extra on the full accumulated CIGAR.
+                // GPU gpu_fix_cigar only ran per-subtask; the accumulated CIGAR
+                // needs cross-boundary indel left-alignment, leading I/D removal
+                // (which adjusts r->rs/r->qs), and correct blen/mlen/dp_max
+                // computed over the FULL alignment, not just the last subtask.
                 if (r->p && r->p->n_cigar > 0) {
-                    int use_gpu_stats = task->gpu_stats_valid &&
-                                        !(opt->flag & MM_F_EQX);
-                    if (use_gpu_stats) {
-                        // GPU fix_cigar (passes 1/2/3a) already applied to CIGAR in-place.
-                        // Precision note: dp_max may differ +/-1 vs CPU (integer vs float log2).
-                        r->blen       = task->blen;
-                        r->mlen       = task->mlen;
-                        r->p->n_ambi  = task->n_ambi;
-                        r->p->dp_max  = task->dp_max;
-                        if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
+                    if (qs1 < 0 || qs1 >= qlen || rs1 < 0 || re1 <= rs1) {
+                        fprintf(stderr, "[BUG] mm_update_extra bounds: qs1=%d qe1=%d qlen=%d rs1=%d re1=%d read=%d reg=%d task[%d] type=%d\n",
+                                qs1, qe1, qlen, rs1, re1, current_read, current_reg, i, task->task_type);
                     } else {
-                        // CPU fallback: leading-I/D coordinate fix (pass 3b) or EQX mode.
-                        if (qs1 < 0 || qs1 >= qlen || rs1 < 0 || re1 <= rs1) {
-                            fprintf(stderr, "[BUG] mm_update_extra bounds: qs1=%d qe1=%d qlen=%d rs1=%d re1=%d read=%d reg=%d task[%d] type=%d\n",
-                                    qs1, qe1, qlen, rs1, re1, current_read, current_reg, i, task->task_type);
-                        } else {
                         // DEBUG: validate CIGAR vs sequence lengths before mm_update_extra
                         {
                             if (!g_nm_atexit_registered) { g_nm_atexit_registered = 1; atexit(g_nm_atexit_handler); }
@@ -1693,7 +1683,6 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                         if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
                         kfree(km, tseq);
                         skip_update_extra:;
-                        }  // end bounds-check else
                     }
                 }
             } else {

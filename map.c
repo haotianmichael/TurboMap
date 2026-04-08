@@ -1791,7 +1791,11 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
     chain_post(opt, max_chain_gap_ref, mi, km, qlen_sum, n_segs, qlens, n_regs0, regs0, a);
     if (!is_sr && !(opt->flag&MM_F_QSTRAND)) {
-        mm_est_err(mi, qlen_sum, *n_regs0, regs0, a, n_mini_pos, *mini_pos);
+        // Skip mm_est_err when voting-based chain is used: voting rechain
+        // generates new anchors whose query positions are not in mini_pos,
+        // causing get_mini_idx() binary search to fail (returns -1).
+        if (!(opt->flag & MM_F_GPU_CHAIN))
+            mm_est_err(mi, qlen_sum, *n_regs0, regs0, a, n_mini_pos, *mini_pos);
         *n_regs0 = mm_filter_strand_retained(*n_regs0, regs0);
     }
 

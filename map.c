@@ -2268,7 +2268,7 @@ static void* drain_worker_fn(void *arg) {
 static void* gpu_batch_consumer(void *data) {
     step_t *s = (step_t*)data;
 
-    #define NUM_GPU_STREAMS 2
+    const int NUM_GPU_STREAMS = gpu_get_num_streams();
 
     #define INIT_BATCH(b_, id_) do { \
         (b_).km = km_init(); \
@@ -2464,7 +2464,6 @@ static void* gpu_batch_consumer(void *data) {
         mm_tbuf_destroy(worker_ctxs[i].wb);
     }
 
-    #undef NUM_GPU_STREAMS
     return NULL;
 }
 static void* kt_worker_manager(void *shared, void *in) {

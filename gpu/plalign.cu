@@ -766,21 +766,16 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     d_cigar_lengths, (int)current_max_cigar_len
                 );
 
-                // Step C: SKIP gpu_fix_cigar_and_stats — send raw CIGARs to host.
-                // CPU mm_update_extra (which calls mm_fix_cigar) will process the
-                // full accumulated CIGAR after all subtasks are concatenated.
-                // Running gpu_fix_cigar per-subtask BEFORE concatenation produces
-                // wrong results because left-alignment is not commutative with
-                // concatenation ("fix then concat ≠ concat then fix").
-                //
-                // gpu_fix_cigar_and_stats<<<batch_size, 1, 0, align_stream>>>(
-                //     d_compact_cigar, d_compact_offsets, d_cigar_lengths,
-                //     d_unpacked_query, d_unpacked_target,
-                //     d_query_offsets, d_target_offsets,
-                //     d_mat, opt->q, opt->e, !(opt->flag & MM_F_SR),
-                //     d_blen, d_mlen, d_n_ambi, d_dp_max, d_gpu_stats_valid,
-                //     batch_size
-                // );
+                // Step C: fix CIGAR in-place + compute alignment stats (one thread per task block)
+                // Sequences still valid in d_unpacked_query/target (same stream, not yet overwritten)
+                gpu_fix_cigar_and_stats<<<batch_size, 1, 0, align_stream>>>(
+                    d_compact_cigar, d_compact_offsets, d_cigar_lengths,
+                    d_unpacked_query, d_unpacked_target,
+                    d_query_offsets, d_target_offsets,
+                    d_mat, opt->q, opt->e, !(opt->flag & MM_F_SR),
+                    d_blen, d_mlen, d_n_ambi, d_dp_max, d_gpu_stats_valid,
+                    batch_size
+                );
             }
 
             // D2H Sync 1: small arrays — CIGAR lengths, scores, endpoints, GPU stats
@@ -788,9 +783,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             if (cigar_buffer) {
                 cudaMemcpyAsync(h_cigar_lengths, d_cigar_lengths,
                                 batch_size * sizeof(int), cudaMemcpyDeviceToHost, align_stream);
-                // Skip D2H of blen/mlen/n_ambi/dp_max/gpu_stats_valid:
-                // gpu_fix_cigar_and_stats kernel is disabled, so these GPU buffers
-                // are uninitialized. Host always runs mm_update_extra to compute them.
+                cudaMemcpyAsync(h_blen,   d_blen,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_mlen,   d_mlen,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_n_ambi, d_n_ambi, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_dp_max, d_dp_max, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_gpu_stats_valid, d_gpu_stats_valid,
+                                batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             }
             // Copy score/endpoint results back (async, ordered after kernel via align_stream)
             cudaMemcpyAsync(h_scores,      d_scores,      batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
@@ -835,8 +833,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
 
             // Sync 2: D2H compact CIGAR (only actual data, no stride padding)
-            // gpu_fix_cigar_and_stats is disabled, so cigar_lengths and compact_offsets
-            // are consistent (both reflect the original, unfixed CIGAR sizes).
+            // IMPORTANT: d_compact_offsets were computed BEFORE gpu_fix_cigar, which may
+            // shrink CIGARs in-place. The data in d_compact_cigar is still at the ORIGINAL
+            // offsets. We must copy d_compact_offsets from GPU rather than recomputing from
+            // the updated h_cigar_lengths, which would produce wrong (shifted) offsets.
             int total_cigar_ops = 0;
             if (cigar_buffer) {
                 // Validate cigar lengths

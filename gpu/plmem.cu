@@ -891,8 +891,8 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     size_t gpu_free_mem, gpu_total_mem;
     cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
 
-    // Per-stream VRAM budget: leave only 256MB global headroom
-    size_t global_reserve = (size_t)256 * 1024 * 1024;
+    // Per-stream VRAM budget: leave 1280MB global headroom (extra for cuda-gdb)
+    size_t global_reserve = (size_t)1280 * 1024 * 1024;
     size_t usable = (gpu_free_mem > global_reserve) ? (gpu_free_mem - global_reserve) : gpu_free_mem;
     size_t avail_mem_per_stream = usable / (*num_stream_);
 

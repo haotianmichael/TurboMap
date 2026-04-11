@@ -1424,7 +1424,7 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
 	            task_ctx.ref_rs = rs;
 	            task_ctx.ref_re = re;
                 mm_align_pair_batched(gpu_batch, opt, qe - qs, qseq, re - rs, tseq, junc, mat,
-                                     bw1, -1, opt->zdrop, extra_flag|KSW_EZ_APPROX_MAX,
+                                     bw1, -1, opt->zdrop, extra_flag,
                                      read_idx, reg_idx, GPU_TASK_GAP_FILL, i, task_ctx);
             }
             rs = re, qs = qe;

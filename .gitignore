@@ -8,8 +8,6 @@ minimap2
 mappy.c
 data
 .vscode/**
-test.sam
-*.sam
 Log/**
 debug/**
 verf

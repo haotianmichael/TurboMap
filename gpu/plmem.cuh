@@ -200,6 +200,7 @@ typedef struct {
     uint32_t *d_align_query_lens;
     uint32_t *d_align_target_lens;
     int32_t *d_align_flag;
+    int32_t *d_align_bw;
 
     // Working buffers
     void *d_align_global_buffer;     // AGATHA working buffer
@@ -308,6 +309,7 @@ typedef struct {
     uint32_t *h_align_query_lens;
     uint32_t *h_align_target_lens;
     int32_t  *h_align_flag;
+    int32_t  *h_align_bw;
     int32_t  *h_align_task_to_align_id;
 
 } deviceMemPtr;

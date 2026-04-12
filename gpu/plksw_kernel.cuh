@@ -94,6 +94,7 @@ __global__ void ksw_fused_persistent_kernel(
     int max_antidiag,
     void *d_temp_buffer,
     int *d_flag,
+    int32_t *d_bw,
     size_t temp_per_task,
     int n_tasks,
     int8_t m,
@@ -147,7 +148,7 @@ __global__ void ksw_fused_persistent_kernel(
         int8_t e  = _cudaGapExtend;
         int8_t q2 = _cudaGapOL;
         int8_t e2 = _cudaGapExtendL;
-        int32_t w = _cudaBandWidth;
+        int32_t w = d_bw[task_id];
 
         // Ensure q+e <= q2+e2 (short gap <= long gap penalty)
         if (q2 + e2 < q + e) {

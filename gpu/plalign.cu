@@ -429,6 +429,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     uint32_t *d_query_lens = dev_mem->d_align_query_lens;
     uint32_t *d_target_lens = dev_mem->d_align_target_lens;
     int32_t *d_flag = dev_mem->d_align_flag;
+    int32_t *d_bw   = dev_mem->d_align_bw;
     void *d_ksw_temp_buffer = dev_mem->d_align_ksw_temp_buffer;
     size_t ksw_temp_per_task = dev_mem->align_ksw_temp_per_task;
     uint8_t *d_backtrack_p = dev_mem->d_align_backtrack_p;
@@ -502,6 +503,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     uint32_t *h_query_lens      = dev_mem->h_align_query_lens;
     uint32_t *h_target_lens     = dev_mem->h_align_target_lens;
     int32_t  *h_flag            = dev_mem->h_align_flag;
+    int32_t  *h_bw              = dev_mem->h_align_bw;
     int32_t  *h_task_to_align_id = dev_mem->h_align_task_to_align_id;
 
     int8_t h_scoring_matrix[25];
@@ -533,8 +535,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         const char *phase_name = (phase == 0) ? "Short Tasks" : "Long Tasks";
 
         // Dynamic backtrack buffer sizing based on phase
+        // Short phase stride caps n_col at (short_task_max_len + 1) to match plmem alloc, allowing
+        // any per-task bandwidth (n_col = min(qlen, tlen, w+1) is bounded by short_task_max_len).
         size_t current_max_antidiag = (phase == 0) ? (2 * short_task_max_len) : (2 * dev_mem->max_align_query_len);
-        size_t current_max_backtrack_size = current_max_antidiag * 752;  // 752 = bandwidth + 1
+        size_t current_max_n_col    = (phase == 0) ? (short_task_max_len + 1) : 752;
+        size_t current_max_backtrack_size = current_max_antidiag * current_max_n_col;
         size_t current_max_cigar_len = (phase == 0) ? (2 * short_task_max_len) : (2 * dev_mem->max_align_query_len);
 
         if (n_tasks_in_phase == 0) continue;  // Skip empty phase
@@ -620,6 +625,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 h_query_lens[i] = tasks[task_idx].qlen;
                 h_target_lens[i] = tasks[task_idx].tlen;
                 h_flag[i] = tasks[task_idx].flag;
+                h_bw[i]   = tasks[task_idx].w;
 
                 total_query_bytes += qlen_aligned;
                 total_target_bytes += tlen_aligned;
@@ -672,6 +678,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemcpyAsync(d_target_lens, h_target_lens,
                             batch_size * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
             cudaMemcpyAsync(d_flag, h_flag,
+                            batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
+            cudaMemcpyAsync(d_bw, h_bw,
                             batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
 
 
@@ -735,6 +743,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     (int)current_max_antidiag,
                     d_ksw_temp_buffer,
                     d_flag,
+                    d_bw,
                     ksw_temp_per_task,
                     batch_size,
                     5,              // m = alphabet size (ACGTN)

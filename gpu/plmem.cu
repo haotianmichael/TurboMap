@@ -241,6 +241,7 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_query_lens      = (uint32_t*)arena_alloc(a, metadata_size);
     dev_mem->d_align_target_lens     = (uint32_t*)arena_alloc(a, metadata_size);
     dev_mem->d_align_flag            = (int32_t*)arena_alloc(a, metadata_size);
+    dev_mem->d_align_bw              = (int32_t*)arena_alloc(a, metadata_size);
 
     // ---- Global DP buffer ----
     size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_query_len * 4;
@@ -261,7 +262,7 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     // ---- Backtrack buffers ----
     size_t alloc_slots = (size_t)dev_mem->n_align_concurrent_blocks;
     size_t max_antidiag_short = 2 * dev_mem->short_task_max_len;
-    size_t max_n_col = 751 + 1;  // bandwidth + 1
+    size_t max_n_col = dev_mem->short_task_max_len + 1;  // bandwidth + 1 (capped by short task length)
     dev_mem->max_align_backtrack_size = max_antidiag_short * max_n_col;
     dev_mem->max_align_cigar_len = 2 * dev_mem->short_task_max_len;
 
@@ -479,6 +480,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         cudaMallocHost(&dev_mem->h_align_query_lens,       mbs * sizeof(uint32_t));
         cudaMallocHost(&dev_mem->h_align_target_lens,      mbs * sizeof(uint32_t));
         cudaMallocHost(&dev_mem->h_align_flag,             mbs * sizeof(int32_t));
+        cudaMallocHost(&dev_mem->h_align_bw,                mbs * sizeof(int32_t));
         cudaMallocHost(&dev_mem->h_align_task_to_align_id, mbs * sizeof(int32_t));
 
         fprintf(stderr, " [Arena] Pinned host buffers: %.2f MB (max_batch=%zu)\n",
@@ -517,6 +519,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFreeHost(dev_mem->h_align_query_lens);
     cudaFreeHost(dev_mem->h_align_target_lens);
     cudaFreeHost(dev_mem->h_align_flag);
+    cudaFreeHost(dev_mem->h_align_bw);
     cudaFreeHost(dev_mem->h_align_task_to_align_id);
     cudaCheck();
 }

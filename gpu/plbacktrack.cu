@@ -325,38 +325,6 @@ __global__ void expand_p_to_int64(uint16_t* p_rel, int64_t* p_expanded, int* off
     }
 }
 
-// Gather kernel: extract ay values needed for needs_rmq_rechain check.
-// For each read, extracts ay_out[offset] (first anchor) and
-// ay_out[offset + chain0_len - 1] (last anchor of first chain).
-__global__ void gather_rechain_ay_kernel(
-    const int32_t  *d_ay_out,
-    const int      *d_offset,
-    const int      *d_n_u,
-    const uint64_t *d_u,
-    int32_t        *d_ay_first,
-    int32_t        *d_ay_last,
-    int             n_reads)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n_reads) return;
-
-    int n_u = d_n_u[i];
-    if (n_u <= 0) {
-        d_ay_first[i] = 0;
-        d_ay_last[i]  = 0;
-        return;
-    }
-
-    int ofs = d_offset[i];
-    d_ay_first[i] = d_ay_out[ofs];
-
-    int chain0_len = (int32_t)d_u[ofs];  // low 32 bits of u[0]
-    if (chain0_len > 0)
-        d_ay_last[i] = d_ay_out[ofs + chain0_len - 1];
-    else
-        d_ay_last[i] = d_ay_out[ofs];
-}
-
 // Host function to orchestrate backtracking.
 // Uses pre-allocated device buffers from dev_mem->d_bt_* — no cudaMalloc in hot path.
 void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
@@ -555,42 +523,6 @@ void plbacktrack_d2h_finish(deviceMemPtr *dev_mem)
     free(dev_mem->bt_h_n_u);
     dev_mem->bt_h_offset = NULL;
     dev_mem->bt_h_n_u    = NULL;
-}
-
-/**
- * plbacktrack_gather_rechain_ay: Gather ay values for needs_rmq_rechain check.
- * Uses a GPU kernel to extract the first and last-of-chain-0 ay values,
- * then D2H into caller-owned host arrays.
- */
-void plbacktrack_gather_rechain_ay(deviceMemPtr *dev_mem, int n_reads,
-                                    cudaStream_t stream,
-                                    int32_t **h_ay_first_out, int32_t **h_ay_last_out)
-{
-    // Use d_vt_ref_min and d_vt_bin_size as temporary device storage
-    // (they have d_bt_max_n_reads capacity and aren't used until voting starts)
-    int32_t *d_ay_first = dev_mem->d_vt_ref_min;
-    int32_t *d_ay_last  = dev_mem->d_vt_bin_size;
-
-    int blk = 256;
-    int grd = (n_reads + blk - 1) / blk;
-    gather_rechain_ay_kernel<<<grd, blk, 0, stream>>>(
-        dev_mem->d_bt_ay_out,
-        dev_mem->d_bt_offset,  // d_offset is still on device from plbacktrack_gpu
-        dev_mem->d_bt_n_u,
-        dev_mem->d_bt_u,
-        d_ay_first, d_ay_last,
-        n_reads);
-
-    int32_t *h_ay_first = (int32_t *)malloc(sizeof(int32_t) * n_reads);
-    int32_t *h_ay_last  = (int32_t *)malloc(sizeof(int32_t) * n_reads);
-    cudaMemcpyAsync(h_ay_first, d_ay_first, sizeof(int32_t) * n_reads,
-                    cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(h_ay_last,  d_ay_last,  sizeof(int32_t) * n_reads,
-                    cudaMemcpyDeviceToHost, stream);
-    cudaStreamSynchronize(stream);
-
-    *h_ay_first_out = h_ay_first;
-    *h_ay_last_out  = h_ay_last;
 }
 
 void plbacktrack_init_memory(deviceMemPtr *dev_mem, size_t max_anchors)

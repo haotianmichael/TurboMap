@@ -214,11 +214,6 @@ void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 int  gpu_get_num_streams(void);
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                              uint8_t *seq_buffer, uint32_t *cigar_buffer, int stream_id);
-/* GPU voting-based re-chaining (replaces gpu_rechain_batch / mg_lchain_rmq).
- * Declared here so map.c and plchain.cu can share the same header.
- * Implemented in gpu/plvoting.cu. */
-// plvoting_rechain_batch declared in plvoting.cuh (needs cudaStream_t)
-
 /* <lchain.c> Chaining backtracking methods */
 uint64_t *mg_chain_backtrack(void *km, int64_t n, const int32_t *f,
                              const int64_t *p, int32_t *v, int32_t *t,
@@ -231,8 +226,6 @@ mm128_t *compact_a(void *km, int32_t n_u, uint64_t *u, int32_t n_v, int32_t *v, 
 Misc build_misc(const mm_idx_t *mi, const mm_mapopt_t *opt, const int64_t qlen_sum, const int n_seg);
 void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt,
                           chain_read_t *read, Misc misc, void *km);
-int needs_rmq_rechain(const mm_mapopt_t *opt, chain_read_t* read);
-void prepare_rechain_anchors(chain_read_t* read, void *km);
 
 #ifdef __cplusplus
 }

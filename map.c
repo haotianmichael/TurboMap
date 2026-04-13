@@ -430,52 +430,6 @@ Misc build_misc(const mm_idx_t *mi, const mm_mapopt_t *opt, const int64_t qlen_s
     return misc;
 }
 
-// Check if a read needs RMQ-style re-chaining (for GPU batch processing)
-int needs_rmq_rechain(const mm_mapopt_t *opt, chain_read_t* read) {
-    int n_segs = read->n_seg;
-    int n_regs0 = read->n_u;
-    int qlen_sum = read->seq.qlen_sum;
-    uint64_t *u = read->u;
-    mm128_t *a = read->a;
-
-    if (opt->bw_long > opt->bw &&
-        (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
-        n_segs == 1 && n_regs0 > 1 && u != NULL && a != NULL) {
-        if ((int32_t)u[0] <= 0) {
-            return 0;  // Invalid chain, skip
-        }
-        int32_t st = (int32_t)a[0].y;
-        int32_t en = (int32_t)a[(int32_t)u[0] - 1].y;
-        if (qlen_sum - (en - st) > opt->rmq_rescue_size ||
-            en - st > qlen_sum * opt->rmq_rescue_ratio) {
-            return 1;  // Needs re-chaining
-        }
-    }
-    return 0;
-}
-
-// Prepare a read's anchors for re-chaining (consolidate and sort)
-void prepare_rechain_anchors(chain_read_t* read, void *km) {
-    int n_regs0 = read->n_u;
-    uint64_t *u = read->u;
-    mm128_t *a = read->a;
-
-    // Calculate total anchor count from all chains
-    int64_t total_n = 0;
-    for (int i = 0; i < n_regs0; i++) {
-        total_n += (int32_t)u[i];
-    }
-    read->n = total_n;
-
-    // Free old chain array
-    kfree(km, u);
-    read->u = NULL;
-    read->n_u = 0;
-
-    // Sort anchors for re-chaining
-    radix_sort_128x(a, a + total_n);
-}
-
 void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t* read, Misc misc, void *km) {
     int n_segs = read->n_seg;
     const char *qname = read->seq.name;
@@ -492,13 +446,34 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
     int i;
     mm128_v mv = {0, 0, 0};
 
-    // RMQ re-chaining is handled by GPU batch processing (gpu_batch_rechain)
-    // Skip this branch - reads needing re-chain are identified by needs_rmq_rechain()
+    // Long-read rescue: if the best chain leaves a large query portion
+    // uncovered, redo the chain with bw_long using a second mg_lchain_dp
+    // call (mirrors CPU mm_map_chain's post-rmq rescue, but swaps
+    // mg_lchain_rmq for a wider-bandwidth mg_lchain_dp — the pre-RMQ
+    // minimap2 behavior). This replaces the old voting-based GPU
+    // rechain path and keeps all chaining inside the DP algorithm CPU
+    // uses for the first pass.
     if (opt->bw_long > opt->bw &&
         (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
-        n_segs == 1 && *n_regs0 >= 1 && *u != NULL && *a != NULL) {
-        // GPU batch re-chaining handles this case (covers 1 or more chains)
-        // Do nothing here - just fall through to set frag_gap
+        n_segs == 1 && *n_regs0 > 1 && *u != NULL && *a != NULL) {
+        int32_t st = (int32_t)(*a)[0].y;
+        int32_t en = (int32_t)(*a)[(int32_t)(*u)[0] - 1].y;
+        if (*qlen_sum - (en - st) > opt->rmq_rescue_size ||
+            en - st > *qlen_sum * opt->rmq_rescue_ratio) {
+            int32_t ii;
+            for (ii = 0, *n_a = 0; ii < *n_regs0; ++ii)
+                *n_a += (int32_t)(*u)[ii];
+            kfree(km, *u);
+            *u = NULL;
+            radix_sort_128x(*a, (*a) + *n_a);
+            *a = mg_lchain_dp(misc.max_dist_x, misc.max_dist_y,
+                              opt->bw_long, opt->max_chain_skip,
+                              opt->max_chain_iter, opt->min_cnt,
+                              opt->min_chain_score,
+                              misc.chn_pen_gap, misc.chn_pen_skip,
+                              misc.is_cdna, n_segs, *n_a, *a,
+                              n_regs0, u, km);
+        }
     }
     else if (opt->max_occ > opt->mid_occ && *rep_len > 0 &&
              !(opt->flag & MM_F_RMQ)) {  // re-chain, mostly for short reads
@@ -1791,11 +1766,7 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
     chain_post(opt, max_chain_gap_ref, mi, km, qlen_sum, n_segs, qlens, n_regs0, regs0, a);
     if (!is_sr && !(opt->flag&MM_F_QSTRAND)) {
-        // Skip mm_est_err when voting-based chain is used: voting rechain
-        // generates new anchors whose query positions are not in mini_pos,
-        // causing get_mini_idx() binary search to fail (returns -1).
-        if (!(opt->flag & MM_F_GPU_CHAIN))
-            mm_est_err(mi, qlen_sum, *n_regs0, regs0, a, n_mini_pos, *mini_pos);
+        mm_est_err(mi, qlen_sum, *n_regs0, regs0, a, n_mini_pos, *mini_pos);
         *n_regs0 = mm_filter_strand_retained(*n_regs0, regs0);
     }
 

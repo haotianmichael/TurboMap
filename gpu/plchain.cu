@@ -10,7 +10,6 @@
 #include "plrange.cuh"
 #include "plscore.cuh"
 #include "plbacktrack.cuh"
-#include "plvoting.cuh"
 #include "plchain.h"
 #include <utility>
 #include <algorithm>
@@ -368,42 +367,14 @@ static void start_backtrack_impl(stream_ptr_t *sp,
 }
 
 /**
- * needs_rmq_rechain_fused: same logic as needs_rmq_rechain() but uses
- * pre-gathered ay values instead of rd->a[] (which is stale in the
- * deferred D2H path).
- */
-static int needs_rmq_rechain_fused(const mm_mapopt_t *opt,
-                                     chain_read_t *read,
-                                     int32_t ay_first, int32_t ay_last) {
-    int n_segs  = read->n_seg;
-    int n_regs0 = read->n_u;
-    int qlen_sum = read->seq.qlen_sum;
-
-    if (opt->bw_long > opt->bw &&
-        (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
-        n_segs == 1 && n_regs0 > 1 && read->u != NULL) {
-        if ((int32_t)read->u[0] <= 0) return 0;
-        int32_t st = ay_first;
-        int32_t en = ay_last;
-        if (qlen_sum - (en - st) > opt->rmq_rescue_size ||
-            en - st > qlen_sum * opt->rmq_rescue_ratio)
-            return 1;
-    }
-    return 0;
-}
-
-/**
- * finish_backtrack_gpu: Fused backtrack→voting pipeline.
+ * finish_backtrack_impl: D2H anchor data + post-chaining for all reads.
  *
- * Anchor data stays on GPU between backtrack and voting stages.
- * Only u[] and a few ay values are D2H'd for decision-making.
- *
- * Flow:
- *   1. Gather ay values from GPU for needs_rmq_rechain check
- *   2. Classify reads: rechain vs non-rechain
- *   3. Non-rechain reads: D2H anchor data, rebuild mm128_t on host
- *   4. Rechain reads: GPU repack + sort + voting (no host round-trip)
- *   5. Post-chaining for all reads
+ * Previously this split reads into "needs RMQ rescue" (GPU voting path)
+ * vs "non-rechain" (D2H path). The voting heuristic diverged from the
+ * CPU chain algorithm and was a major source of alignment mismatches,
+ * so it has been removed. Every read now takes a uniform D2H path, and
+ * the long-read rescue is performed on the host by post_chaining_helper
+ * via a second mg_lchain_dp call with bw_long (see map.c).
  */
 static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
                                    stream_ptr_t *sp,
@@ -412,47 +383,15 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
     deviceMemPtr *dev_mem = &sp->dev_mem;
     cudaStream_t stream   = sp->cudastream;
 
-    /* Step 1: Gather ay values for needs_rmq_rechain check (tiny D2H) */
-    int32_t *h_ay_first = NULL, *h_ay_last = NULL;
-    plbacktrack_gather_rechain_ay(dev_mem, n_read, stream,
-                                   &h_ay_first, &h_ay_last);
-
-    /* Step 2: Classify reads */
-    int *rechain_indices     = (int *)malloc(sizeof(int) * n_read);
-    int *non_rechain_indices = (int *)malloc(sizeof(int) * n_read);
-    int n_rechain = 0, n_non_rechain = 0;
-
+    /* D2H all reads uniformly — rebuild host-side a[] from compacted
+     * backtrack output. */
     for (int i = 0; i < n_read; i++) {
-        if (needs_rmq_rechain_fused(opt, &reads[i],
-                                     h_ay_first[i], h_ay_last[i]))
-            rechain_indices[n_rechain++] = i;
-        else
-            non_rechain_indices[n_non_rechain++] = i;
+        plbacktrack_d2h_read(dev_mem, &reads[i], i, km, stream);
     }
-    free(h_ay_first);
-    free(h_ay_last);
-
-    fprintf(stderr, "[DEBUG] finish_backtrack_impl: n_read=%d, rechain=%d, non_rechain=%d\n",
-            n_read, n_rechain, n_non_rechain);
-
-    /* Step 3: Non-rechain reads — D2H anchor data and rebuild mm128_t */
-    for (int i = 0; i < n_non_rechain; i++) {
-        plbacktrack_d2h_read(dev_mem, &reads[non_rechain_indices[i]],
-                              non_rechain_indices[i], km, stream);
-    }
-
-    /* Step 4: Rechain reads — fused GPU voting (data stays on GPU) */
-    if (n_rechain > 0) {
-        plvoting_rechain_batch_fused(mi, opt, reads, rechain_indices,
-                                      n_rechain, misc, km, stream, dev_mem);
-    }
-
-    /* Step 5: Cleanup deferred D2H metadata */
     plbacktrack_d2h_finish(dev_mem);
-    free(rechain_indices);
-    free(non_rechain_indices);
 
-    /* Step 6: Post-chaining for all reads */
+    /* Post-chaining on host (long-read rescue via mg_lchain_dp(bw_long)
+     * happens inside post_chaining_helper). */
     for (int i = 0; i < n_read; i++)
         post_chaining_helper(mi, opt, &reads[i], misc, km);
 
@@ -601,10 +540,10 @@ void free_stream_gpu(int n_threads) {
     plmem_stream_cleanup();
 }
 
-/* gpu_rechain_batch has been superseded by plvoting_rechain_batch (plvoting.cu).
- * The voting-based approach replaces the RMQ-tree with a GPU histogram that
- * identifies high-coverage reference regions, then runs mg_lchain_dp with
- * bw_long on the filtered anchor set.  See gpu/plvoting.cu for details. */
+/* Long-read rescue is now performed on the host via a second
+ * mg_lchain_dp(bw_long) call in post_chaining_helper (map.c). The
+ * previous GPU voting-based path diverged from the CPU chain algorithm
+ * and has been removed. */
 
 #ifdef __cplusplus
 } // extern "C"

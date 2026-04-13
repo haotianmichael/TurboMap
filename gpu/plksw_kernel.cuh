@@ -506,7 +506,19 @@ __global__ void ksw_fused_persistent_kernel(
                 backtrack_t = ez_max_t;
             }
 
-            device_res->aln_score[task_id]        = ez_zdropped ? ez_max : ez_score;
+            // Match CPU (align.c):
+            //   LEFT_EXT / RIGHT_EXT (EXTZ_ONLY): always add ez->max to dp_score
+            //   GAP_FILL zdropped:                add ez->max
+            //   GAP_FILL normal:                  add ez->score
+            // For EXTZ_ONLY tasks, ez_score is only written when the DP walks to
+            // the far corner (r == qlen+tlen-2), which extension tasks almost never
+            // reach, so ez_score stays KSW_NEG_INF and map.c's `score > 0` guard
+            // drops the contribution entirely. Emit ez_max for those tasks instead.
+            int32_t out_score;
+            if (flag & KSW_EZ_EXTZ_ONLY)      out_score = ez_max;
+            else if (ez_zdropped)             out_score = ez_max;
+            else                              out_score = ez_score;
+            device_res->aln_score[task_id]        = out_score;
             device_res->query_batch_end[task_id]  = backtrack_q;
             device_res->target_batch_end[task_id] = backtrack_t;
             device_res->mqe[task_id]              = ez_mqe;

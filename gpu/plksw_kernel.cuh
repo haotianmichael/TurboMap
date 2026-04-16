@@ -3,16 +3,36 @@
 #include "gasal_kernels.h"
 
 /*
- * plksw_kernel.cuh — Anti-diagonal KSW2 kernel with direct int32 H/E/F/E2/F2
+ * plksw_kernel.cuh — Fused Persistent KSW2 kernel with Suzuki-Kasahara int8
+ *                     difference encoding (correct) + persistent work-stealing
+ *                     + fused backtrack/CIGAR (efficient).
  *
- * Replaces the Suzuki-Kasahara int8 difference encoding with direct int32
- * values to avoid overflow on long sequences. Uses triple-buffered H arrays
- * (H from r-2 needed for diagonal, H from r-1 for gap open).
+ * The DP core uses the Suzuki-Kasahara delta encoding identical to CPU SSE
+ * ksw2_extd2_sse.c. Variables u/v/x/y/x2/y2 are int8 deltas; H[] is int32
+ * used only for max-score tracking (not as DP input).
  *
- * Dual-affine gap: short gap (q+e) and long gap (q2+e2).
- * Anti-diagonal wavefront: all cells on diagonal r are independent.
- * Persistent kernel with atomic work-stealing.
- * Fused backtracking + CIGAR generation.
+ * Anti-diagonal cells are processed in batches of WARP_SIZE. Within a batch,
+ * all cells are independent (read left-neighbor from previous anti-diagonal
+ * via pre-loaded registers). Between batches, a __syncwarp() + boundary save
+ * prevents RAW hazards on the global u/v/x/y/x2/y2 arrays.
+ *
+ * Per-slot temp buffer layout:
+ *   H[tlen * int32]          — absolute H for max tracking only
+ *   u[(tlen+1) * int8]       — Suzuki-Kasahara delta
+ *   v[(tlen+1) * int8]       — Suzuki-Kasahara delta
+ *   x[(tlen+1) * int8]       — Suzuki-Kasahara delta
+ *   y[(tlen+1) * int8]       — Suzuki-Kasahara delta
+ *   x2[(tlen+1) * int8]      — Suzuki-Kasahara delta (long gap)
+ *   y2[(tlen+1) * int8]      — Suzuki-Kasahara delta (long gap)
+ *   qr[qlen * uint8]         — reversed query sequence
+ *   target[tlen * uint8]     — target sequence
+ *
+ * Backtrack direction byte:
+ *   bits 0-2: state — 0=diag(H), 1=E, 2=F, 3=E2, 4=F2
+ *   bit 3 (0x08): E continuation
+ *   bit 4 (0x10): F continuation
+ *   bit 5 (0x20): E2 continuation
+ *   bit 6 (0x40): F2 continuation
  */
 
 #define KSW_EZ_SCORE_ONLY  0x01
@@ -56,27 +76,6 @@ __device__ __forceinline__ int8_t dp_compute_score(uint8_t a, uint8_t b, int8_t 
     return (a < m && b < m) ? mat[a * m + b] : 0;
 }
 
-/*
- * Fused Persistent KSW Kernel — Direct int32 dual-affine
- *
- * Per-slot temp buffer layout:
- *   H_buf0[(tlen+1) * int32]   — triple-buffered H, buffer 0
- *   H_buf1[(tlen+1) * int32]   — triple-buffered H, buffer 1
- *   H_buf2[(tlen+1) * int32]   — triple-buffered H, buffer 2
- *   E[(tlen+1) * int32]        — short gap in query (vertical/deletion)
- *   F[(tlen+1) * int32]        — short gap in target (horizontal/insertion)
- *   E2[(tlen+1) * int32]       — long gap in query
- *   F2[(tlen+1) * int32]       — long gap in target
- *   qr[qlen * uint8]           — reversed query sequence
- *   target[tlen * uint8]       — target sequence
- *
- * Backtrack direction byte (same format as before):
- *   bits 0-2: state — 0=diag, 1=E, 2=F, 3=E2, 4=F2
- *   bit 3: E continuation (gap extend won over gap open)
- *   bit 4: F continuation
- *   bit 5: E2 continuation
- *   bit 6: F2 continuation
- */
 __global__ void ksw_fused_persistent_kernel(
     int *d_task_counter,
     uint32_t *packed_query_batch,
@@ -150,44 +149,66 @@ __global__ void ksw_fused_persistent_kernel(
         int8_t e2 = _cudaGapExtendL;
         int32_t w = d_bw[task_id];
 
-        // Ensure q+e <= q2+e2 (short gap <= long gap penalty)
+        // Ensure q+e <= q2+e2 (short gap penalty <= long gap penalty)
         if (q2 + e2 < q + e) {
             int8_t tmp = q; q = q2; q2 = tmp;
             tmp = e; e = e2; e2 = tmp;
         }
-        int32_t qe  = q  + e;
-        int32_t qe2 = q2 + e2;
+        int8_t qe  = q  + e;
+        int8_t qe2 = q2 + e2;
 
         int wl = (w < 0) ? max(qlen, tlen) : w;
         int wr = (w < 0) ? max(qlen, tlen) : w;
 
+        int long_thres = (e != e2) ? (q2 - q) / (e - e2) - 1 : 0;
+        if (q2 + e2 + long_thres * e2 > q + e + long_thres * e) {
+            ++long_thres;
+        }
+        int32_t long_diff = long_thres * (e - e2) - (q2 - q) - e2;
+
+        int8_t sc_mch = device_mat[0];
+
         // ========== Slot-indexed Temp Buffer ==========
         char *task_buf = (char*)d_temp_buffer + (size_t)slot_id * temp_per_task;
 
-        size_t arr_len = (size_t)(tlen + 1);
-        size_t offset = 0;
-        int32_t *H_bufs[3];
-        H_bufs[0] = (int32_t*)(task_buf + offset); offset += arr_len * sizeof(int32_t);
-        H_bufs[1] = (int32_t*)(task_buf + offset); offset += arr_len * sizeof(int32_t);
-        H_bufs[2] = (int32_t*)(task_buf + offset); offset += arr_len * sizeof(int32_t);
-        int32_t *E_arr  = (int32_t*)(task_buf + offset); offset += arr_len * sizeof(int32_t);
-        int32_t *F_arr  = (int32_t*)(task_buf + offset); offset += arr_len * sizeof(int32_t);
-        int32_t *E2_arr = (int32_t*)(task_buf + offset); offset += arr_len * sizeof(int32_t);
-        int32_t *F2_arr = (int32_t*)(task_buf + offset); offset += arr_len * sizeof(int32_t);
-        uint8_t *qr     = (uint8_t*)(task_buf + offset); offset += qlen * sizeof(uint8_t);
-        uint8_t *target = (uint8_t*)(task_buf + offset);
+        size_t buf_offset = 0;
+        int32_t *H = (int32_t*)(task_buf + buf_offset);
+        buf_offset += tlen * sizeof(int32_t);
 
-        // ========== Initialization ==========
-        // H boundary: H[-1][j] = 0, H[i][-1] = 0
-        // Initialize all H buffers to 0 (boundary value)
-        for (int i = lane_id; i < (int)arr_len; i += WARP_SIZE) {
-            H_bufs[0][i] = 0;
-            H_bufs[1][i] = 0;
-            H_bufs[2][i] = 0;
-            E_arr[i]  = KSW_NEG_INF;
-            F_arr[i]  = KSW_NEG_INF;
-            E2_arr[i] = KSW_NEG_INF;
-            F2_arr[i] = KSW_NEG_INF;
+        int8_t *u_arr = (int8_t*)(task_buf + buf_offset);
+        buf_offset += (tlen + 1) * sizeof(int8_t);
+        int8_t *v_arr = (int8_t*)(task_buf + buf_offset);
+        buf_offset += (tlen + 1) * sizeof(int8_t);
+        int8_t *x_arr = (int8_t*)(task_buf + buf_offset);
+        buf_offset += (tlen + 1) * sizeof(int8_t);
+        int8_t *y_arr = (int8_t*)(task_buf + buf_offset);
+        buf_offset += (tlen + 1) * sizeof(int8_t);
+        int8_t *x2_arr = (int8_t*)(task_buf + buf_offset);
+        buf_offset += (tlen + 1) * sizeof(int8_t);
+        int8_t *y2_arr = (int8_t*)(task_buf + buf_offset);
+        buf_offset += (tlen + 1) * sizeof(int8_t);
+
+        uint8_t *qr     = (uint8_t*)(task_buf + buf_offset);
+        buf_offset += qlen * sizeof(uint8_t);
+        uint8_t *target = (uint8_t*)(task_buf + buf_offset);
+
+        // ========== Initialization (Suzuki-Kasahara sentinels) ==========
+        for (int i = lane_id; i < tlen; i += WARP_SIZE) {
+            H[i] = KSW_NEG_INF;
+            u_arr[i] = -q - e;
+            v_arr[i] = -q - e;
+            x_arr[i] = -q - e;
+            y_arr[i] = -q - e;
+            x2_arr[i] = -q2 - e2;
+            y2_arr[i] = -q2 - e2;
+        }
+        if (lane_id == 0) {
+            u_arr[tlen] = -q - e;
+            v_arr[tlen] = -q - e;
+            x_arr[tlen] = -q - e;
+            y_arr[tlen] = -q - e;
+            x2_arr[tlen] = -q2 - e2;
+            y2_arr[tlen] = -q2 - e2;
         }
 
         // ========== Sequence Unpacking ==========
@@ -212,8 +233,6 @@ __global__ void ksw_fused_persistent_kernel(
         int last_H0_t = 0;
         int32_t H0 = 0;
 
-        // n_col: max band width for direction byte storage per anti-diagonal.
-        // No SIMD padding needed (unlike SSE kernel) — must match plalign.cu allocation.
         int n_col = (qlen < tlen) ? qlen : tlen;
         n_col = (n_col < w + 1) ? n_col : (w + 1);
 
@@ -227,8 +246,7 @@ __global__ void ksw_fused_persistent_kernel(
         int     *off_end = backtrack_off_end + (size_t)slot_id * max_antidiag;
 
         // ========== Main DP Loop: Anti-diagonal Traversal ==========
-        int last_st = -1, last_en = -1;    // r-1 band boundaries
-        int pprev_st = -1, pprev_en = -1;  // r-2 band boundaries
+        int last_st = -1, last_en = -1;
         for (int r = 0; r < qlen + tlen - 1; r++) {
             // Band boundaries
             int st = 0, en = tlen - 1;
@@ -244,181 +262,256 @@ __global__ void ksw_fused_persistent_kernel(
 
             int st0 = st, en0 = en;
 
-            // Record backtrack range
-            if (lane_id == 0 && with_cigar) {
-                off[r] = st0;
-                off_end[r] = en0;
-            }
-
-            // Triple-buffer rotation
-            int32_t *H_cur   = H_bufs[r % 3];       // current anti-diagonal's H
-            int32_t *H_prev  = H_bufs[(r + 2) % 3]; // anti-diagonal r-1
-            int32_t *H_pprev = H_bufs[(r + 1) % 3]; // anti-diagonal r-2
-
-            uint8_t *pr = (with_cigar && cigar_buffer) ? (p_bt + (size_t)r * n_col) : NULL;
-
-            // ========== Parallel DP: all cells on anti-diagonal r ==========
-            for (int idx = lane_id; idx <= (en0 - st0); idx += WARP_SIZE) {
-                int t = st0 + idx;             // target position j
-                int qi = r - t;                // query position i (in original coords)
-                int qi_rev = qlen - 1 - qi;    // reversed query index
-
-                // Substitution score
-                int8_t score;
-                if (qi >= 0 && qi < qlen && t >= 0 && t < tlen) {
-                    score = dp_compute_score(qr[qi_rev], target[t], device_mat, m);
-                } else {
-                    score = 0;
-                }
-
-                // Diagonal: H[i-1][j-1] from anti-diagonal r-2
-                // H_pprev[t-1] valid only if t-1 was in band at r-2
-                int32_t H_diag;
-                if (qi == 0 || t == 0) {
-                    H_diag = 0;
-                } else if (t - 1 >= pprev_st && t - 1 <= pprev_en) {
-                    H_diag = H_pprev[t - 1];
-                } else {
-                    H_diag = 0;
-                }
-
-                // Gap in query (E): vertical move (i-1,j) -> (i,j)
-                // E[i][j] = max(H[i-1][j] - qe, E[i-1][j] - e)
-                // H_prev[t] is only valid if t was in band at r-1
-                int32_t H_up;
-                if (qi == 0) {
-                    H_up = 0;
-                } else if (t >= last_st && t <= last_en) {
-                    H_up = H_prev[t];
-                } else {
-                    H_up = 0;  // out of r-1 band: treat as boundary
-                }
-                int32_t e_open  = H_up - qe;
-                int32_t e_ext;
-                if (t >= last_st && t <= last_en) {
-                    e_ext = E_arr[t] - e;
-                } else {
-                    e_ext = KSW_NEG_INF;
-                }
-                int32_t E_val   = max(e_open, e_ext);
-
-                // Gap in target (F): horizontal move (i,j-1) -> (i,j)
-                // F[i][j] = max(H[i][j-1] - qe, F[i][j-1] - e)
-                // H_prev[t-1] is only valid if t-1 was in band at r-1
-                int32_t H_left;
-                if (t == 0) {
-                    H_left = 0;
-                } else if (t - 1 >= last_st && t - 1 <= last_en) {
-                    H_left = H_prev[t - 1];
-                } else {
-                    H_left = 0;  // out of r-1 band: treat as boundary
-                }
-                int32_t f_open  = H_left - qe;
-                // F_arr[t-1] is valid only if t-1 was in band at r-1
-                int32_t f_ext;
-                int32_t F_val;
-                if (t == 0) {
-                    F_val = f_open;  // boundary: no F extension
-                } else if (t - 1 >= last_st && t - 1 <= last_en) {
-                    f_ext = F_arr[t - 1] - e;
-                    F_val = max(f_open, f_ext);
-                } else {
-                    f_ext = KSW_NEG_INF;  // out-of-band: no valid F from previous
-                    F_val = f_open;
-                }
-
-                // Long gap in query (E2)
-                int32_t e2_open = H_up - qe2;
-                int32_t e2_ext;
-                if (t >= last_st && t <= last_en) {
-                    e2_ext = E2_arr[t] - e2;
-                } else {
-                    e2_ext = KSW_NEG_INF;
-                }
-                int32_t E2_val  = max(e2_open, e2_ext);
-
-                // Long gap in target (F2)
-                int32_t f2_open = H_left - qe2;
-                int32_t f2_ext;
-                int32_t F2_val;
-                if (t == 0) {
-                    F2_val = f2_open;
-                } else if (t - 1 >= last_st && t - 1 <= last_en) {
-                    f2_ext = F2_arr[t - 1] - e2;
-                    F2_val = max(f2_open, f2_ext);
-                } else {
-                    f2_ext = KSW_NEG_INF;
-                    F2_val = f2_open;
-                }
-
-                // H[i][j] = max(H_diag + score, E, F, E2, F2)
-                int32_t H_val = H_diag + (int32_t)score;
-                uint8_t d = 0;
-
-                if (!with_cigar) {
-                    H_val = max(H_val, E_val);
-                    H_val = max(H_val, F_val);
-                    H_val = max(H_val, E2_val);
-                    H_val = max(H_val, F2_val);
-                } else if (!right_align) {
-                    // State mapping must match ksw2 backtrack convention:
-                    // state 1 = horizontal gap (F, target gap) = DEL → --i
-                    // state 2 = vertical gap (E, query gap)   = INS → --j
-                    // state 3 = long horizontal (F2)          = DEL
-                    // state 4 = long vertical (E2)            = INS
-                    if (F_val  > H_val) { H_val = F_val;  d = 1; }
-                    if (E_val  > H_val) { H_val = E_val;  d = 2; }
-                    if (F2_val > H_val) { H_val = F2_val; d = 3; }
-                    if (E2_val > H_val) { H_val = E2_val; d = 4; }
-                } else {
-                    if (!(H_val > F_val))  { H_val = F_val;  d = 1; }
-                    if (!(H_val > E_val))  { H_val = E_val;  d = 2; }
-                    if (!(H_val > F2_val)) { H_val = F2_val; d = 3; }
-                    if (!(H_val > E2_val)) { H_val = E2_val; d = 4; }
-                }
-
-                // Backtrack continuation bits — must match state numbering:
-                // bit 3 (0x08) = state 1 continuation = F (horizontal gap extension)
-                // bit 4 (0x10) = state 2 continuation = E (vertical gap extension)
-                // bit 5 (0x20) = state 3 continuation = F2 (long horizontal)
-                // bit 6 (0x40) = state 4 continuation = E2 (long vertical)
-                if (with_cigar) {
-                    if (!right_align) {
-                        if (f_ext > f_open && t > 0)       d |= 0x08;
-                        if (e_ext > e_open)                d |= 0x10;
-                        if (f2_ext > f2_open && t > 0)     d |= 0x20;
-                        if (e2_ext > e2_open)              d |= 0x40;
+            // ========== Set Boundary Conditions (lane 0) ==========
+            int8_t x1_boundary, v1_boundary, x21_boundary;
+            if (lane_id == 0) {
+                // Left boundary: x[st0-1], v[st0-1], x2[st0-1] from previous anti-diag
+                if (st0 > 0) {
+                    if (st0 - 1 >= last_st && st0 - 1 <= last_en) {
+                        x1_boundary = x_arr[st0 - 1];
+                        x21_boundary = x2_arr[st0 - 1];
+                        v1_boundary = v_arr[st0 - 1];
                     } else {
-                        if (f_ext >= f_open && t > 0)      d |= 0x08;
-                        if (e_ext >= e_open)               d |= 0x10;
-                        if (f2_ext >= f2_open && t > 0)    d |= 0x20;
-                        if (e2_ext >= e2_open)             d |= 0x40;
+                        x1_boundary = -q - e;
+                        x21_boundary = -q2 - e2;
+                        v1_boundary = -q - e;
+                    }
+                } else {
+                    // st0 == 0: initial boundary (matches CPU SSE exactly)
+                    x1_boundary = -q - e;
+                    x21_boundary = -q2 - e2;
+                    if (r == 0) {
+                        v1_boundary = -q - e;
+                    } else if (r < long_thres) {
+                        v1_boundary = -e;
+                    } else if (r == long_thres) {
+                        v1_boundary = (int8_t)long_diff;
+                    } else {
+                        v1_boundary = -e2;
                     }
                 }
 
-                // Store results
-                H_cur[t]   = H_val;
-                E_arr[t]   = E_val;
-                F_arr[t]   = F_val;
-                E2_arr[t]  = E2_val;
-                F2_arr[t]  = F2_val;
+                // Right boundary: u[r], y[r], y2[r]
+                if (en0 >= r && r < tlen) {
+                    y_arr[r] = -q - e;
+                    y2_arr[r] = -q2 - e2;
+                    if (r == 0) {
+                        u_arr[r] = -q - e;
+                    } else if (r < long_thres) {
+                        u_arr[r] = -e;
+                    } else if (r == long_thres) {
+                        u_arr[r] = (int8_t)long_diff;
+                    } else {
+                        u_arr[r] = -e2;
+                    }
+                }
 
-                if (pr != NULL) {
-                    pr[t - st0] = d;
+                // Record backtrack range
+                if (with_cigar) {
+                    off[r] = st0;
+                    off_end[r] = en0;
                 }
             }
             __syncwarp();
 
+            // Broadcast boundary values to all lanes
+            x1_boundary = __shfl_sync(0xffffffff, x1_boundary, 0);
+            v1_boundary = __shfl_sync(0xffffffff, v1_boundary, 0);
+            x21_boundary = __shfl_sync(0xffffffff, x21_boundary, 0);
+
+            uint8_t *pr = (with_cigar && cigar_buffer) ? (p_bt + (size_t)r * n_col) : NULL;
+
+            // ========== Batched Parallel DP: Suzuki-Kasahara recurrence ==========
+            // Process cells in batches of WARP_SIZE to avoid RAW hazard:
+            // Within a batch, each lane pre-loads its left neighbor (x[t-1], v[t-1],
+            // x2[t-1]) from the PREVIOUS anti-diagonal's values BEFORE any lane
+            // writes to the arrays. Between batches, __syncwarp() ensures writes
+            // are visible, and the last cell's x/v/x2 become the next batch's
+            // left boundary.
+            int band_size = en0 - st0 + 1;
+            int8_t batch_x1_boundary = x1_boundary;
+            int8_t batch_v1_boundary = v1_boundary;
+            int8_t batch_x21_boundary = x21_boundary;
+
+            for (int batch_start = 0; batch_start < band_size; batch_start += WARP_SIZE) {
+                int idx = batch_start + lane_id;
+                // Is this lane active in this batch?
+                bool active = (idx < band_size);
+
+                // Pre-load left neighbor values from previous anti-diagonal
+                // BEFORE any writes happen in this batch
+                int8_t my_x1, my_v1, my_x21;
+                int8_t my_u_prev, my_y_prev, my_y2_prev;
+                int8_t my_score;
+                if (active) {
+                    int t = st0 + idx;
+                    int qi = r - t;
+                    int qi_rev = qlen - 1 - qi;
+
+                    // Left neighbor: for lane 0 in batch, use batch boundary
+                    if (lane_id == 0) {
+                        my_x1  = batch_x1_boundary;
+                        my_v1  = batch_v1_boundary;
+                        my_x21 = batch_x21_boundary;
+                    } else {
+                        // t-1 values are still from previous anti-diagonal
+                        // (not yet overwritten in this batch)
+                        my_x1  = x_arr[t - 1];
+                        my_v1  = v_arr[t - 1];
+                        my_x21 = x2_arr[t - 1];
+                    }
+
+                    // Vertical neighbor values (always from previous anti-diagonal)
+                    my_u_prev  = u_arr[t];
+                    my_y_prev  = y_arr[t];
+                    my_y2_prev = y2_arr[t];
+
+                    // Match/mismatch score
+                    if (qi >= 0 && qi < qlen && t >= 0 && t < tlen) {
+                        my_score = dp_compute_score(qr[qi_rev], target[t], device_mat, m);
+                    } else {
+                        my_score = 0;
+                    }
+                } else {
+                    my_x1 = my_v1 = my_x21 = 0;
+                    my_u_prev = my_y_prev = my_y2_prev = 0;
+                    my_score = 0;
+                }
+                // All reads from previous anti-diagonal are done.
+                // Now safe to compute and write.
+
+                // Declare output registers in wider scope for batch boundary passing
+                int8_t new_x = 0, new_v_out = 0, new_x2 = 0;
+
+                if (active) {
+                    int t = st0 + idx;
+
+                    // DP recurrence — exactly matches CPU SSE ksw2_extd2_sse.c
+                    int8_t z = my_score;
+                    int8_t a  = my_x1 + my_v1;
+                    int8_t b  = my_y_prev + my_u_prev;
+                    int8_t a2 = my_x21 + my_v1;
+                    int8_t b2 = my_y2_prev + my_u_prev;
+
+                    int8_t ut = my_u_prev;
+
+                    uint8_t d = 0;
+
+                    // State selection
+                    if (!with_cigar) {
+                        if (a > z) z = a;
+                        if (b > z) z = b;
+                        if (a2 > z) z = a2;
+                        if (b2 > z) z = b2;
+                    } else if (!right_align) {
+                        if (a > z) { z = a; d = 1; }
+                        if (b > z) { z = b; d = 2; }
+                        if (a2 > z) { z = a2; d = 3; }
+                        if (b2 > z) { z = b2; d = 4; }
+                    } else {
+                        if (!(z > a)) { z = a; d = 1; }
+                        if (!(z > b)) { z = b; d = 2; }
+                        if (!(z > a2)) { z = a2; d = 3; }
+                        if (!(z > b2)) { z = b2; d = 4; }
+                    }
+
+                    // Suzuki-Kasahara clamp: delta per step <= sc_mch
+                    if (z > sc_mch) z = sc_mch;
+
+                    // New deltas
+                    int8_t new_u = z - my_v1;
+                    new_v_out = z - ut;
+
+                    // Gap continuation
+                    int tmp_val = z - q;
+                    a -= tmp_val;
+                    b -= tmp_val;
+                    tmp_val = z - q2;
+                    a2 -= tmp_val;
+                    b2 -= tmp_val;
+
+                    int8_t new_y, new_y2;
+
+                    if (!with_cigar || !right_align) {
+                        new_x  = (a  > 0) ? (a  - qe)  : (-qe);
+                        new_y  = (b  > 0) ? (b  - qe)  : (-qe);
+                        new_x2 = (a2 > 0) ? (a2 - qe2) : (-qe2);
+                        new_y2 = (b2 > 0) ? (b2 - qe2) : (-qe2);
+
+                        if (with_cigar) {
+                            if (a  > 0) d |= 0x08;
+                            if (b  > 0) d |= 0x10;
+                            if (a2 > 0) d |= 0x20;
+                            if (b2 > 0) d |= 0x40;
+                        }
+                    } else {
+                        new_x  = (!(0 > a))  ? (a  - qe)  : (-qe);
+                        new_y  = (!(0 > b))  ? (b  - qe)  : (-qe);
+                        new_x2 = (!(0 > a2)) ? (a2 - qe2) : (-qe2);
+                        new_y2 = (!(0 > b2)) ? (b2 - qe2) : (-qe2);
+
+                        if (!(0 > a))  d |= 0x08;
+                        if (!(0 > b))  d |= 0x10;
+                        if (!(0 > a2)) d |= 0x20;
+                        if (!(0 > b2)) d |= 0x40;
+                    }
+
+                    // Write back to global arrays
+                    u_arr[t]  = new_u;
+                    v_arr[t]  = new_v_out;
+                    x_arr[t]  = new_x;
+                    y_arr[t]  = new_y;
+                    x2_arr[t] = new_x2;
+                    y2_arr[t] = new_y2;
+
+                    if (pr != NULL) {
+                        pr[t - st0] = d;
+                    }
+                }
+
+                // Pass boundary to next batch via register shuffle.
+                // new_x/new_v_out/new_x2 are in registers (0 for inactive lanes).
+                // Broadcast from last active lane to all lanes.
+                int last_lane = min(WARP_SIZE - 1, band_size - batch_start - 1);
+                if (batch_start + WARP_SIZE < band_size) {
+                    batch_x1_boundary  = __shfl_sync(0xffffffff, new_x,     last_lane);
+                    batch_v1_boundary  = __shfl_sync(0xffffffff, new_v_out, last_lane);
+                    batch_x21_boundary = __shfl_sync(0xffffffff, new_x2,    last_lane);
+                }
+                __syncwarp();
+
+            } // End batch loop
+
             // ========== Track Maximum Score (lane 0 only) ==========
             if (lane_id == 0) {
                 if (!approx_max) {
-                    int32_t max_H = KSW_NEG_INF;
-                    int max_t_pos = st0;
+                    int32_t max_H, max_t_pos;
+                    if (r == 0) {
+                        H[0] = (int32_t)v_arr[0] - qe;
+                        max_H = H[0];
+                        max_t_pos = 0;
+                    } else {
+                        int32_t H_en0_old = (en0 > 0) ? H[en0 - 1] : H[en0];
+                        max_H = KSW_NEG_INF;
+                        max_t_pos = st0;
 
-                    for (int t = st0; t <= en0; ++t) {
-                        if (H_cur[t] > max_H) {
-                            max_H = H_cur[t];
-                            max_t_pos = t;
+                        for (int t = st0; t < en0; ++t) {
+                            H[t] += (int32_t)v_arr[t];
+                            if (H[t] > max_H) {
+                                max_H = H[t];
+                                max_t_pos = t;
+                            }
+                        }
+
+                        if (en0 > 0) {
+                            H[en0] = H_en0_old + (int32_t)u_arr[en0];
+                        } else {
+                            H[en0] += (int32_t)v_arr[en0];
+                        }
+
+                        if (H[en0] > max_H) {
+                            max_H = H[en0];
+                            max_t_pos = en0;
                         }
                     }
 
@@ -439,55 +532,55 @@ __global__ void ksw_fused_persistent_kernel(
                         }
                     }
 
-                    // Check boundary conditions
-                    if (en0 == tlen - 1 && H_cur[en0] > ez_mte) {
-                        ez_mte = H_cur[en0];
+                    if (en0 == tlen - 1 && H[en0] > ez_mte) {
+                        ez_mte = H[en0];
                         ez_mte_q = r - en0;
                     }
-                    if (r - st0 == qlen - 1 && st0 >= 0 && st0 < tlen && H_cur[st0] > ez_mqe) {
-                        ez_mqe = H_cur[st0];
+                    if (r - st0 == qlen - 1 && st0 >= 0 && st0 < tlen && H[st0] > ez_mqe) {
+                        ez_mqe = H[st0];
                         ez_mqe_t = st0;
                     }
                     if (r == qlen + tlen - 2 && en0 == tlen - 1) {
-                        ez_score = H_cur[tlen - 1];
+                        ez_score = H[tlen - 1];
                     }
                 } else {
-                    // Approximate max tracking
+                    // Approximate max tracking (from Suzuki-Kasahara deltas)
                     if (r > 0) {
                         if (last_H0_t >= st0 && last_H0_t <= en0 &&
                             last_H0_t + 1 >= st0 && last_H0_t + 1 <= en0) {
-                            int32_t h0 = H_cur[last_H0_t];
-                            int32_t h1 = H_cur[last_H0_t + 1];
-                            if (h0 >= h1) {
-                                H0 = h0;
+                            int32_t d0 = v_arr[last_H0_t];
+                            int32_t d1 = u_arr[last_H0_t + 1];
+                            if (d0 > d1) {
+                                H0 += d0;
                             } else {
-                                H0 = h1;
+                                H0 += d1;
                                 ++last_H0_t;
                             }
                         } else if (last_H0_t >= st0 && last_H0_t <= en0) {
-                            H0 = H_cur[last_H0_t];
+                            H0 += v_arr[last_H0_t];
                         } else {
                             ++last_H0_t;
-                            H0 = H_cur[last_H0_t];
+                            H0 += u_arr[last_H0_t];
                         }
                     } else {
-                        H0 = H_cur[0];
+                        H0 = v_arr[0] - qe;
                         last_H0_t = 0;
                     }
                     if (r == qlen + tlen - 2 && en0 == tlen - 1) {
                         ez_score = H0;
                     }
                 }
-            }
 
-            // Update band boundaries for next anti-diagonal
-            pprev_st = last_st;
-            pprev_en = last_en;
-            last_st = st0;
-            last_en = en0;
+                last_st = st0;
+                last_en = en0;
+            }
 
             int zdropped_flag = __shfl_sync(0xffffffff, ez_zdropped, 0);
             if (zdropped_flag) break;
+
+            // Broadcast last_st/last_en so all lanes can check boundaries
+            last_st = __shfl_sync(0xffffffff, last_st, 0);
+            last_en = __shfl_sync(0xffffffff, last_en, 0);
         } // End anti-diagonal loop
 
         // ========== Write Results ==========
@@ -506,14 +599,6 @@ __global__ void ksw_fused_persistent_kernel(
                 backtrack_t = ez_max_t;
             }
 
-            // Match CPU (align.c):
-            //   LEFT_EXT / RIGHT_EXT (EXTZ_ONLY): always add ez->max to dp_score
-            //   GAP_FILL zdropped:                add ez->max
-            //   GAP_FILL normal:                  add ez->score
-            // For EXTZ_ONLY tasks, ez_score is only written when the DP walks to
-            // the far corner (r == qlen+tlen-2), which extension tasks almost never
-            // reach, so ez_score stays KSW_NEG_INF and map.c's `score > 0` guard
-            // drops the contribution entirely. Emit ez_max for those tasks instead.
             int32_t out_score;
             if (flag & KSW_EZ_EXTZ_ONLY)      out_score = ez_max;
             else if (ez_zdropped)             out_score = ez_max;

@@ -338,15 +338,28 @@ __global__ void ksw_fused_persistent_kernel(
                 // Is this lane active in this batch?
                 bool active = (idx < band_size);
 
-                // Pre-load left neighbor values from previous anti-diagonal
-                // BEFORE any writes happen in this batch
+                // Pre-load ALL values from previous anti-diagonal (r-1)
+                // BEFORE any writes happen in this batch.
+                // This includes:
+                //   - Left neighbor: x[t-1], v[t-1], x2[t-1] from r-1
+                //   - Vertical neighbor: u[t], y[t], y2[t] from r-1
+                //   - OLD values at position t: x[t], v[t], x2[t] from r-1
+                //     (needed for next batch's left boundary)
                 int8_t my_x1, my_v1, my_x21;
                 int8_t my_u_prev, my_y_prev, my_y2_prev;
                 int8_t my_score;
+                // OLD x/v/x2 at position t (from r-1), for next-batch boundary
+                int8_t old_x_at_t = 0, old_v_at_t = 0, old_x2_at_t = 0;
                 if (active) {
                     int t = st0 + idx;
                     int qi = r - t;
                     int qi_rev = qlen - 1 - qi;
+
+                    // Read OLD values at position t BEFORE any writes
+                    // (these are from anti-diagonal r-1)
+                    old_x_at_t  = x_arr[t];
+                    old_v_at_t  = v_arr[t];
+                    old_x2_at_t = x2_arr[t];
 
                     // Left neighbor: for lane 0 in batch, use batch boundary
                     if (lane_id == 0) {
@@ -469,14 +482,16 @@ __global__ void ksw_fused_persistent_kernel(
                     }
                 }
 
-                // Pass boundary to next batch via register shuffle.
-                // new_x/new_v_out/new_x2 are in registers (0 for inactive lanes).
-                // Broadcast from last active lane to all lanes.
+                // Pass OLD (r-1) values at last position as boundary for next batch.
+                // The next batch's lane 0 needs x[t-1], v[t-1], x2[t-1] from
+                // anti-diagonal r-1, NOT the newly computed r values.
+                // old_x_at_t / old_v_at_t / old_x2_at_t were pre-loaded from r-1
+                // before any writes in this batch.
                 int last_lane = min(WARP_SIZE - 1, band_size - batch_start - 1);
                 if (batch_start + WARP_SIZE < band_size) {
-                    batch_x1_boundary  = __shfl_sync(0xffffffff, new_x,     last_lane);
-                    batch_v1_boundary  = __shfl_sync(0xffffffff, new_v_out, last_lane);
-                    batch_x21_boundary = __shfl_sync(0xffffffff, new_x2,    last_lane);
+                    batch_x1_boundary  = __shfl_sync(0xffffffff, old_x_at_t,  last_lane);
+                    batch_v1_boundary  = __shfl_sync(0xffffffff, old_v_at_t,  last_lane);
+                    batch_x21_boundary = __shfl_sync(0xffffffff, old_x2_at_t, last_lane);
                 }
                 __syncwarp();
 

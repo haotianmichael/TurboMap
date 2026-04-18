@@ -130,7 +130,7 @@ inline __device__ void compute_sc_seg_one_wf(const int32_t* anchors_x, const int
                                 blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg);
             if (sc == INT32_MIN) continue;
             sc += f[i];
-            if (sc > f[i+j+1]) {
+            if (sc >= f[i+j+1] && sc != MM_QSPAN) {
                 f[i+j+1] = sc;
                 p[i+j+1] = j+1;
 
@@ -171,7 +171,7 @@ inline __device__ void compute_sc_seg_multi_wf(const int32_t* anchors_x, const i
                                 blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg);
             if (sc == INT32_MIN) continue;
             sc += f[i];
-            if (sc > f[i+j+1]) {
+            if (sc >= f[i+j+1] && sc != MM_QSPAN) {
                 f[i+j+1] = sc;
                 p[i+j+1] = j+1;
 

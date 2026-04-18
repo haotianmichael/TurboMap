@@ -18,19 +18,15 @@ __device__ unsigned curr_long_segid;
 
 /* arithmetic functions begin */
 
-// __device__ static inline float cuda_mg_log2(float x) // NB: this doesn't work when x<2
-// {
-// 	union { float f; uint32_t i; } z = { x };
-// 	float log_2 = ((z.i >> 23) & 255) - 128;
-// 	z.i &= ~(255 << 23);
-// 	z.i += 127 << 23;
-// 	log_2 += (-0.34484843f * z.f + 2.02466578f) * z.f - 0.67487759f;
-// 	return log_2;
-// }
-
-__device__ static inline float cuda_mg_log2(int32_t x) // NB: this doesn't work when x<2
+// Accurate float log2 — matches CPU mg_log2().  Safe for x >= 2 (caller ensures dd+1 >= 2).
+__device__ static inline float cuda_mg_log2(float x)
 {
-    return 31 - __clz(x);
+    union { float f; uint32_t i; } z = { x };
+    float log_2 = ((z.i >> 23) & 255) - 128;
+    z.i &= ~(255 << 23);
+    z.i += 127 << 23;
+    log_2 += (-0.34484843f * z.f + 2.02466578f) * z.f - 0.67487759f;
+    return log_2;
 }
 
 __device__ int32_t original_comput_sc(const int32_t ai_x, const int32_t ai_y, const int32_t aj_x, const int32_t aj_y,
@@ -91,14 +87,14 @@ inline __device__ int32_t comput_sc(const int32_t ai_x, const int32_t ai_y, cons
     int32_t sc = MM_QSPAN < dg ? MM_QSPAN : dg;
     
     if (dd || dg > MM_QSPAN) {
-        int32_t log_pen = dd >= 1 ? (31 - __clz(dd+1)) : 0;
-        int32_t lin_pen = chn_pen_gap * (float)dd + chn_pen_skip * (float)dg;
-        // Initial conditions for modifying score based on penalties
+        // Use float throughout to match CPU comput_sc precision
+        float log_pen = dd >= 1 ? cuda_mg_log2((float)(dd + 1)) : 0.0f;
+        float lin_pen = chn_pen_gap * (float)dd + chn_pen_skip * (float)dg;
         bool minorBonus = is_cdna && !is_same_sid && dr == 0;
         bool majorAdjustment = (is_cdna && dg == dq) || !is_same_sid;
         sc += minorBonus;
-        sc -= (!minorBonus && majorAdjustment) * (int)(lin_pen < log_pen ? lin_pen : log_pen);
-        sc -= (!minorBonus && !majorAdjustment) * (int)(lin_pen + 0.5f * log_pen);
+        sc -= (!minorBonus && majorAdjustment) ? (int)(lin_pen < log_pen ? lin_pen : log_pen) : 0;
+        sc -= (!minorBonus && !majorAdjustment) ? (int)(lin_pen + 0.5f * log_pen) : 0;
     }
     return sc;
 }
@@ -134,7 +130,7 @@ inline __device__ void compute_sc_seg_one_wf(const int32_t* anchors_x, const int
                                 blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg);
             if (sc == INT32_MIN) continue;
             sc += f[i];
-            if (sc >= f[i+j+1] && sc != MM_QSPAN) {
+            if (sc > f[i+j+1]) {
                 f[i+j+1] = sc;
                 p[i+j+1] = j+1;
 
@@ -175,7 +171,7 @@ inline __device__ void compute_sc_seg_multi_wf(const int32_t* anchors_x, const i
                                 blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg);
             if (sc == INT32_MIN) continue;
             sc += f[i];
-            if (sc >= f[i+j+1] && sc != MM_QSPAN) {
+            if (sc > f[i+j+1]) {
                 f[i+j+1] = sc;
                 p[i+j+1] = j+1;
 

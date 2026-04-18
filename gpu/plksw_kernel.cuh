@@ -192,23 +192,24 @@ __global__ void ksw_fused_persistent_kernel(
         buf_offset += qlen * sizeof(uint8_t);
         uint8_t *target = (uint8_t*)(task_buf + buf_offset);
 
-        // ========== Initialization (Suzuki-Kasahara sentinels) ==========
+        // ========== Initialization (zero, matching CPU ksw2_extd2_sse convention) ==========
+        // Fresh-entry cells at t=en0 read from initialization; CPU uses 0 for neutral starts.
         for (int i = lane_id; i < tlen; i += WARP_SIZE) {
             H[i] = KSW_NEG_INF;
-            u_arr[i] = -q - e;
-            v_arr[i] = -q - e;
-            x_arr[i] = -q - e;
-            y_arr[i] = -q - e;
-            x2_arr[i] = -q2 - e2;
-            y2_arr[i] = -q2 - e2;
+            u_arr[i] = 0;
+            v_arr[i] = 0;
+            x_arr[i] = 0;
+            y_arr[i] = 0;
+            x2_arr[i] = 0;
+            y2_arr[i] = 0;
         }
         if (lane_id == 0) {
-            u_arr[tlen] = -q - e;
-            v_arr[tlen] = -q - e;
-            x_arr[tlen] = -q - e;
-            y_arr[tlen] = -q - e;
-            x2_arr[tlen] = -q2 - e2;
-            y2_arr[tlen] = -q2 - e2;
+            u_arr[tlen] = 0;
+            v_arr[tlen] = 0;
+            x_arr[tlen] = 0;
+            y_arr[tlen] = 0;
+            x2_arr[tlen] = 0;
+            y2_arr[tlen] = 0;
         }
 
         // ========== Sequence Unpacking ==========

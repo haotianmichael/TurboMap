@@ -508,8 +508,18 @@ __global__ void ksw_fused_persistent_kernel(
                         max_t_pos = 0;
                     } else {
                         int32_t H_en0_old = (en0 > 0) ? H[en0 - 1] : H[en0];
-                        max_H = KSW_NEG_INF;
-                        max_t_pos = st0;
+
+                        // Compute H[en0] FIRST, matching CPU ksw2_extd2_sse.c line 329:
+                        //   max_H = H[en0] = en0>0? H[en0-1]+u8[en0] : H[en0]+v8[en0]; max_t = en0;
+                        // This ensures the rightmost cell wins ties in max_t selection,
+                        // because the subsequent loop over st0..en0-1 uses strict >.
+                        if (en0 > 0) {
+                            H[en0] = H_en0_old + (int32_t)u_arr[en0];
+                        } else {
+                            H[en0] += (int32_t)v_arr[en0];
+                        }
+                        max_H = H[en0];
+                        max_t_pos = en0;
 
                         for (int t = st0; t < en0; ++t) {
                             H[t] += (int32_t)v_arr[t];
@@ -517,17 +527,6 @@ __global__ void ksw_fused_persistent_kernel(
                                 max_H = H[t];
                                 max_t_pos = t;
                             }
-                        }
-
-                        if (en0 > 0) {
-                            H[en0] = H_en0_old + (int32_t)u_arr[en0];
-                        } else {
-                            H[en0] += (int32_t)v_arr[en0];
-                        }
-
-                        if (H[en0] > max_H) {
-                            max_H = H[en0];
-                            max_t_pos = en0;
                         }
                     }
 

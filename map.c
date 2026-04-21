@@ -14,6 +14,24 @@
 #include "ksw2.h"
 #include <nvToolsExt.h>
 
+/* -----------------------------------------------------------------------
+ * DEBUG_CHAIN_COMPARE: compile-time flag to compare GPU-DP-chain output
+ * with CPU-RMQ-chain on the same (compacted) anchors, then skip KSW.
+ *
+ * Build with:  make CFLAGS_EXTRA=-DDEBUG_CHAIN_COMPARE
+ * or add -DDEBUG_CHAIN_COMPARE to CFLAGS in the Makefile.
+ * ----------------------------------------------------------------------- */
+#define DEBUG_CHAIN_COMPARE
+
+#ifdef DEBUG_CHAIN_COMPARE
+/* Global comparison counters (updated atomically from multiple threads). */
+static volatile long g_dbgcmp_total     = 0;  /* total reads compared     */
+static volatile long g_dbgcmp_nu_diff   = 0;  /* reads: n_chains differs  */
+static volatile long g_dbgcmp_sc_diff   = 0;  /* reads: best score differs */
+static volatile long g_dbgcmp_gpu_nu    = 0;  /* sum of GPU n_chains      */
+static volatile long g_dbgcmp_rmq_nu    = 0;  /* sum of RMQ n_chains      */
+#endif /* DEBUG_CHAIN_COMPARE */
+
 #define __AMD_SPLIT_KERNELS__ 1
 struct mm_tbuf_s {
 	void *km;
@@ -445,6 +463,91 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
 
     int i;
     mm128_v mv = {0, 0, 0};
+
+#ifdef DEBUG_CHAIN_COMPARE
+    /* ------------------------------------------------------------------
+     * Chain comparison: run CPU mg_lchain_rmq on the same compacted
+     * anchors that the GPU DP chain produced, and compare statistics.
+     *
+     * NOTE: *a contains the GPU-backtracked (compacted) anchors only —
+     * seeds that were not part of any GPU chain are already discarded.
+     * This comparison tests: given the same chainable seeds, does RMQ
+     * produce the same chains as GPU DP?
+     * ------------------------------------------------------------------ */
+    if (*n_regs0 > 0 && *a != NULL && *n_a > 0) {
+        int64_t cmp_n = *n_a;
+
+        /* Save GPU chain stats — u[] is sorted by target pos, not score;
+         * find the best-scoring chain explicitly. */
+        int gpu_n_chains = *n_regs0;
+        int gpu_best_sc  = 0;
+        int gpu_best_cnt = 0;
+        for (int _ci = 0; _ci < gpu_n_chains; _ci++) {
+            int sc  = (int)((*u)[_ci] >> 32);
+            int cnt = (int32_t)((*u)[_ci]);
+            if (sc > gpu_best_sc) { gpu_best_sc = sc; gpu_best_cnt = cnt; }
+        }
+
+        /* Deep-copy anchors for RMQ (mg_lchain_rmq consumes/frees input) */
+        mm128_t *cmp_a = (mm128_t*)malloc(cmp_n * sizeof(mm128_t));
+        memcpy(cmp_a, *a, cmp_n * sizeof(mm128_t));
+
+        /* RMQ expects anchors sorted by (x, y) — radix_sort_128x does this */
+        radix_sort_128x(cmp_a, cmp_a + cmp_n);
+
+        /* Run CPU RMQ chain */
+        int      rmq_n_chains = 0;
+        uint64_t *rmq_u       = NULL;
+        cmp_a = mg_lchain_rmq(opt->max_gap, opt->rmq_inner_dist,
+                              opt->bw, opt->max_chain_skip,
+                              opt->rmq_size_cap, opt->min_cnt,
+                              opt->min_chain_score,
+                              misc.chn_pen_gap, misc.chn_pen_skip,
+                              cmp_n, cmp_a, &rmq_n_chains, &rmq_u, NULL);
+        /* RMQ u[] also sorted by target pos — find best-scoring chain */
+        int rmq_best_sc  = 0;
+        int rmq_best_cnt = 0;
+        for (int _ci = 0; _ci < rmq_n_chains; _ci++) {
+            int sc  = (int)(rmq_u[_ci] >> 32);
+            int cnt = (int32_t)(rmq_u[_ci]);
+            if (sc > rmq_best_sc) { rmq_best_sc = sc; rmq_best_cnt = cnt; }
+        }
+
+        /* Print per-read comparison line */
+        fprintf(stderr,
+            "CHAIN_CMP\t%s\tn_anc=%ld"
+            "\tGPU_nu=%d\tGPU_sc=%d\tGPU_cnt=%d"
+            "\tRMQ_nu=%d\tRMQ_sc=%d\tRMQ_cnt=%d"
+            "\t%s\n",
+            qname, (long)cmp_n,
+            gpu_n_chains, gpu_best_sc, gpu_best_cnt,
+            rmq_n_chains, rmq_best_sc, rmq_best_cnt,
+            (gpu_n_chains == rmq_n_chains && gpu_best_sc == rmq_best_sc) ? "MATCH" : "DIFF");
+
+        /* Update global counters atomically */
+        __atomic_fetch_add(&g_dbgcmp_total,   1,             __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_dbgcmp_gpu_nu,  gpu_n_chains,  __ATOMIC_RELAXED);
+        __atomic_fetch_add(&g_dbgcmp_rmq_nu,  rmq_n_chains,  __ATOMIC_RELAXED);
+        if (gpu_n_chains != rmq_n_chains)
+            __atomic_fetch_add(&g_dbgcmp_nu_diff, 1, __ATOMIC_RELAXED);
+        if (gpu_best_sc != rmq_best_sc)
+            __atomic_fetch_add(&g_dbgcmp_sc_diff, 1, __ATOMIC_RELAXED);
+
+        /* Free RMQ outputs */
+        free(cmp_a);
+        free(rmq_u);
+    } else {
+        /* No GPU chains — still count the read */
+        fprintf(stderr,
+            "CHAIN_CMP\t%s\tn_anc=%ld\tGPU_nu=0\tGPU_sc=0\tGPU_cnt=0"
+            "\tRMQ_nu=0\tRMQ_sc=0\tRMQ_cnt=0\tMATCH\n",
+            qname, (long)*n_a);
+        __atomic_fetch_add(&g_dbgcmp_total, 1, __ATOMIC_RELAXED);
+    }
+    /* Skip the rescue / re-chain and early-return — caller will skip KSW */
+    *frag_gap = misc.max_dist_x;
+    return;
+#endif /* DEBUG_CHAIN_COMPARE */
 
     // Long-read rescue: if the best chain leaves a large query portion
     // uncovered, redo the chain with bw_long using a second mg_lchain_dp
@@ -2220,7 +2323,28 @@ static void* drain_worker_fn(void *arg) {
 
         slot->batch.count = bt_n;
         copy_rep_frag(s, &slot->batch);
+
+#ifdef DEBUG_CHAIN_COMPARE
+        /* Skip KSW alignment — free chain data and emit empty (unmapped) regs.
+         * post_chaining_helper already printed per-read CHAIN_CMP stats. */
+        for (int dbg_i = 0; dbg_i < bt_n; dbg_i++) {
+            chain_read_t *dbg_r = &slot->batch.reads[dbg_i];
+            long seq_i = dbg_r->seq.i;
+            int off    = s->seg_off[seq_i];
+            int seg_j  = dbg_r->seq.seg_id;
+            /* Emit empty result so the output pipeline doesn't hang */
+            s->n_reg[off + seg_j] = 0;
+            s->reg[off + seg_j]   = NULL;
+            /* Free chain allocations */
+            kfree(slot->batch.km, dbg_r->a);
+            kfree(slot->batch.km, dbg_r->u);
+            kfree(slot->batch.km, dbg_r->mini_pos);
+            dbg_r->a = NULL; dbg_r->u = NULL; dbg_r->mini_pos = NULL;
+        }
+#else
         prepare_align_batch_gpu(&slot->batch, wb, s, sid);
+#endif /* DEBUG_CHAIN_COMPARE */
+
         mm_trbuf_batch_reset(&slot->batch, slot->batch_max_reads, s->p->opt);
 
         // Overflow reads are handled by the consumer — put back into
@@ -2434,6 +2558,27 @@ static void* gpu_batch_consumer(void *data) {
         pthread_cond_destroy(&slots[i].cond_done);
         mm_tbuf_destroy(worker_ctxs[i].wb);
     }
+
+#ifdef DEBUG_CHAIN_COMPARE
+    /* Print aggregate chain comparison summary */
+    long tot   = g_dbgcmp_total;
+    long nudif = g_dbgcmp_nu_diff;
+    long scdif = g_dbgcmp_sc_diff;
+    long gnu   = g_dbgcmp_gpu_nu;
+    long rnu   = g_dbgcmp_rmq_nu;
+    fprintf(stderr,
+        "\n[DEBUG_CHAIN_COMPARE SUMMARY]\n"
+        "  total reads compared : %ld\n"
+        "  n_chains differs     : %ld / %ld  (%.1f%%)\n"
+        "  best score differs   : %ld / %ld  (%.1f%%)\n"
+        "  avg GPU chains/read  : %.2f\n"
+        "  avg RMQ chains/read  : %.2f\n",
+        tot,
+        nudif, tot, tot > 0 ? 100.0 * nudif / tot : 0.0,
+        scdif, tot, tot > 0 ? 100.0 * scdif / tot : 0.0,
+        tot > 0 ? (double)gnu / tot : 0.0,
+        tot > 0 ? (double)rnu / tot : 0.0);
+#endif /* DEBUG_CHAIN_COMPARE */
 
     return NULL;
 }

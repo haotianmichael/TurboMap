@@ -21,7 +21,7 @@
  * Build with:  make CFLAGS_EXTRA=-DDEBUG_CHAIN_COMPARE
  * or add -DDEBUG_CHAIN_COMPARE to CFLAGS in the Makefile.
  * ----------------------------------------------------------------------- */
-#define DEBUG_CHAIN_COMPARE
+// #define DEBUG_CHAIN_COMPARE   /* uncomment to enable GPU vs RMQ chain comparison + skip KSW */
 
 #ifdef DEBUG_CHAIN_COMPARE
 /* Global comparison counters (updated atomically from multiple threads). */

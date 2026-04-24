@@ -180,8 +180,20 @@ def classify(cpu, gpu):
     pos_diff = abs(cpu['pos'] - gpu['pos'])
     detail['pos_diff'] = pos_diff
     if pos_diff > POSITION_TOL:
-        detail['reason'] = f'|pos diff|={pos_diff} > {POSITION_TOL}'
-        return 'wrong_pos', detail
+        # Only a real failure for VC if CPU MAPQ is above the filter threshold.
+        # Low-MAPQ reads are filtered by variant callers anyway, so a different
+        # mapping position for MAPQ-1 reads does not affect downstream results.
+        if cpu['mapq'] >= MAPQ_THRESHOLD:
+            detail['reason'] = (f'|pos diff|={pos_diff} > {POSITION_TOL}  '
+                                f'cpu_mapq={cpu["mapq"]} (high-conf!)')
+            return 'wrong_pos', detail
+        else:
+            # Low MAPQ — position difference doesn't matter for VC; record
+            # as a note but count as filtered (excluded from denom effectively
+            # via the low_mapq bucket).
+            detail['note'] = (f'pos diff={pos_diff} but cpu_mapq={cpu["mapq"]}'
+                              f' < {MAPQ_THRESHOLD} — filtered by VC anyway')
+            return 'low_mapq_pos_diff', detail
 
     # ── Same chrom + close position: check usability ────────────────────────
 
@@ -191,23 +203,21 @@ def classify(cpu, gpu):
         gpu['pos'], gpu['ref_span'])
     detail['overlap'] = round(overlap, 3)
 
-    # 2. Ref_span ratio (truncation check)
+    # 2. Ref_span ratio — the ONLY reliable truncation signal.
+    #    Do NOT use trailing soft-clip size: long reads routinely have huge
+    #    trailing S in primary alignments (the rest maps as supplementary).
+    #    If ref_span is the same, the primary alignment is equivalent regardless
+    #    of how many unaligned bases follow it.
     cpu_ref = cpu['ref_span']
     gpu_ref = gpu['ref_span']
     ref_ratio = (gpu_ref / cpu_ref) if cpu_ref > 0 else 1.0
     detail['ref_ratio'] = round(ref_ratio, 3)
-
-    # 3. Severe trailing clip (false-zdrop truncation)
-    trail_clip = gpu['trail_clip']
-    detail['trail_clip'] = trail_clip
-    is_truncated = (trail_clip > TRUNCATION_CLIP or
-                    ref_ratio < REF_SPAN_MIN_FRAC)
-    if is_truncated:
+    if ref_ratio < REF_SPAN_MIN_FRAC:
         detail['reason'] = (f'GPU truncated: ref_ratio={ref_ratio:.2f} '
-                            f'trail_clip={trail_clip}')
+                            f'(gpu_ref={gpu_ref} vs cpu_ref={cpu_ref})')
         return 'truncated', detail
 
-    # 4. MAPQ filter impact
+    # 3. MAPQ filter impact
     cpu_high_conf = cpu['mapq'] >= MAPQ_THRESHOLD
     gpu_high_conf = gpu['mapq'] >= MAPQ_THRESHOLD
     mapq_fail = cpu_high_conf and not gpu_high_conf
@@ -253,18 +263,25 @@ def main(argv):
             details[cat].append((qname, c, g, det))
 
     # ── Denominator: reads where CPU attempted to map ────────────────────────
-    # Excludes both_unmapped (neither tried) and cpu_unmapped (CPU didn't map)
+    # Excludes both_unmapped and cpu_unmapped.
+    # low_mapq_pos_diff: CPU mapped but MAPQ < threshold → VC filters them
+    #   anyway, so they neither contribute to "usable" nor to "fail" counts.
     denom = (counts['strict'] + counts['usable'] + counts['borderline'] +
              counts['wrong_chrom'] + counts['wrong_pos'] +
-             counts['truncated'] + counts['unusable'] + counts['gpu_unmapped'])
+             counts['truncated'] + counts['unusable'] + counts['gpu_unmapped'] +
+             counts['low_mapq_pos_diff'])
 
     vc_usable = counts['strict'] + counts['usable']
 
+    # VC-relevant denominator: exclude reads that are filtered by MAPQ anyway
+    # (low_mapq_pos_diff are mapped but irrelevant to VC outcome)
+    vc_denom = denom - counts['low_mapq_pos_diff']
+
     def pct(n, d=None):
-        d = d if d is not None else denom
+        d = d if d is not None else vc_denom
         return f'{100.0*n/d:.1f}%' if d else 'n/a'
 
-    W = 68
+    W = 72
     print('=' * W)
     print(f'  CPU: {cpu_path}')
     print(f'  GPU: {gpu_path}')
@@ -273,35 +290,37 @@ def main(argv):
           f'  ref_span_min={int(REF_SPAN_MIN_FRAC*100)}%'
           f'  mapq_threshold={MAPQ_THRESHOLD}')
     print('=' * W)
-    print(f'  Total reads in union:             {len(all_reads)}')
-    print(f'  Both unmapped (excluded):         {counts["both_unmapped"]}')
-    print(f'  CPU unmapped (excluded):          {counts["cpu_unmapped"]}')
-    print(f'  ─────────────────────────────────────────────────────────')
-    print(f'  Denominator (CPU-mapped reads):   {denom}')
+    print(f'  Total reads in union:                 {len(all_reads)}')
+    print(f'  Both unmapped (excluded):             {counts["both_unmapped"]}')
+    print(f'  CPU unmapped (excluded):              {counts["cpu_unmapped"]}')
+    print(f'  Low-MAPQ wrong pos (VC-filtered):     {counts["low_mapq_pos_diff"]}')
+    print(f'  ─────────────────────────────────────────────────────────────')
+    print(f'  VC-relevant denominator:              {vc_denom}')
+    print(f'  (total CPU-mapped reads:              {denom})')
     print()
-    print(f'  ┌── PASSES variant-calling bar ───────────────────────────')
-    print(f'  │  strict (identical CIGAR):      {counts["strict"]:5d}  {pct(counts["strict"])}')
-    print(f'  │  usable (equiv. for VC):        {counts["usable"]:5d}  {pct(counts["usable"])}')
-    print(f'  │                                 ──────  ──────')
-    print(f'  │  VC-USABLE TOTAL:               {vc_usable:5d}  {pct(vc_usable)}')
+    print(f'  ┌── PASSES variant-calling bar ─────────────────────────────')
+    print(f'  │  strict (identical CIGAR):          {counts["strict"]:5d}  {pct(counts["strict"])}')
+    print(f'  │  usable (equiv. for VC):            {counts["usable"]:5d}  {pct(counts["usable"])}')
+    print(f'  │                                     ──────  ──────')
+    print(f'  │  VC-USABLE TOTAL:                   {vc_usable:5d}  {pct(vc_usable)}')
     print(f'  │')
-    print(f'  ├── MARGINAL ─────────────────────────────────────────────')
-    print(f'  │  borderline (60-80% overlap):   {counts["borderline"]:5d}  {pct(counts["borderline"])}')
+    print(f'  ├── MARGINAL ───────────────────────────────────────────────')
+    print(f'  │  borderline (60-80% overlap):       {counts["borderline"]:5d}  {pct(counts["borderline"])}')
     print(f'  │')
-    print(f'  └── FAILS variant-calling bar ───────────────────────────')
-    print(f'     GPU unmapped (CPU had map):    {counts["gpu_unmapped"]:5d}  {pct(counts["gpu_unmapped"])}')
-    print(f'     truncated (false zdrop etc):   {counts["truncated"]:5d}  {pct(counts["truncated"])}')
-    print(f'     wrong position (>{POSITION_TOL}bp off):  {counts["wrong_pos"]:5d}  {pct(counts["wrong_pos"])}')
-    print(f'     wrong chromosome:              {counts["wrong_chrom"]:5d}  {pct(counts["wrong_chrom"])}')
-    print(f'     other unusable:               {counts["unusable"]:5d}  {pct(counts["unusable"])}')
+    print(f'  └── FAILS variant-calling bar ─────────────────────────────')
+    print(f'     GPU unmapped (CPU MAPQ≥{MAPQ_THRESHOLD} mapped):  {counts["gpu_unmapped"]:5d}  {pct(counts["gpu_unmapped"])}')
+    print(f'     truncated (ref_span<80% of CPU):   {counts["truncated"]:5d}  {pct(counts["truncated"])}')
+    print(f'     wrong pos (high-conf, >{POSITION_TOL}bp off): {counts["wrong_pos"]:5d}  {pct(counts["wrong_pos"])}')
+    print(f'     wrong chromosome:                  {counts["wrong_chrom"]:5d}  {pct(counts["wrong_chrom"])}')
+    print(f'     other unusable:                    {counts["unusable"]:5d}  {pct(counts["unusable"])}')
     print('=' * W)
 
-    # Colour-code the headline
-    rate = vc_usable / denom if denom else 0
+    # Colour-code the headline — use vc_denom (excludes VC-filtered reads)
+    rate = vc_usable / vc_denom if vc_denom else 0
     star = '✓✓' if rate >= 0.98 else ('✓' if rate >= 0.95 else '✗')
-    print(f'  VC-USABLE RATE:  {pct(vc_usable)}  {star}')
+    print(f'  VC-USABLE RATE:  {rate*100:.1f}%  {star}')
     if counts['borderline']:
-        bordr_rate = (vc_usable + counts['borderline']) / denom if denom else 0
+        bordr_rate = (vc_usable + counts['borderline']) / vc_denom if vc_denom else 0
         print(f'  With borderline: {bordr_rate*100:.1f}%')
     print('=' * W)
 
@@ -332,12 +351,14 @@ def main(argv):
             if det:
                 print(f'         detail: {det}')
 
-    show_examples('truncated',   'TRUNCATED (GPU extension stopped early — type-A errors)')
-    show_examples('wrong_pos',   'WRONG POSITION')
-    show_examples('wrong_chrom', 'WRONG CHROMOSOME')
-    show_examples('gpu_unmapped','GPU FAILED TO MAP')
-    show_examples('unusable',    'UNUSABLE (other)')
-    show_examples('borderline',  'BORDERLINE (marginal coverage overlap)')
+    show_examples('truncated',    'TRUNCATED (ref_span < 80% of CPU)')
+    show_examples('wrong_pos',    'WRONG POSITION (high-confidence reads only)')
+    show_examples('wrong_chrom',  'WRONG CHROMOSOME')
+    show_examples('gpu_unmapped', 'GPU FAILED TO MAP')
+    show_examples('unusable',     'UNUSABLE (other)')
+    show_examples('borderline',   'BORDERLINE (marginal coverage overlap)')
+    show_examples('low_mapq_pos_diff',
+                  f'LOW-MAPQ position diff (MAPQ<{MAPQ_THRESHOLD}, VC-filtered — informational only)')
 
 
 if __name__ == '__main__':

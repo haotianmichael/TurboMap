@@ -1,95 +1,81 @@
 #!/usr/bin/env python3
 """
-Compare two SAM files (CPU minimap2 reference vs GPU TurboMap) and report
-precision with a tolerant metric that treats DP tie-break differences as
-equivalent alignments.
+Evaluate GPU BAM/SAM usability for downstream variant calling vs CPU reference.
 
 Usage:
     python diff.py <cpu.sam> <gpu.sam>
-    python diff.py minimap.sam test.sam
+    python diff.py minimap.sam turbomap.sam
 
-Definitions:
-    A "tie-break" occurs when multiple DP traceback paths yield the same
-    optimal score — the two aligners land on the same locus, consume the
-    same reference and query spans, but pick slightly different CIGAR ops
-    internally. Such alignments are biologically equivalent: they cover
-    the same bases on the genome. This script counts them as matches.
+This script answers the practical question: "Will substituting the GPU-produced
+alignments for the CPU-produced ones affect variant calling?"  It does NOT
+require identical CIGAR strings — it uses the criteria that actual variant
+callers (GATK HaplotypeCaller, DeepVariant, bcftools call) care about.
 
-    Strict match (exact CIGAR equality) is also reported separately so
-    you can see how many reads are byte-identical.
+Variant-calling usability criteria
+------------------------------------
+A GPU alignment is USABLE when ALL of the following hold:
 
-Categories per primary alignment pair (matched by QNAME):
+  1. Same chromosome (RNAME)
+  2. Start position within POSITION_TOL bp  (default 50)
+  3. Genomic coverage overlap >= OVERLAP_MIN  (default 80%)
+     overlap = intersection of [pos, pos+ref_span) intervals / union
+  4. GPU MAPQ passes the standard filter:
+       - if CPU MAPQ >= MAPQ_THRESHOLD: GPU MAPQ must also be >= MAPQ_THRESHOLD
+       - if CPU MAPQ <  MAPQ_THRESHOLD: any GPU MAPQ accepted
+  5. Alignment is not severely truncated:
+       GPU ref_span >= REF_SPAN_MIN_FRAC * CPU ref_span  (default 0.80)
 
-    - strict:          RNAME + POS + CIGAR all identical
-    - tiebreak:        same RNAME + POS + ref_span + query_span,
-                       NM difference within tolerance (default 5%),
-                       but CIGAR string differs
-    - drifted:         same RNAME + POS but the alignment shape differs
-                       substantially (ref_span differs, or NM drift > 5%)
-    - truncated:       same RNAME + POS, GPU ends early (trailing
-                       soft-clip > 1000 bp or ref_span shortfall > 20%)
-    - wrong_pos:       same RNAME, POS differs by > 100 bp
-    - wrong_chrom:     RNAME differs
-    - gpu_unmapped:    mapped in CPU, unmapped in GPU
-    - cpu_unmapped:    unmapped in CPU, mapped in GPU
-    - both_unmapped:   unmapped in both
+A GPU alignment is BORDERLINE when the chromosome and position match but
+one of criteria 3-5 fails modestly (overlap 60-80% or ref_span 60-80%).
 
-Two headline numbers:
+Everything else is UNUSABLE.
 
-    Strict accuracy  = strict / (strict + tiebreak + drifted + truncated
-                                 + wrong_pos + wrong_chrom + gpu_unmapped)
-    Effective accuracy = (strict + tiebreak) / (same denominator)
+A separate "strict" count tracks reads where RNAME+POS+CIGAR are identical.
 
-Effective accuracy is the real-world precision: it credits GPU for
-producing biologically equivalent alignments even when the CIGAR string
-does not match CPU byte-for-byte.
+Headline metric
+---------------
+  VC-usable rate = (USABLE + STRICT) / (reads where CPU produced a mapping)
+
+This is the fraction of CPU-mapped reads the GPU handles well enough for
+variant calling.  It should be >= 95% to consider the GPU pipeline production-
+ready.
+
+Report also breaks out WHY reads are UNUSABLE so you know where to focus.
 """
 
 import sys
 import re
 from collections import defaultdict
 
+# ─── Tuneable thresholds ────────────────────────────────────────────────────
+POSITION_TOL      = 50      # bp: max allowed start-position difference
+OVERLAP_MIN       = 0.80    # 80% reciprocal overlap in reference span
+REF_SPAN_MIN_FRAC = 0.80    # GPU ref_span must be >= 80% of CPU ref_span
+MAPQ_THRESHOLD    = 20      # standard variant-caller filter
+TRUNCATION_CLIP   = 500     # trailing soft-clip (bp) → truncated
+BORDERLINE_OVERLAP= 0.60    # below this overlap is always UNUSABLE
+# ────────────────────────────────────────────────────────────────────────────
+
 CIGAR_RE = re.compile(r'(\d+)([MIDNSHP=X])')
-
-# Reference-consuming ops: M, D, N, =, X
-REF_OPS = set('MDN=X')
-# Query-consuming ops: M, I, S, =, X
+REF_OPS   = set('MDN=X')
 QUERY_OPS = set('MIS=X')
-# Match-ish ops (count toward aligned length)
-ALIGNED_OPS = set('MID=X')
-
-NM_TOLERANCE = 0.05         # 5% NM drift still counted as tie-break
-TRUNCATION_CLIP = 1000      # trailing soft-clip threshold in bp
-TRUNCATION_REF_FRAC = 0.20  # ref_span shortfall fraction for truncation
-POS_TOLERANCE = 100         # bp - "same POS" within this many bases
 
 
 def parse_cigar(cigar):
-    """Return list of (length, op) tuples. Empty for '*'."""
     if cigar == '*' or not cigar:
         return []
     return [(int(n), op) for n, op in CIGAR_RE.findall(cigar)]
 
 
 def cigar_spans(ops):
-    """Return (ref_span, query_span, aligned_len, leading_clip, trailing_clip)."""
-    ref_span = 0
-    query_span = 0
-    aligned = 0
-    for n, op in ops:
-        if op in REF_OPS:
-            ref_span += n
-        if op in QUERY_OPS and op != 'S':
-            query_span += n
-        if op in ALIGNED_OPS:
-            aligned += n
-    leading = ops[0][0] if ops and ops[0][1] == 'S' else 0
-    trailing = ops[-1][0] if ops and ops[-1][1] == 'S' else 0
-    return ref_span, query_span, aligned, leading, trailing
+    """Return (ref_span, query_span, trailing_soft_clip)."""
+    ref_span  = sum(n for n, op in ops if op in REF_OPS)
+    qry_span  = sum(n for n, op in ops if op in QUERY_OPS and op != 'S')
+    trail_clip = ops[-1][0] if ops and ops[-1][1] == 'S' else 0
+    return ref_span, qry_span, trail_clip
 
 
 def parse_nm(fields):
-    """Extract NM tag value from SAM optional fields. Returns None if absent."""
     for f in fields[11:]:
         if f.startswith('NM:i:'):
             try:
@@ -99,11 +85,21 @@ def parse_nm(fields):
     return None
 
 
+def interval_overlap_frac(pos_a, span_a, pos_b, span_b):
+    """Intersection / Union of two 0-based half-open intervals."""
+    if span_a <= 0 or span_b <= 0:
+        return 0.0
+    end_a = pos_a + span_a
+    end_b = pos_b + span_b
+    inter = max(0, min(end_a, end_b) - max(pos_a, pos_b))
+    union = max(end_a, end_b) - min(pos_a, pos_b)
+    return inter / union if union > 0 else 0.0
+
+
 def parse_sam(path):
     """
-    Return {qname: primary_record} where primary_record is a dict or None
-    (unmapped). Only primary alignments (FLAG & 0x900 == 0) are kept —
-    supplementary and secondary are skipped.
+    Return {qname: primary_record}.
+    Only primary alignments (FLAG & 0x900 == 0) are kept.
     """
     primaries = {}
     with open(path) as f:
@@ -114,172 +110,234 @@ def parse_sam(path):
             if len(fields) < 11:
                 continue
             qname = fields[0]
-            flag = int(fields[1])
-            # Skip supplementary (0x800) and secondary (0x100)
-            if flag & 0x900:
+            flag  = int(fields[1])
+            if flag & 0x900:   # skip supplementary / secondary
                 continue
-            rname = fields[2]
-            pos = int(fields[3])
-            mapq = int(fields[4])
-            cigar = fields[5]
-            nm = parse_nm(fields)
-            is_unmapped = bool(flag & 0x4)
-            ops = parse_cigar(cigar)
-            ref_span, qry_span, aligned, lead_clip, trail_clip = cigar_spans(ops)
             if qname in primaries:
-                # Duplicate primary — shouldn't happen, keep first
-                continue
+                continue       # keep first primary
+            rname    = fields[2]
+            pos      = int(fields[3])   # 1-based
+            mapq     = int(fields[4])
+            cigar    = fields[5]
+            nm       = parse_nm(fields)
+            unmapped = bool(flag & 0x4)
+            ops      = parse_cigar(cigar)
+            ref_span, qry_span, trail_clip = cigar_spans(ops)
             primaries[qname] = dict(
-                flag=flag,
-                rname=rname,
-                pos=pos,
-                mapq=mapq,
-                cigar=cigar,
-                nm=nm,
-                unmapped=is_unmapped,
-                ref_span=ref_span,
-                qry_span=qry_span,
-                aligned=aligned,
-                lead_clip=lead_clip,
+                rname=rname, pos=pos, mapq=mapq, cigar=cigar,
+                nm=nm, unmapped=unmapped,
+                ref_span=ref_span, qry_span=qry_span,
                 trail_clip=trail_clip,
             )
     return primaries
 
 
 def classify(cpu, gpu):
-    """Classify a matched pair of primary alignments."""
-    if cpu is None and gpu is None:
-        return 'both_unmapped'
+    """
+    Return (category, detail_flags) for a CPU/GPU primary alignment pair.
+
+    Categories:
+        both_unmapped   – both unmapped (agreement, excluded from denominator)
+        cpu_unmapped    – CPU did not map; GPU may or may not have
+        gpu_unmapped    – CPU mapped, GPU reported unmapped
+        strict          – identical RNAME + POS + CIGAR
+        usable          – passes all VC-usability criteria (see module doc)
+        borderline      – same chrom+pos but coverage overlap 60-80%
+        wrong_chrom     – different chromosome
+        wrong_pos       – same chrom, |pos diff| > POSITION_TOL
+        truncated       – same chrom+pos, GPU severely truncated
+        unusable        – same chrom+pos but fails VC criteria
+    """
+    detail = {}
+
     if cpu is None:
-        return 'cpu_unmapped'      # only in gpu SAM's read set
+        return 'cpu_unmapped', detail
     if gpu is None:
-        return 'gpu_only_missing'  # read not emitted by gpu at all
+        detail['reason'] = 'missing from GPU SAM'
+        return 'unusable', detail
+
     if cpu['unmapped'] and gpu['unmapped']:
-        return 'both_unmapped'
-    if not cpu['unmapped'] and gpu['unmapped']:
-        return 'gpu_unmapped'
-    if cpu['unmapped'] and not gpu['unmapped']:
-        return 'cpu_unmapped'
+        return 'both_unmapped', detail
+    if cpu['unmapped']:
+        return 'cpu_unmapped', detail
+    if gpu['unmapped']:
+        detail['reason'] = 'GPU unmapped'
+        return 'gpu_unmapped', detail
 
-    # Both mapped: compare loci
+    # ── Strict identical ────────────────────────────────────────────────────
+    if (cpu['rname'] == gpu['rname'] and
+            cpu['pos']   == gpu['pos'] and
+            cpu['cigar'] == gpu['cigar']):
+        return 'strict', detail
+
+    # ── Chromosome ──────────────────────────────────────────────────────────
     if cpu['rname'] != gpu['rname']:
-        return 'wrong_chrom'
-    if abs(cpu['pos'] - gpu['pos']) > POS_TOLERANCE:
-        return 'wrong_pos'
+        detail['cpu_rname'] = cpu['rname']
+        detail['gpu_rname'] = gpu['rname']
+        return 'wrong_chrom', detail
 
-    # Same locus — now compare alignment shape
-    if cpu['cigar'] == gpu['cigar']:
-        return 'strict'
+    # ── Position ────────────────────────────────────────────────────────────
+    pos_diff = abs(cpu['pos'] - gpu['pos'])
+    detail['pos_diff'] = pos_diff
+    if pos_diff > POSITION_TOL:
+        detail['reason'] = f'|pos diff|={pos_diff} > {POSITION_TOL}'
+        return 'wrong_pos', detail
 
-    # Check for truncation first — GPU ending significantly earlier
+    # ── Same chrom + close position: check usability ────────────────────────
+
+    # 1. Genomic overlap
+    overlap = interval_overlap_frac(
+        cpu['pos'], cpu['ref_span'],
+        gpu['pos'], gpu['ref_span'])
+    detail['overlap'] = round(overlap, 3)
+
+    # 2. Ref_span ratio (truncation check)
     cpu_ref = cpu['ref_span']
     gpu_ref = gpu['ref_span']
-    if cpu_ref > 0:
-        shortfall = (cpu_ref - gpu_ref) / cpu_ref
+    ref_ratio = (gpu_ref / cpu_ref) if cpu_ref > 0 else 1.0
+    detail['ref_ratio'] = round(ref_ratio, 3)
+
+    # 3. Severe trailing clip (false-zdrop truncation)
+    trail_clip = gpu['trail_clip']
+    detail['trail_clip'] = trail_clip
+    is_truncated = (trail_clip > TRUNCATION_CLIP or
+                    ref_ratio < REF_SPAN_MIN_FRAC)
+    if is_truncated:
+        detail['reason'] = (f'GPU truncated: ref_ratio={ref_ratio:.2f} '
+                            f'trail_clip={trail_clip}')
+        return 'truncated', detail
+
+    # 4. MAPQ filter impact
+    cpu_high_conf = cpu['mapq'] >= MAPQ_THRESHOLD
+    gpu_high_conf = gpu['mapq'] >= MAPQ_THRESHOLD
+    mapq_fail = cpu_high_conf and not gpu_high_conf
+    detail['cpu_mapq'] = cpu['mapq']
+    detail['gpu_mapq'] = gpu['mapq']
+
+    # 5. Final usability decision
+    if overlap >= OVERLAP_MIN and not mapq_fail:
+        return 'usable', detail
+    elif overlap >= BORDERLINE_OVERLAP and not mapq_fail:
+        detail['reason'] = f'overlap={overlap:.2f} between 60-80%'
+        return 'borderline', detail
     else:
-        shortfall = 0.0
-    if gpu['trail_clip'] > TRUNCATION_CLIP or shortfall > TRUNCATION_REF_FRAC:
-        return 'truncated'
-
-    # Same locus, similar extent — is it a tie-break?
-    same_ref_span = cpu['ref_span'] == gpu['ref_span']
-    same_qry_span = cpu['qry_span'] == gpu['qry_span']
-    nm_ok = True
-    if cpu['nm'] is not None and gpu['nm'] is not None:
-        if cpu['nm'] == 0 and gpu['nm'] == 0:
-            nm_ok = True
-        else:
-            denom = max(1, cpu['nm'])
-            nm_ok = abs(gpu['nm'] - cpu['nm']) / denom <= NM_TOLERANCE
-
-    if same_ref_span and same_qry_span and nm_ok:
-        return 'tiebreak'
-    return 'drifted'
+        reasons = []
+        if overlap < BORDERLINE_OVERLAP:
+            reasons.append(f'overlap={overlap:.2f} < {BORDERLINE_OVERLAP}')
+        if mapq_fail:
+            reasons.append(f'MAPQ drop {cpu["mapq"]}→{gpu["mapq"]} (threshold={MAPQ_THRESHOLD})')
+        detail['reason'] = '; '.join(reasons)
+        return 'unusable', detail
 
 
 def main(argv):
     if len(argv) != 3:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
+
     cpu_path, gpu_path = argv[1], argv[2]
-    cpu = parse_sam(cpu_path)
-    gpu = parse_sam(gpu_path)
+    cpu_recs = parse_sam(cpu_path)
+    gpu_recs = parse_sam(gpu_path)
 
-    all_reads = set(cpu) | set(gpu)
-    counts = defaultdict(int)
-    examples = defaultdict(list)
+    all_reads = set(cpu_recs) | set(gpu_recs)
+    counts  = defaultdict(int)
+    details = defaultdict(list)   # {category: [(qname, cpu, gpu, detail), ...]}
+    MAX_EX  = 5
 
-    for qname in all_reads:
-        c = cpu.get(qname)
-        g = gpu.get(qname)
-        cat = classify(c, g)
+    for qname in sorted(all_reads):
+        c = cpu_recs.get(qname)
+        g = gpu_recs.get(qname)
+        cat, det = classify(c, g)
         counts[cat] += 1
-        if len(examples[cat]) < 3:
-            examples[cat].append((qname, c, g))
+        if len(details[cat]) < MAX_EX:
+            details[cat].append((qname, c, g, det))
 
-    total = sum(counts.values())
-    mapped_denom = (total
-                    - counts['both_unmapped']
-                    - counts['cpu_unmapped']
-                    - counts['gpu_only_missing'])
+    # ── Denominator: reads where CPU attempted to map ────────────────────────
+    # Excludes both_unmapped (neither tried) and cpu_unmapped (CPU didn't map)
+    denom = (counts['strict'] + counts['usable'] + counts['borderline'] +
+             counts['wrong_chrom'] + counts['wrong_pos'] +
+             counts['truncated'] + counts['unusable'] + counts['gpu_unmapped'])
 
-    strict = counts['strict']
-    tiebreak = counts['tiebreak']
-    effective = strict + tiebreak
+    vc_usable = counts['strict'] + counts['usable']
 
-    def pct(n, d):
-        return f'{100.0*n/d:.2f}%' if d else 'n/a'
+    def pct(n, d=None):
+        d = d if d is not None else denom
+        return f'{100.0*n/d:.1f}%' if d else 'n/a'
 
-    print('=' * 68)
-    print(f'CPU file: {cpu_path}')
-    print(f'GPU file: {gpu_path}')
-    print('=' * 68)
-    print(f'Total reads compared:              {total}')
-    print(f'  both unmapped (agree, no op):    {counts["both_unmapped"]}')
-    print(f'  only in GPU SAM (no CPU entry):  {counts["cpu_unmapped"]}')
-    print(f'  missing from GPU SAM:            {counts["gpu_only_missing"]}')
+    W = 68
+    print('=' * W)
+    print(f'  CPU: {cpu_path}')
+    print(f'  GPU: {gpu_path}')
+    print('=' * W)
+    print(f'  Thresholds: pos_tol={POSITION_TOL}bp  overlap_min={int(OVERLAP_MIN*100)}%'
+          f'  ref_span_min={int(REF_SPAN_MIN_FRAC*100)}%'
+          f'  mapq_threshold={MAPQ_THRESHOLD}')
+    print('=' * W)
+    print(f'  Total reads in union:             {len(all_reads)}')
+    print(f'  Both unmapped (excluded):         {counts["both_unmapped"]}')
+    print(f'  CPU unmapped (excluded):          {counts["cpu_unmapped"]}')
+    print(f'  ─────────────────────────────────────────────────────────')
+    print(f'  Denominator (CPU-mapped reads):   {denom}')
     print()
-    print(f'Denominator (CPU attempted to map): {mapped_denom}')
-    print('-' * 68)
-    print(f'  strict (identical CIGAR):        {strict:5d}  ({pct(strict, mapped_denom)})')
-    print(f'  tiebreak-equivalent:             {tiebreak:5d}  ({pct(tiebreak, mapped_denom)})')
-    print(f'  drifted (same locus, shape diff):{counts["drifted"]:5d}  ({pct(counts["drifted"], mapped_denom)})')
-    print(f'  truncated (GPU extension early): {counts["truncated"]:5d}  ({pct(counts["truncated"], mapped_denom)})')
-    print(f'  wrong POS (>{POS_TOLERANCE} bp off):          {counts["wrong_pos"]:5d}  ({pct(counts["wrong_pos"], mapped_denom)})')
-    print(f'  wrong chromosome:                {counts["wrong_chrom"]:5d}  ({pct(counts["wrong_chrom"], mapped_denom)})')
-    print(f'  GPU failed to map:               {counts["gpu_unmapped"]:5d}  ({pct(counts["gpu_unmapped"], mapped_denom)})')
-    print('=' * 68)
-    print(f'  Strict accuracy:     {pct(strict, mapped_denom)}')
-    print(f'  Effective accuracy:  {pct(effective, mapped_denom)}'
-          f'   <-- real-world precision (tolerates tie-break)')
-    print('=' * 68)
+    print(f'  ┌── PASSES variant-calling bar ───────────────────────────')
+    print(f'  │  strict (identical CIGAR):      {counts["strict"]:5d}  {pct(counts["strict"])}')
+    print(f'  │  usable (equiv. for VC):        {counts["usable"]:5d}  {pct(counts["usable"])}')
+    print(f'  │                                 ──────  ──────')
+    print(f'  │  VC-USABLE TOTAL:               {vc_usable:5d}  {pct(vc_usable)}')
+    print(f'  │')
+    print(f'  ├── MARGINAL ─────────────────────────────────────────────')
+    print(f'  │  borderline (60-80% overlap):   {counts["borderline"]:5d}  {pct(counts["borderline"])}')
+    print(f'  │')
+    print(f'  └── FAILS variant-calling bar ───────────────────────────')
+    print(f'     GPU unmapped (CPU had map):    {counts["gpu_unmapped"]:5d}  {pct(counts["gpu_unmapped"])}')
+    print(f'     truncated (false zdrop etc):   {counts["truncated"]:5d}  {pct(counts["truncated"])}')
+    print(f'     wrong position (>{POSITION_TOL}bp off):  {counts["wrong_pos"]:5d}  {pct(counts["wrong_pos"])}')
+    print(f'     wrong chromosome:              {counts["wrong_chrom"]:5d}  {pct(counts["wrong_chrom"])}')
+    print(f'     other unusable:               {counts["unusable"]:5d}  {pct(counts["unusable"])}')
+    print('=' * W)
 
-    # Show a few examples for the actionable failure buckets
-    def show(cat, label):
-        if not examples[cat]:
+    # Colour-code the headline
+    rate = vc_usable / denom if denom else 0
+    star = '✓✓' if rate >= 0.98 else ('✓' if rate >= 0.95 else '✗')
+    print(f'  VC-USABLE RATE:  {pct(vc_usable)}  {star}')
+    if counts['borderline']:
+        bordr_rate = (vc_usable + counts['borderline']) / denom if denom else 0
+        print(f'  With borderline: {bordr_rate*100:.1f}%')
+    print('=' * W)
+
+    # ── Per-category examples ────────────────────────────────────────────────
+    def show_examples(cat, label):
+        if not details[cat]:
             return
         print()
-        print(f'--- {label} examples ({counts[cat]} total) ---')
-        for qname, c, g in examples[cat]:
-            print(f'  {qname}')
-            if c:
-                print(f'    CPU: {c["rname"]}:{c["pos"]} ref={c["ref_span"]} '
-                      f'NM={c["nm"]} MAPQ={c["mapq"]}')
-                print(f'         CIGAR[:120]={c["cigar"][:120]}')
+        print(f'--- {label} ({counts[cat]} total, showing ≤{MAX_EX}) ---')
+        for qname, c, g, det in details[cat]:
+            print(f'  read: {qname}')
+            if c and not c['unmapped']:
+                print(f'    CPU  {c["rname"]}:{c["pos"]}  ref_span={c["ref_span"]}  '
+                      f'MAPQ={c["mapq"]}  NM={c["nm"]}')
+                print(f'         CIGAR={c["cigar"][:100]}')
+            elif c:
+                print('    CPU  <unmapped>')
             else:
-                print('    CPU: <missing>')
-            if g:
-                print(f'    GPU: {g["rname"]}:{g["pos"]} ref={g["ref_span"]} '
-                      f'NM={g["nm"]} MAPQ={g["mapq"]}')
-                print(f'         CIGAR[:120]={g["cigar"][:120]}')
+                print('    CPU  <absent>')
+            if g and not g['unmapped']:
+                print(f'    GPU  {g["rname"]}:{g["pos"]}  ref_span={g["ref_span"]}  '
+                      f'MAPQ={g["mapq"]}  NM={g["nm"]}')
+                print(f'         CIGAR={g["cigar"][:100]}')
+            elif g:
+                print('    GPU  <unmapped>')
             else:
-                print('    GPU: <missing>')
+                print('    GPU  <absent>')
+            if det:
+                print(f'         detail: {det}')
 
-    show('truncated', 'Truncated (GPU extension stopped early)')
-    show('drifted', 'Drifted (same locus, substantial shape difference)')
-    show('wrong_pos', 'Wrong POS')
-    show('wrong_chrom', 'Wrong chromosome')
-    show('gpu_unmapped', 'GPU failed to map')
+    show_examples('truncated',   'TRUNCATED (GPU extension stopped early — type-A errors)')
+    show_examples('wrong_pos',   'WRONG POSITION')
+    show_examples('wrong_chrom', 'WRONG CHROMOSOME')
+    show_examples('gpu_unmapped','GPU FAILED TO MAP')
+    show_examples('unusable',    'UNUSABLE (other)')
+    show_examples('borderline',  'BORDERLINE (marginal coverage overlap)')
 
 
 if __name__ == '__main__':

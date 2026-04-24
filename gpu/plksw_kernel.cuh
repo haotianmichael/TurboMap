@@ -192,24 +192,31 @@ __global__ void ksw_fused_persistent_kernel(
         buf_offset += qlen * sizeof(uint8_t);
         uint8_t *target = (uint8_t*)(task_buf + buf_offset);
 
-        // ========== Initialization (zero, matching CPU ksw2_extd2_sse convention) ==========
-        // Fresh-entry cells at t=en0 read from initialization; CPU uses 0 for neutral starts.
+        // ========== Initialization (matching CPU ksw2_extd2_sse.c memset convention) ==========
+        // CPU does: memset(u,-q-e,tlen_*16); memset(v,-q-e,...); memset(x,-q-e,...); memset(y,-q-e,...);
+        //           memset(x2,-q2-e2,...); memset(y2,-q2-e2,...);
+        // When st0 decreases (band expands left), new positions entering the band for the first
+        // time read their delta values from these arrays.  Initializing to 0 instead of -(q+e)
+        // makes those boundary cells look like they came from a gap-free predecessor, inflating H,
+        // inflating ez_max, and causing false zdrop triggers.  Fix: match CPU's memset values.
+        int8_t neg_qe  = (int8_t)(-(int)(q + e));
+        int8_t neg_qe2 = (int8_t)(-(int)(q2 + e2));
         for (int i = lane_id; i < tlen; i += WARP_SIZE) {
             H[i] = KSW_NEG_INF;
-            u_arr[i] = 0;
-            v_arr[i] = 0;
-            x_arr[i] = 0;
-            y_arr[i] = 0;
-            x2_arr[i] = 0;
-            y2_arr[i] = 0;
+            u_arr[i] = neg_qe;
+            v_arr[i] = neg_qe;
+            x_arr[i] = neg_qe;
+            y_arr[i] = neg_qe;
+            x2_arr[i] = neg_qe2;
+            y2_arr[i] = neg_qe2;
         }
         if (lane_id == 0) {
-            u_arr[tlen] = 0;
-            v_arr[tlen] = 0;
-            x_arr[tlen] = 0;
-            y_arr[tlen] = 0;
-            x2_arr[tlen] = 0;
-            y2_arr[tlen] = 0;
+            u_arr[tlen] = neg_qe;
+            v_arr[tlen] = neg_qe;
+            x_arr[tlen] = neg_qe;
+            y_arr[tlen] = neg_qe;
+            x2_arr[tlen] = neg_qe2;
+            y2_arr[tlen] = neg_qe2;
         }
 
         // ========== Sequence Unpacking ==========

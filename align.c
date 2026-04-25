@@ -1382,8 +1382,12 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
             // tseq buffer) or qe > qlen (overflows qseq0). Check before any
             // sequence operations.
             if (re <= rs || qe <= qs) {
-                if (re > rs) rs = re;
-                if (qe > qs) qs = qe;
+                // Anchor coordinates go backward in ref or query (can happen
+                // with voting-recombined anchors).  Skip this anchor entirely
+                // without advancing rs or qs: the next valid anchor's task will
+                // cover the accumulated range including this skipped position.
+                // BUG-FIX: previously "qs = qe" here silently ate up to ~13 kbp
+                // of query bases without creating a CIGAR task for them.
                 continue;
             }
             if (re > re0 || qe > qlen) {

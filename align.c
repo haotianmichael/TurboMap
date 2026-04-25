@@ -1368,16 +1368,45 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     re1 = rs, qe1 = qs;
 
     // Gap filling
+    // DEBUG: track previous qs to detect unexplained jumps
+    int _dbg_qs_prev = qs;
     for (i = is_sr? cnt1 - 1 : 1; i < cnt1; ++i) {
-        if ((a[as1+i].y & (MM_SEED_IGNORE|MM_SEED_TANDEM)) && i != cnt1 - 1) continue;
+        // DEBUG: print iteration state when a large qs jump is detected
+        // (fires at most once per region, only for problematic cases)
+        if (qs - _dbg_qs_prev > 5000) {
+            fprintf(stderr, "[GF_JUMP] read=%d reg=%d qs jumped %d->%d at i=%d "
+                    "(re=%d rs=%d qe=%d re0=%d qlen=%d cnt1=%d)\n",
+                    read_idx, reg_idx, _dbg_qs_prev, qs, i,
+                    re, rs, qe, re0, qlen, cnt1);
+        }
+        _dbg_qs_prev = qs;
+
+        int _dbg_flags = (int)(a[as1+i].y >> 32 & 0xff);
+        int _dbg_ignore = !!(a[as1+i].y & (MM_SEED_IGNORE|MM_SEED_TANDEM));
+        int _dbg_re_before = re, _dbg_qe_before = qe;
+
+        if ((a[as1+i].y & (MM_SEED_IGNORE|MM_SEED_TANDEM)) && i != cnt1 - 1) {
+            fprintf(stderr, "[GF_ITER] read=%d reg=%d i=%d IGNORE/TANDEM re=%d rs=%d qe=%d qs=%d\n",
+                    read_idx, reg_idx, i, re, rs, qe, qs);
+            continue;
+        }
         if (is_sr && !(mi->flag & MM_I_HPC)) {
             re = (int32_t)a[as1 + i].x + 1;
             qe = (int32_t)a[as1 + i].y + 1;
         } else mm_adjust_minier(mi, qseq0, &a[as1 + i], &re, &qe);
         re1 = re, qe1 = qe;
-        
-        if (i == cnt1 - 1 || (a[as1+i].y&MM_SEED_LONG_JOIN) || 
-            (qe - qs >= opt->min_ksw_len && re - rs >= opt->min_ksw_len)) {
+
+        int _dbg_cond = (i == cnt1 - 1 || (a[as1+i].y&MM_SEED_LONG_JOIN) ||
+                         (qe - qs >= opt->min_ksw_len && re - rs >= opt->min_ksw_len));
+        fprintf(stderr, "[GF_ITER] read=%d reg=%d i=%d re=%d->%d rs=%d qe=%d->%d qs=%d "
+                "cond=%d re0=%d qlen=%d last=%d lj=%d gap_q=%d gap_r=%d\n",
+                read_idx, reg_idx, i,
+                _dbg_re_before, re, rs, _dbg_qe_before, qe, qs,
+                _dbg_cond, re0, qlen, (i==cnt1-1),
+                !!(a[as1+i].y&MM_SEED_LONG_JOIN),
+                qe-qs, re-rs);
+
+        if (_dbg_cond) {
             // Guard: voting-recombined anchors can produce re > re0 (overflows
             // tseq buffer) or qe > qlen (overflows qseq0). Check before any
             // sequence operations.
@@ -1388,6 +1417,8 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                 // cover the accumulated range including this skipped position.
                 // BUG-FIX: previously "qs = qe" here silently ate up to ~13 kbp
                 // of query bases without creating a CIGAR task for them.
+                fprintf(stderr, "[GF_ITER] read=%d reg=%d i=%d -> OUTER_GUARD (re<=rs||qe<=qs)\n",
+                        read_idx, reg_idx, i);
                 continue;
             }
             if (re > re0 || qe > qlen) {
@@ -1398,6 +1429,9 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                     // creating a CIGAR task silently drops query bases.
                     // Just skip this anchor; the next valid anchor's task
                     // (or RIGHT_EXT) will cover the accumulated range.
+                    fprintf(stderr, "[GF_ITER] read=%d reg=%d i=%d -> INNER_GUARD after clamp "
+                            "(re=%d rs=%d qe=%d qs=%d)\n",
+                            read_idx, reg_idx, i, re, rs, qe, qs);
                     continue;
                 }
             }

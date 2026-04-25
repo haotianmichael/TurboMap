@@ -1728,12 +1728,17 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             int exp_tlen = re1 - rs1;
                             if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
                                 g_nm_count++;
+                                const char *read_name = (gpu_batch && current_read >= 0 && current_read < gpu_batch->n_reads)
+                                    ? gpu_batch->read_ctxs[current_read].name : "?";
+                                // Print a machine-parseable line so diff.py can extract read names:
+                                //   grep '^[CIGAR_MM]' run.log | cut -d' ' -f2 > mismatch_reads.txt
+                                fprintf(stderr, "[CIGAR_MM] %s\n", read_name);
                                 fprintf(stderr, "[DEBUG] CIGAR mismatch #%d/%d: cq=%d ct=%d eq=%d et=%d "
                                         "task[%d] type=%d score=%d maxq=%d maxt=%d zdrop=%d reach=%d "
-                                        "rs1=%d re1=%d qs1=%d qe1=%d\n",
+                                        "rs1=%d re1=%d qs1=%d qe1=%d read=%s\n",
                                         g_nm_count, g_nm_total, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen,
                                         i, task->task_type, task->score, task->max_q, task->max_t, task->zdropped,
-                                        task->reach_end, rs1, re1, qs1, qe1);
+                                        task->reach_end, rs1, re1, qs1, qe1, read_name);
                                 if (g_nm_count <= 5) {
                                     fprintf(stderr, "  subtasks(%d):", n_subtasks);
                                     for (int si = 0; si < n_subtasks; si++)

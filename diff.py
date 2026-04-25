@@ -3,8 +3,17 @@
 Evaluate GPU BAM/SAM usability for downstream variant calling vs CPU reference.
 
 Usage:
-    python diff.py <cpu.sam> <gpu.sam>
+    python diff.py <cpu.sam> <gpu.sam> [--debug-log <stderr.log>]
     python diff.py minimap.sam turbomap.sam
+    python diff.py minimap.sam turbomap.sam --debug-log run.log
+
+  --debug-log FILE   stderr log from GPU run containing [CIGAR_MM] lines.
+                     Reads listed there had GPU CIGAR assembly errors (the
+                     accumulated CIGAR didn't cover the expected coordinate
+                     range, so mm_update_extra was skipped).  They are
+                     reported in their own bucket so they don't pollute the
+                     usable/wrong_pos numbers.
+                     Tip: ./minimap2 ... > test.sam 2>run.log
 
 This script answers the practical question: "Will substituting the GPU-produced
 alignments for the CPU-produced ones affect variant calling?"  It does NOT
@@ -240,14 +249,51 @@ def classify(cpu, gpu):
         return 'unusable', detail
 
 
+def parse_cigar_mm_log(log_path):
+    """
+    Extract read names that had GPU CIGAR assembly errors from the stderr log.
+    Looks for lines starting with '[CIGAR_MM] <read_name>'.
+    Returns a set of read names.
+    """
+    mismatch_reads = set()
+    try:
+        with open(log_path) as f:
+            for line in f:
+                if line.startswith('[CIGAR_MM] '):
+                    name = line[len('[CIGAR_MM] '):].strip()
+                    if name:
+                        mismatch_reads.add(name)
+    except OSError as e:
+        print(f'[WARNING] Cannot read debug log: {e}', file=sys.stderr)
+    return mismatch_reads
+
+
 def main(argv):
-    if len(argv) != 3:
+    # Parse args: cpu.sam gpu.sam [--debug-log FILE]
+    debug_log = None
+    positional = []
+    i = 1
+    while i < len(argv):
+        if argv[i] == '--debug-log' and i + 1 < len(argv):
+            debug_log = argv[i + 1]
+            i += 2
+        else:
+            positional.append(argv[i])
+            i += 1
+
+    if len(positional) != 2:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
 
-    cpu_path, gpu_path = argv[1], argv[2]
+    cpu_path, gpu_path = positional
     cpu_recs = parse_sam(cpu_path)
     gpu_recs = parse_sam(gpu_path)
+
+    # Read names that had CIGAR assembly errors in the GPU (from debug log)
+    cigar_mm_reads = parse_cigar_mm_log(debug_log) if debug_log else set()
+    if cigar_mm_reads:
+        print(f'[INFO] Loaded {len(cigar_mm_reads)} CIGAR-mismatch read names from {debug_log}',
+              file=sys.stderr)
 
     all_reads = set(cpu_recs) | set(gpu_recs)
     counts  = defaultdict(int)
@@ -257,19 +303,33 @@ def main(argv):
     for qname in sorted(all_reads):
         c = cpu_recs.get(qname)
         g = gpu_recs.get(qname)
-        cat, det = classify(c, g)
+        # If the GPU had a CIGAR assembly error for this read, report it
+        # separately BEFORE applying other classification criteria — the
+        # alignment data in the SAM is unreliable (mm_update_extra was skipped).
+        if qname in cigar_mm_reads:
+            cat = 'gpu_cigar_err'
+            det = {'note': 'GPU CIGAR assembly error (mm_update_extra skipped)'}
+            if c and not c['unmapped']:
+                det['cpu_mapq'] = c['mapq']
+                det['cpu_ref_span'] = c['ref_span']
+            if g and not g['unmapped']:
+                det['gpu_pos'] = g['pos']
+                det['gpu_ref_span'] = g['ref_span']
+                det['gpu_mapq'] = g['mapq']
+        else:
+            cat, det = classify(c, g)
         counts[cat] += 1
         if len(details[cat]) < MAX_EX:
             details[cat].append((qname, c, g, det))
 
     # ── Denominator: reads where CPU attempted to map ────────────────────────
     # Excludes both_unmapped and cpu_unmapped.
-    # low_mapq_pos_diff: CPU mapped but MAPQ < threshold → VC filters them
-    #   anyway, so they neither contribute to "usable" nor to "fail" counts.
+    # low_mapq_pos_diff: VC-filtered anyway.
+    # gpu_cigar_err: CIGAR assembly failed — these are always failures.
     denom = (counts['strict'] + counts['usable'] + counts['borderline'] +
              counts['wrong_chrom'] + counts['wrong_pos'] +
              counts['truncated'] + counts['unusable'] + counts['gpu_unmapped'] +
-             counts['low_mapq_pos_diff'])
+             counts['low_mapq_pos_diff'] + counts['gpu_cigar_err'])
 
     vc_usable = counts['strict'] + counts['usable']
 
@@ -308,6 +368,10 @@ def main(argv):
     print(f'  │  borderline (60-80% overlap):       {counts["borderline"]:5d}  {pct(counts["borderline"])}')
     print(f'  │')
     print(f'  └── FAILS variant-calling bar ─────────────────────────────')
+    print(f'     GPU CIGAR assembly error:          {counts["gpu_cigar_err"]:5d}  {pct(counts["gpu_cigar_err"])}')
+    print(f'       (mm_update_extra skipped → SAM data unreliable)')
+    if not cigar_mm_reads:
+        print(f'       [provide --debug-log to identify these reads]')
     print(f'     GPU unmapped (CPU MAPQ≥{MAPQ_THRESHOLD} mapped):  {counts["gpu_unmapped"]:5d}  {pct(counts["gpu_unmapped"])}')
     print(f'     truncated (ref_span<80% of CPU):   {counts["truncated"]:5d}  {pct(counts["truncated"])}')
     print(f'     wrong pos (high-conf, >{POSITION_TOL}bp off): {counts["wrong_pos"]:5d}  {pct(counts["wrong_pos"])}')
@@ -351,6 +415,7 @@ def main(argv):
             if det:
                 print(f'         detail: {det}')
 
+    show_examples('gpu_cigar_err', 'GPU CIGAR ASSEMBLY ERROR (mm_update_extra skipped — SAM data unreliable)')
     show_examples('truncated',    'TRUNCATED (ref_span < 80% of CPU)')
     show_examples('wrong_pos',    'WRONG POSITION (high-confidence reads only)')
     show_examples('wrong_chrom',  'WRONG CHROMOSOME')

@@ -307,10 +307,16 @@ def main(argv):
         # separately BEFORE applying other classification criteria — the
         # alignment data in the SAM is unreliable (mm_update_extra was skipped).
         if qname in cigar_mm_reads:
-            cat = 'gpu_cigar_err'
-            det = {'note': 'GPU CIGAR assembly error (mm_update_extra skipped)'}
+            cpu_mapq = c['mapq'] if (c and not c['unmapped']) else 0
+            if cpu_mapq < MAPQ_THRESHOLD:
+                # CPU MAPQ below VC filter — this read gets filtered by variant
+                # callers regardless of GPU output, so it's not a VC failure.
+                cat = 'low_mapq_cigar_err'
+            else:
+                cat = 'gpu_cigar_err'
+            det = {'note': 'GPU CIGAR assembly error (mm_update_extra skipped)',
+                   'cpu_mapq': cpu_mapq}
             if c and not c['unmapped']:
-                det['cpu_mapq'] = c['mapq']
                 det['cpu_ref_span'] = c['ref_span']
             if g and not g['unmapped']:
                 det['gpu_pos'] = g['pos']
@@ -318,24 +324,31 @@ def main(argv):
                 det['gpu_mapq'] = g['mapq']
         else:
             cat, det = classify(c, g)
+            # Also split gpu_unmapped by MAPQ: if CPU MAPQ < threshold the read
+            # would be VC-filtered anyway (same logic as low_mapq_pos_diff).
+            if cat == 'gpu_unmapped' and c and c['mapq'] < MAPQ_THRESHOLD:
+                cat = 'low_mapq_unmapped'
         counts[cat] += 1
         if len(details[cat]) < MAX_EX:
             details[cat].append((qname, c, g, det))
 
     # ── Denominator: reads where CPU attempted to map ────────────────────────
     # Excludes both_unmapped and cpu_unmapped.
-    # low_mapq_pos_diff: VC-filtered anyway.
-    # gpu_cigar_err: CIGAR assembly failed — these are always failures.
+    # VC-filtered buckets (CPU MAPQ < threshold → VC ignores these reads):
+    #   low_mapq_pos_diff, low_mapq_cigar_err, low_mapq_unmapped
+    vc_filtered = (counts['low_mapq_pos_diff'] +
+                   counts['low_mapq_cigar_err'] +
+                   counts['low_mapq_unmapped'])
+
     denom = (counts['strict'] + counts['usable'] + counts['borderline'] +
              counts['wrong_chrom'] + counts['wrong_pos'] +
              counts['truncated'] + counts['unusable'] + counts['gpu_unmapped'] +
-             counts['low_mapq_pos_diff'] + counts['gpu_cigar_err'])
+             counts['gpu_cigar_err'] + vc_filtered)
 
     vc_usable = counts['strict'] + counts['usable']
 
-    # VC-relevant denominator: exclude reads that are filtered by MAPQ anyway
-    # (low_mapq_pos_diff are mapped but irrelevant to VC outcome)
-    vc_denom = denom - counts['low_mapq_pos_diff']
+    # VC-relevant denominator: only reads that would actually be used by VC
+    vc_denom = denom - vc_filtered
 
     def pct(n, d=None):
         d = d if d is not None else vc_denom
@@ -353,7 +366,10 @@ def main(argv):
     print(f'  Total reads in union:                 {len(all_reads)}')
     print(f'  Both unmapped (excluded):             {counts["both_unmapped"]}')
     print(f'  CPU unmapped (excluded):              {counts["cpu_unmapped"]}')
-    print(f'  Low-MAPQ wrong pos (VC-filtered):     {counts["low_mapq_pos_diff"]}')
+    print(f'  VC-filtered (CPU MAPQ<{MAPQ_THRESHOLD}, excluded):  {vc_filtered}')
+    print(f'    of which: low-MAPQ wrong pos         {counts["low_mapq_pos_diff"]}')
+    print(f'              low-MAPQ CIGAR err          {counts["low_mapq_cigar_err"]}')
+    print(f'              low-MAPQ unmapped            {counts["low_mapq_unmapped"]}')
     print(f'  ─────────────────────────────────────────────────────────────')
     print(f'  VC-relevant denominator:              {vc_denom}')
     print(f'  (total CPU-mapped reads:              {denom})')
@@ -367,12 +383,11 @@ def main(argv):
     print(f'  ├── MARGINAL ───────────────────────────────────────────────')
     print(f'  │  borderline (60-80% overlap):       {counts["borderline"]:5d}  {pct(counts["borderline"])}')
     print(f'  │')
-    print(f'  └── FAILS variant-calling bar ─────────────────────────────')
-    print(f'     GPU CIGAR assembly error:          {counts["gpu_cigar_err"]:5d}  {pct(counts["gpu_cigar_err"])}')
-    print(f'       (mm_update_extra skipped → SAM data unreliable)')
+    print(f'  └── FAILS variant-calling bar (high-conf reads only) ───────')
+    print(f'     GPU CIGAR err (CPU MAPQ≥{MAPQ_THRESHOLD}):       {counts["gpu_cigar_err"]:5d}  {pct(counts["gpu_cigar_err"])}')
     if not cigar_mm_reads:
-        print(f'       [provide --debug-log to identify these reads]')
-    print(f'     GPU unmapped (CPU MAPQ≥{MAPQ_THRESHOLD} mapped):  {counts["gpu_unmapped"]:5d}  {pct(counts["gpu_unmapped"])}')
+        print(f'       [provide --debug-log to identify; currently counted as wrong_pos/unmapped]')
+    print(f'     GPU unmapped (CPU MAPQ≥{MAPQ_THRESHOLD}):        {counts["gpu_unmapped"]:5d}  {pct(counts["gpu_unmapped"])}')
     print(f'     truncated (ref_span<80% of CPU):   {counts["truncated"]:5d}  {pct(counts["truncated"])}')
     print(f'     wrong pos (high-conf, >{POSITION_TOL}bp off): {counts["wrong_pos"]:5d}  {pct(counts["wrong_pos"])}')
     print(f'     wrong chromosome:                  {counts["wrong_chrom"]:5d}  {pct(counts["wrong_chrom"])}')
@@ -423,7 +438,11 @@ def main(argv):
     show_examples('unusable',     'UNUSABLE (other)')
     show_examples('borderline',   'BORDERLINE (marginal coverage overlap)')
     show_examples('low_mapq_pos_diff',
-                  f'LOW-MAPQ position diff (MAPQ<{MAPQ_THRESHOLD}, VC-filtered — informational only)')
+                  f'LOW-MAPQ pos diff (MAPQ<{MAPQ_THRESHOLD}, VC-filtered)')
+    show_examples('low_mapq_cigar_err',
+                  f'LOW-MAPQ CIGAR err (MAPQ<{MAPQ_THRESHOLD}, VC-filtered — GPU bug but irrelevant to VC)')
+    show_examples('low_mapq_unmapped',
+                  f'LOW-MAPQ unmapped (MAPQ<{MAPQ_THRESHOLD}, VC-filtered)')
 
 
 if __name__ == '__main__':

@@ -146,8 +146,8 @@ typedef struct {
     int32_t n_a;            // number of anchors after squeeze
     mm128_t *a;             // anchor array
     int32_t qlen;           // query length (total length of the read)
+    const char *name;       // read name (pointer into the original bseq1 — valid for the lifetime of the batch)
 
- 
     // Results will be written back to regs0
 } read_align_ctx_t;
 

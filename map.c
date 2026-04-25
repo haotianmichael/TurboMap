@@ -1728,7 +1728,8 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             int exp_tlen = re1 - rs1;
                             if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
                                 g_nm_count++;
-                                const char *read_name = (gpu_batch && current_read >= 0 && current_read < gpu_batch->n_reads)
+                                const char *read_name = (current_read >= 0 && current_read < gpu_batch->n_reads
+                                                         && gpu_batch->read_ctxs[current_read].name)
                                     ? gpu_batch->read_ctxs[current_read].name : "?";
                                 // Print a machine-parseable line so diff.py can extract read names:
                                 //   grep '^[CIGAR_MM]' run.log | cut -d' ' -f2 > mismatch_reads.txt
@@ -1905,7 +1906,8 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
     ctx->qseq0[1] = qseq0[1];
     ctx->n_a = n_a;
     ctx->a = a;
-	ctx->qlen = qlens[0];  // Store the actual query length
+    ctx->qlen = qlens[0];  // Store the actual query length
+    ctx->name = qname;     // Read name pointer (valid for batch lifetime)
     
     for (i = 0; i < skele_n_regs; ++i) {
         mm_reg1_t r2;

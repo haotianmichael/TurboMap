@@ -1103,8 +1103,10 @@ static int gpu_batch_add_task(gpu_align_batch_t *gpu_batch,
 
 	task->task_ctx.qs0 = task_ctx.qs0; task->task_ctx.qe0 = task_ctx.qe0;
 	task->task_ctx.rs0 = task_ctx.rs0; task->task_ctx.re0 = task_ctx.re0;
-	task->task_ctx.rev= task_ctx.rev;
+	task->task_ctx.rev = task_ctx.rev;
 	task->task_ctx.rid = task_ctx.rid;
+	task->task_ctx.as1 = task_ctx.as1;   // needed for zdrop mm_split_reg
+	task->task_ctx.cnt1 = task_ctx.cnt1; // needed for zdrop mm_split_reg
 
     gpu_batch->n_tasks++;
     return 0;
@@ -1122,13 +1124,17 @@ static void mm_align_pair_batched(gpu_align_batch_t *gpu_batch,
 	if (qlen <= 0 || tlen <= 0) {
         return;
     }
-    // For very large alignments, skip GPU (fallback handled later)
-    if (opt->max_sw_mat > 0 && (int64_t)tlen * qlen > opt->max_sw_mat) {
-        return;
-    }
-    
-    gpu_batch_add_task(gpu_batch, qseq, qlen, tseq, tlen, junc, mat, 
-                      w, end_bonus, zdrop, flag, read_idx, reg_idx, 
+    // NOTE: Do NOT skip large alignments based on opt->max_sw_mat here.
+    // The CPU path (mm_align_pair) handles max_sw_mat by simulating a zdrop
+    // at position 0.  Silently skipping the task here is WRONG because the
+    // caller advances rs/qs cursors unconditionally after this call, leaving
+    // a gap in CIGAR coverage with no corresponding alignment ops.
+    // The GPU uses banded DP (O(bw * len) memory, not O(qlen * tlen)), so
+    // the matrix-size concern that motivated max_sw_mat for SSE code does not
+    // apply; just let the GPU run the alignment.
+
+    gpu_batch_add_task(gpu_batch, qseq, qlen, tseq, tlen, junc, mat,
+                      w, end_bonus, zdrop, flag, read_idx, reg_idx,
                       task_type, task_sub_idx, task_ctx);
 }
 

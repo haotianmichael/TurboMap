@@ -1394,7 +1394,10 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
                 if (re > re0) re = re0;
                 if (qe > qlen) qe = qlen;
                 if (re <= rs || qe <= qs) {
-                    rs = re; qs = qe;
+                    // Same bug as the outer guard: advancing qs here without
+                    // creating a CIGAR task silently drops query bases.
+                    // Just skip this anchor; the next valid anchor's task
+                    // (or RIGHT_EXT) will cover the accumulated range.
                     continue;
                 }
             }

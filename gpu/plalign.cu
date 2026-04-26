@@ -420,7 +420,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         }
     }
 
-    fprintf(stderr, "[Info::%s] Three-tier alignment: %d short tasks (max_len≤%zubp) + %d long tasks (max_len>%zubp)\n",
+    fprintf(stderr, "[Info::%s] Alignment: %d short (max_len≤%zubp) + %d long (max_len>%zubp, dynamic bt)\n",
             __func__, n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
 
     int kernel_threads = 256;
@@ -771,9 +771,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             {
                 int parallel_threads = 32;   // one warp per block
-                fprintf(stderr, "[Info::%s] %s batch %d/%d: slots=%d tasks=%d bt_stride=%zu\n",
-                        __func__, phase_name, batch_num, total_batches,
-                        phase_concurrent_slots, batch_size, batch_max_backtrack_size);
+                // batch summary printed after completion (see below)
                 ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
                                               0, align_stream>>>(
                     d_task_counter,
@@ -1005,8 +1003,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             tasks_processed_in_phase += batch_size;
             total_tasks_processed += batch_size;
-            fprintf(stderr, "[Info::%s]   -> done (%d/%d in phase)\n",
-                    __func__, tasks_processed_in_phase, n_tasks_in_phase);
+            fprintf(stderr, "[Info::%s] %s [%d/%d] tasks=%d slots=%d bt_stride=%zu  (%d/%d done)\n",
+                    __func__, phase_name, batch_num, total_batches,
+                    batch_size, phase_concurrent_slots, batch_max_backtrack_size,
+                    tasks_processed_in_phase, n_tasks_in_phase);
         }  // End of batch loop within phase
     }  // End of three-tier loop
 

@@ -1406,7 +1406,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
 
     // Per-subtask tracking for mismatch diagnostics
     #define MAX_SUBTASK_TRACE 32
-    struct { int type, sub_idx, cq, ct, n_cigar; int32_t max_q, max_t; int reach_end, zdrop; int32_t ref_qs, ref_qe, ref_rs, ref_re; } subtask_trace[MAX_SUBTASK_TRACE];
+    struct { int type, sub_idx, cq, ct, n_cigar; int32_t max_q, max_t; int reach_end, zdrop; } subtask_trace[MAX_SUBTASK_TRACE];
     int n_subtasks = 0;
     
     ksw_gen_simple_mat(5, mat, opt->a, opt->b, opt->sc_ambi);
@@ -1677,10 +1677,6 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             subtask_trace[n_subtasks].max_t = task->max_t;
             subtask_trace[n_subtasks].reach_end = task->reach_end;
             subtask_trace[n_subtasks].zdrop = task->zdropped;
-            subtask_trace[n_subtasks].ref_qs = task->task_ctx.ref_qs;
-            subtask_trace[n_subtasks].ref_qe = task->task_ctx.ref_qe;
-            subtask_trace[n_subtasks].ref_rs = task->task_ctx.ref_rs;
-            subtask_trace[n_subtasks].ref_re = task->task_ctx.ref_re;
             n_subtasks++;
         }
 
@@ -1747,39 +1743,13 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                 if (g_nm_count <= 5) {
                                     fprintf(stderr, "  subtasks(%d):", n_subtasks);
                                     for (int si = 0; si < n_subtasks; si++)
-                                        fprintf(stderr, " [t%d.%d cq=%d ct=%d nc=%d mq=%d mt=%d re=%d zd=%d rqs=%d rqe=%d rrs=%d rre=%d]",
+                                        fprintf(stderr, " [t%d.%d cq=%d ct=%d nc=%d mq=%d mt=%d re=%d zd=%d]",
                                                 subtask_trace[si].type, subtask_trace[si].sub_idx,
                                                 subtask_trace[si].cq, subtask_trace[si].ct,
                                                 subtask_trace[si].n_cigar,
                                                 subtask_trace[si].max_q, subtask_trace[si].max_t,
-                                                subtask_trace[si].reach_end, subtask_trace[si].zdrop,
-                                                subtask_trace[si].ref_qs, subtask_trace[si].ref_qe,
-                                                subtask_trace[si].ref_rs, subtask_trace[si].ref_re);
+                                                subtask_trace[si].reach_end, subtask_trace[si].zdrop);
                                     fprintf(stderr, "\n");
-                                    // Print coverage gaps between consecutive tasks
-                                    fprintf(stderr, "  coverage gaps(q/r):");
-                                    int prev_qe = qs1, prev_re = rs1;
-                                    int sum_cq = 0;
-                                    for (int si = 0; si < n_subtasks; si++) {
-                                        int task_rqs = subtask_trace[si].ref_qs;
-                                        int task_rqe = subtask_trace[si].ref_qe;
-                                        int task_rrs = subtask_trace[si].ref_rs;
-                                        int task_rre = subtask_trace[si].ref_re;
-                                        int qgap = task_rqs - prev_qe;
-                                        int rgap = task_rrs - prev_re;
-                                        if (qgap != 0 || rgap != 0)
-                                            fprintf(stderr, " [before t%d.%d: qgap=%d rgap=%d]",
-                                                    subtask_trace[si].type, subtask_trace[si].sub_idx, qgap, rgap);
-                                        prev_qe = task_rqe;
-                                        prev_re = task_rre;
-                                        sum_cq += subtask_trace[si].cq;
-                                    }
-                                    // Check gap after last task
-                                    int final_qgap = qe1 - prev_qe;
-                                    int final_rgap = re1 - prev_re;
-                                    if (final_qgap != 0 || final_rgap != 0)
-                                        fprintf(stderr, " [after last: qgap=%d rgap=%d]", final_qgap, final_rgap);
-                                    fprintf(stderr, " sum_cq=%d\n", sum_cq);
                                 }
                                 goto skip_update_extra;
                             }

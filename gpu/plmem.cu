@@ -342,10 +342,10 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
 void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                               int range_grid_size, int num_cut,
                               int num_streams) {
-    fprintf(stderr, "[Info] GPU ARENA MEMORY ALLOCATION ==========\n");
-    fprintf(stderr, "Configuration: anchor_per_batch=%zu, range_grid_size=%d, num_cut=%d, ",
-            anchor_per_batch, range_grid_size, num_cut);
-    fprintf(stderr, "buffer_size_long=%zu\n", dev_mem->buffer_size_long);
+    // Only print detailed allocation info for the first stream; all streams are identical.
+    static int arena_info_printed = 0;
+    int print_info = !arena_info_printed;
+    arena_info_printed = 1;
     cudaSetDevice(CUDA_DEVICE);
 
     // Save parameters for phase transitions
@@ -402,13 +402,6 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
 
     size_t free_mem = 0, total_mem = 0;
     cudaMemGetInfo(&free_mem, &total_mem);
-    fprintf(stderr, " [Arena] GPU VRAM: %.2f GB total, %.2f GB free, %d streams\n",
-            total_mem / (1024.0*1024.0*1024.0), free_mem / (1024.0*1024.0*1024.0),
-            num_streams);
-    fprintf(stderr, " [Arena] Single allocation: %.2f MB (%.2f GB)\n",
-            arena_size / (1024.0*1024.0), arena_size / (1024.0*1024.0*1024.0));
-    fprintf(stderr, " [Arena] Chain phase needs: %.2f MB (%.2f GB)\n",
-            chain_size / (1024.0*1024.0), chain_size / (1024.0*1024.0*1024.0));
 
     // ---- Dynamic scaling: use extra arena memory for larger align batches ----
     // Per-task align cost: 2×CIGAR(8KB) + metadata/stats/results(84B) + ez(48B) ≈ 16.2KB
@@ -444,7 +437,8 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             dev_mem->max_align_tasks = old_tasks;
             dev_mem->short_task_batch_size = 4000;
             dev_mem->long_task_batch_size = 128;
-            fprintf(stderr, " [Arena] Align scaling failed, using defaults\n");
+            if (print_info)
+                fprintf(stderr, " [Arena] Align scaling failed, using defaults\n");
         } else {
             align_size = scaled_align_size;
         }
@@ -454,29 +448,28 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         dev_mem->arena.offset     = 0;
     }
 
-    fprintf(stderr, " [Arena] Align phase needs: %.2f MB (%.2f GB)\n",
-            align_size / (1024.0*1024.0), align_size / (1024.0*1024.0*1024.0));
-    fprintf(stderr, " [Arena]   max_tasks=%zu  short_batch=%d  long_batch=%d  n_concurrent=%d\n",
-            dev_mem->max_align_tasks, dev_mem->short_task_batch_size,
-            dev_mem->long_task_batch_size, dev_mem->n_align_concurrent_blocks);
-    {
+    if (print_info) {
         size_t bt_p_mb = (size_t)dev_mem->n_align_concurrent_blocks *
                          dev_mem->max_align_backtrack_size / (1024*1024);
-        size_t bt_off_mb  = (size_t)dev_mem->n_align_concurrent_blocks *
-                            2 * dev_mem->short_task_max_len * sizeof(int) / (1024*1024);
         size_t bt_off_long_mb = (size_t)dev_mem->n_long_concurrent_slots *
                                 2 * dev_mem->max_align_query_len * sizeof(int) / (1024*1024);
-        fprintf(stderr, " [Arena]   Backtrack pool (shared short+long): %zu MB  "
-                        "bt_off short: %zu MB  bt_off long: %zu MB (%d slots × 100k stride)\n",
-                bt_p_mb, bt_off_mb, bt_off_long_mb, dev_mem->n_long_concurrent_slots);
+        fprintf(stderr, "[Info] GPU arena: %.2f GB total, %.2f GB free  (%d stream%s, %.2f GB each)\n",
+                total_mem / (1024.0*1024.0*1024.0), free_mem / (1024.0*1024.0*1024.0),
+                num_streams, num_streams > 1 ? "s" : "",
+                arena_size / (1024.0*1024.0*1024.0));
+        fprintf(stderr, "[Info]   Chain phase: %.0f MB  |  Align phase: %.0f MB\n",
+                chain_size / (1024.0*1024.0), align_size / (1024.0*1024.0));
+        fprintf(stderr, "[Info]   Align config: max_tasks=%zu  short_batch=%d  long_batch=%d"
+                        "  n_concurrent=%d\n",
+                dev_mem->max_align_tasks, dev_mem->short_task_batch_size,
+                dev_mem->long_task_batch_size, dev_mem->n_align_concurrent_blocks);
+        fprintf(stderr, "[Info]   Backtrack pool: %zu MB  |  bt_off long: %zu MB"
+                        " (%d slots × 100k stride)\n",
+                bt_p_mb, bt_off_long_mb, dev_mem->n_long_concurrent_slots);
     }
 
     // Set up chain phase initially
     setup_chain_phase(dev_mem, anchor_per_batch, range_grid_size, num_cut);
-
-    fprintf(stderr, " [Arena] Chain phase active: %.2f MB used of %.2f MB\n",
-            dev_mem->arena.offset / (1024.0*1024.0),
-            dev_mem->arena.total_size / (1024.0*1024.0));
 
     // ---- Pre-allocate pinned host buffers for alignment D2H/H2D ----
     // These were previously allocated/freed inside every gpu_align_batch_execute call
@@ -513,8 +506,9 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         cudaMallocHost(&dev_mem->h_align_bw,                mbs * sizeof(int32_t));
         cudaMallocHost(&dev_mem->h_align_task_to_align_id, mbs * sizeof(int32_t));
 
-        fprintf(stderr, " [Arena] Pinned host buffers: %.2f MB (max_batch=%zu)\n",
-                (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0), mbs);
+        if (print_info)
+            fprintf(stderr, "[Info]   Pinned host buffers: %.0f MB (max_batch=%zu)\n",
+                    (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0), mbs);
     }
 
     cudaCheck();
@@ -557,18 +551,12 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
 void plmem_phase_to_align(deviceMemPtr *dev_mem) {
     if (dev_mem->current_phase == GPU_PHASE_ALIGN) return;
     setup_align_phase(dev_mem);
-    fprintf(stderr, " [Arena] Phase -> ALIGN: %.2f MB used of %.2f MB\n",
-            dev_mem->arena.offset / (1024.0*1024.0),
-            dev_mem->arena.total_size / (1024.0*1024.0));
 }
 
 void plmem_phase_to_chain(deviceMemPtr *dev_mem) {
     if (dev_mem->current_phase == GPU_PHASE_CHAIN) return;
     setup_chain_phase(dev_mem, dev_mem->saved_anchor_per_batch,
                       dev_mem->saved_range_grid_size, dev_mem->saved_num_cut);
-    fprintf(stderr, " [Arena] Phase -> CHAIN: %.2f MB used of %.2f MB\n",
-            dev_mem->arena.offset / (1024.0*1024.0),
-            dev_mem->arena.total_size / (1024.0*1024.0));
 }
 
 

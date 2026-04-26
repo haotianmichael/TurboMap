@@ -771,9 +771,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             {
                 int parallel_threads = 32;   // one warp per block
-                fprintf(stderr, "\n[Info::%s] %s batch %d: slots=%d tasks=%d bt_stride=%zu antidiag_stride=%zu\n",
-                        __func__, phase_name, batch_num, phase_concurrent_slots, batch_size,
-                        batch_max_backtrack_size, batch_max_antidiag);
+                fprintf(stderr, "[Info::%s] %s batch %d/%d: slots=%d tasks=%d bt_stride=%zu\n",
+                        __func__, phase_name, batch_num, total_batches,
+                        phase_concurrent_slots, batch_size, batch_max_backtrack_size);
                 ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
                                               0, align_stream>>>(
                     d_task_counter,
@@ -1003,31 +1003,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             free(h_unpacked_query);
             free(h_unpacked_target);
 
-            // Update progress
             tasks_processed_in_phase += batch_size;
             total_tasks_processed += batch_size;
-
-            // Progress bar (show phase-specific progress)
-            int percent = (tasks_processed_in_phase * 100) / n_tasks_in_phase;
-            int bar_width = 30;
-            int filled = (percent * bar_width) / 100;
-            fprintf(stderr, "\r[%s] [", phase_name);
-            for (int i = 0; i < bar_width; i++) {
-                if (i < filled) fprintf(stderr, "=");
-                else if (i == filled) fprintf(stderr, ">");
-                else fprintf(stderr, " ");
-            }
-            fprintf(stderr, "] %3d%% (%d/%d in phase, %d/%d total, batch %d/%d)",
-                    percent, tasks_processed_in_phase, n_tasks_in_phase,
-                    total_tasks_processed, n_tasks, batch_num, total_batches);
-            fflush(stderr);
+            fprintf(stderr, "[Info::%s]   -> done (%d/%d in phase)\n",
+                    __func__, tasks_processed_in_phase, n_tasks_in_phase);
         }  // End of batch loop within phase
-
-        fprintf(stderr, "\n[Info::%s] %s done: %d tasks processed\n",
-                __func__, phase_name, n_tasks_in_phase);
     }  // End of three-tier loop
 
-    fprintf(stderr, "[Info::%s] Alignment complete: %d tasks, %d batches\n",
+    fprintf(stderr, "[Info::%s] Alignment complete: %d tasks in %d batches\n",
             __func__, n_tasks, batch_num);
 
     // Cleanup phase-specific arrays

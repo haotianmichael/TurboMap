@@ -212,6 +212,12 @@ typedef struct {
     int *d_align_backtrack_off;
     int *d_align_backtrack_off_end;
     int *d_align_backtrack_n_col;
+    // Long-task specific backtrack_off buffers (stride = max_antidiag_long = 2*max_align_query_len)
+    // The short-task off buffers use stride = max_antidiag_short = 2*short_task_max_len (2000),
+    // which is too small for long tasks whose antidiag can reach 2*max_align_query_len (100000).
+    int *d_align_backtrack_off_long;
+    int *d_align_backtrack_off_end_long;
+    int n_long_concurrent_slots;  // max concurrent slots for the long-task tier
     uint32_t *d_align_cigar_buffer;
     int *d_align_cigar_lengths;
     size_t max_align_backtrack_size; // per task

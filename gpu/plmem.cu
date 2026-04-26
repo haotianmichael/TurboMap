@@ -275,6 +275,22 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_backtrack_off_end = (int*)arena_alloc(a, bt_off_bytes);
     dev_mem->d_align_backtrack_n_col   = (int*)arena_alloc(a, alloc_slots * sizeof(int));
 
+    // ---- Long-task backtrack_off buffers ----
+    // Short-task off buffers use stride = max_antidiag_short (2000), which is far too small for
+    // long tasks (antidiag up to 2*max_align_query_len = 100000).  We allocate a separate pair
+    // with the full long-task antidiag stride.  The number of concurrent long-task slots is
+    // bounded by both the bt_p pool capacity and this allocation.
+    // n_long_concurrent_slots = bt_p_total / (max_antidiag_long * max_n_col_long_upper)
+    // where max_n_col_long_upper is a safe upper bound for the largest expected bandwidth.
+    // We use 128 as a practical cap: for bw_long=7501 tasks each need ~183 MB of bt_p, so
+    // the actual concurrency will be limited by bt_p (~26 slots) not by this cap.
+    size_t max_antidiag_long = 2 * dev_mem->max_align_query_len;  // 100,000
+    dev_mem->n_long_concurrent_slots = 128;
+    size_t bt_off_long_bytes = (size_t)dev_mem->n_long_concurrent_slots *
+                               max_antidiag_long * sizeof(int);
+    dev_mem->d_align_backtrack_off_long     = (int*)arena_alloc(a, bt_off_long_bytes);
+    dev_mem->d_align_backtrack_off_end_long = (int*)arena_alloc(a, bt_off_long_bytes);
+
     // ---- CIGAR buffers ----
     size_t cigar_buf_bytes = dev_mem->max_align_tasks *
                              dev_mem->max_align_cigar_len * sizeof(uint32_t);

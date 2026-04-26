@@ -1124,16 +1124,9 @@ static void mm_align_pair_batched(gpu_align_batch_t *gpu_batch,
 	if (qlen <= 0 || tlen <= 0) {
         return;
     }
-    // Skip alignments whose DP matrix exceeds max_sw_mat to prevent GPU
-    // kernel buffer overflow.  The GPU long-task kernel allocates a fixed
-    // bt_size per batch; tasks with qlen*tlen >> bt_size/n_tasks cause an
-    // illegal memory access that corrupts all results in the batch.
-    // NOTE: the caller advances rs/qs after this call regardless, which
-    // leaves a gap in CIGAR coverage for skipped tasks — that is a known
-    // limitation tracked separately.
-    if (opt->max_sw_mat > 0 && (int64_t)tlen * qlen > opt->max_sw_mat) {
-        return;
-    }
+    // Note: the old max_sw_mat guard that silently dropped large tasks has been removed.
+    // The GPU three-tier buffer system now dynamically sizes the backtrack buffer per batch,
+    // so all tasks — including those with large qlen*tlen — are processed correctly.
 
     gpu_batch_add_task(gpu_batch, qseq, qlen, tseq, tlen, junc, mat,
                       w, end_bonus, zdrop, flag, read_idx, reg_idx,

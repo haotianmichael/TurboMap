@@ -537,9 +537,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         // Dynamic backtrack buffer sizing based on phase
         // Short phase stride caps n_col at (short_task_max_len + 1) to match plmem alloc, allowing
         // any per-task bandwidth (n_col = min(qlen, tlen, w+1) is bounded by short_task_max_len).
-        size_t current_max_antidiag = (phase == 0) ? (2 * short_task_max_len) : (2 * dev_mem->max_align_query_len);
-        size_t current_max_n_col    = (phase == 0) ? (short_task_max_len + 1) : 752;
-        size_t current_max_backtrack_size = current_max_antidiag * current_max_n_col;
+        // Long phase: n_col and antidiag are computed PER BATCH below to handle varying bandwidths.
+        size_t current_max_antidiag = 2 * short_task_max_len;          // used only for phase 0
+        size_t current_max_n_col    = short_task_max_len + 1;          // used only for phase 0
+        size_t current_max_backtrack_size = current_max_antidiag * current_max_n_col;  // phase 0
         size_t current_max_cigar_len = (phase == 0) ? (2 * short_task_max_len) : (2 * dev_mem->max_align_query_len);
 
         if (n_tasks_in_phase == 0) continue;  // Skip empty phase
@@ -603,18 +604,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // Calculate offsets and prepare sequences for this batch
             for (int i = 0; i < batch_size; i++) {
                 int task_idx = current_task_indices[batch_start + i];
-
-                // Validate sequence lengths against buffer limits
-                if (tasks[task_idx].qlen > max_query_len_limit) {
-                    fprintf(stderr, "[WARNING] Task %d: qlen=%d exceeds max_query_len=%zu, clamping\n",
-                            task_idx, tasks[task_idx].qlen, max_query_len_limit);
-                    tasks[task_idx].qlen = max_query_len_limit;
-                }
-                if (tasks[task_idx].tlen > max_query_len_limit) {
-                    fprintf(stderr, "[WARNING] Task %d: tlen=%d exceeds max_query_len=%zu, clamping\n",
-                            task_idx, tasks[task_idx].tlen, max_query_len_limit);
-                    tasks[task_idx].tlen = max_query_len_limit;
-                }
 
                 // Align to 8-byte boundary for AGATHA
                 size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
@@ -704,13 +693,71 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // ===== Persistent KSW Kernel (unified anti-diagonal, int32 dual-affine) =====
             // Both phases use the same fused persistent kernel with direct int32 H/E/F/E2/F2.
             // Anti-diagonal backtrack with banding for all task sizes.
+            //
+            // THREE-TIER buffer management:
+            //   Phase 0 (short): fixed n_col = short_task_max_len+1, antidiag = 2*short_task_max_len
+            //   Phase 1 (long):  per-batch dynamic n_col and antidiag computed from actual tasks
+            //                    Uses a separate bt_off buffer with long antidiag stride (100,000)
+            //                    to avoid corrupting adjacent allocations (the short bt_off only
+            //                    has 2*short_task_max_len=2000 entries per slot).
+            //
+            // Concurrent slots = bt_p_total / per_task_backtrack_bytes, capped at
+            // n_long_concurrent_slots (which sizes the bt_off_long allocation).
+
             size_t bt_p_total_bytes = (size_t)n_concurrent_blocks *
                                       dev_mem->max_align_backtrack_size;
 
-            size_t max_slots_this_phase = bt_p_total_bytes /
-                                          (size_t)current_max_backtrack_size;
+            // Per-batch backtrack parameters (overridden for long phase below)
+            size_t batch_max_backtrack_size = current_max_backtrack_size;
+            size_t batch_max_antidiag       = current_max_antidiag;
+            int   *d_bt_off_batch           = d_backtrack_off;
+            int   *d_bt_off_end_batch       = d_backtrack_off_end;
+            int    max_slots_cap            = n_concurrent_blocks;
 
-            int phase_concurrent_slots = n_concurrent_blocks;
+            if (phase == 1) {
+                // Scan this batch to find actual maximum n_col and antidiag needed.
+                // n_col = min(min(qlen, tlen), w+1)  (mirrors kernel line 244-245)
+                size_t actual_max_n_col    = 1;
+                size_t actual_max_antidiag = 1;
+                for (int i = 0; i < batch_size; i++) {
+                    int tidx = current_task_indices[batch_start + i];
+                    int ql   = tasks[tidx].qlen;
+                    int tl   = tasks[tidx].tlen;
+                    int w    = tasks[tidx].w;
+                    int nc   = (ql < tl) ? ql : tl;
+                    if (w >= 0 && w + 1 < nc) nc = w + 1;
+                    size_t ad = (size_t)ql + (size_t)tl;
+                    if ((size_t)nc > actual_max_n_col)    actual_max_n_col    = nc;
+                    if (ad > actual_max_antidiag) actual_max_antidiag = ad;
+                }
+                // The bt_p slot stride = actual_max_antidiag × actual_max_n_col.
+                // We use the REAL per-batch values so the bt_p pool is redistributed
+                // correctly among concurrent slots — no wasted space, no overflow.
+                size_t max_antidiag_long = 2 * (size_t)dev_mem->max_align_query_len;
+                if (actual_max_antidiag > max_antidiag_long)
+                    actual_max_antidiag = max_antidiag_long;
+
+                batch_max_backtrack_size = actual_max_antidiag * actual_max_n_col;
+
+                // IMPORTANT: batch_max_antidiag passed to the kernel is used as the
+                // per-slot STRIDE in backtrack_off (off = backtrack_off + slot_id * max_antidiag).
+                // This stride MUST match the allocation stride of d_align_backtrack_off_long,
+                // which was allocated as n_long_concurrent_slots × max_antidiag_long × sizeof(int).
+                // Therefore we always pass max_antidiag_long (not actual_max_antidiag) here.
+                batch_max_antidiag = max_antidiag_long;
+
+                // Use long-task bt_off buffers (stride = max_antidiag_long per slot)
+                d_bt_off_batch     = dev_mem->d_align_backtrack_off_long;
+                d_bt_off_end_batch = dev_mem->d_align_backtrack_off_end_long;
+                // Concurrent slots bounded by the long-tier bt_off allocation
+                max_slots_cap = dev_mem->n_long_concurrent_slots;
+            }
+
+            size_t max_slots_this_phase = (batch_max_backtrack_size > 0)
+                ? (bt_p_total_bytes / batch_max_backtrack_size)
+                : (size_t)n_concurrent_blocks;
+
+            int phase_concurrent_slots = max_slots_cap;
             if ((size_t)phase_concurrent_slots > max_slots_this_phase)
                 phase_concurrent_slots = (int)max_slots_this_phase;
             if (phase_concurrent_slots > batch_size)
@@ -722,9 +769,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             {
                 int parallel_threads = 32;   // one warp per block
-                fprintf(stderr, "\n[DEBUG::%s] Phase%d launch: blocks=%d, batch=%d, bt_size=%zu\n",
+                fprintf(stderr, "\n[DEBUG::%s] Phase%d launch: blocks=%d, batch=%d, bt_size=%zu, max_antidiag=%zu\n",
                         __func__, phase, phase_concurrent_slots, batch_size,
-                        current_max_backtrack_size);
+                        batch_max_backtrack_size, batch_max_antidiag);
                 ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
                                               0, align_stream>>>(
                     d_task_counter,
@@ -737,10 +784,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     (gasal_res_t*)device_res,
                     d_mat,
                     d_backtrack_p,
-                    d_backtrack_off,
-                    d_backtrack_off_end,
-                    (int)current_max_backtrack_size,
-                    (int)current_max_antidiag,
+                    d_bt_off_batch,
+                    d_bt_off_end_batch,
+                    (int)batch_max_backtrack_size,
+                    (int)batch_max_antidiag,
                     d_ksw_temp_buffer,
                     d_flag,
                     d_bw,

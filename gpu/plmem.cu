@@ -449,23 +449,22 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     }
 
     if (print_info) {
-        size_t bt_p_mb = (size_t)dev_mem->n_align_concurrent_blocks *
-                         dev_mem->max_align_backtrack_size / (1024*1024);
-        size_t bt_off_long_mb = (size_t)dev_mem->n_long_concurrent_slots *
-                                2 * dev_mem->max_align_query_len * sizeof(int) / (1024*1024);
+        double GB = 1024.0*1024.0*1024.0;
+        double bt_p_gb = (double)dev_mem->n_align_concurrent_blocks *
+                         dev_mem->max_align_backtrack_size / GB;
+        double bt_off_long_gb = (double)dev_mem->n_long_concurrent_slots *
+                                2 * dev_mem->max_align_query_len * sizeof(int) / GB;
         fprintf(stderr, "[Info] GPU arena: %.2f GB total, %.2f GB free  (%d stream%s, %.2f GB each)\n",
-                total_mem / (1024.0*1024.0*1024.0), free_mem / (1024.0*1024.0*1024.0),
+                total_mem / GB, free_mem / GB,
                 num_streams, num_streams > 1 ? "s" : "",
-                arena_size / (1024.0*1024.0*1024.0));
-        fprintf(stderr, "[Info]   Chain phase: %.0f MB  |  Align phase: %.0f MB\n",
-                chain_size / (1024.0*1024.0), align_size / (1024.0*1024.0));
-        fprintf(stderr, "[Info]   Align config: max_tasks=%zu  short_batch=%d  long_batch=%d"
-                        "  n_concurrent=%d\n",
+                arena_size / GB);
+        fprintf(stderr, "[Info]   Chain phase: %.2f GB  |  Align phase: %.2f GB\n",
+                chain_size / GB, align_size / GB);
+        fprintf(stderr, "[Info]   Align config: max_tasks=%zu  short_batch=%d  long_batch=%d  n_concurrent=%d\n",
                 dev_mem->max_align_tasks, dev_mem->short_task_batch_size,
                 dev_mem->long_task_batch_size, dev_mem->n_align_concurrent_blocks);
-        fprintf(stderr, "[Info]   Backtrack pool: %zu MB  |  bt_off long: %zu MB"
-                        " (%d slots × 100k stride)\n",
-                bt_p_mb, bt_off_long_mb, dev_mem->n_long_concurrent_slots);
+        fprintf(stderr, "[Info]   Backtrack pool: %.2f GB  |  bt_off long: %.2f GB (%d slots × 100k stride)\n",
+                bt_p_gb, bt_off_long_gb, dev_mem->n_long_concurrent_slots);
     }
 
     // Set up chain phase initially
@@ -507,8 +506,8 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         cudaMallocHost(&dev_mem->h_align_task_to_align_id, mbs * sizeof(int32_t));
 
         if (print_info)
-            fprintf(stderr, "[Info]   Pinned host buffers: %.0f MB (max_batch=%zu)\n",
-                    (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0), mbs);
+            fprintf(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu)\n",
+                    (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0*1024.0), mbs);
     }
 
     cudaCheck();

@@ -420,8 +420,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         }
     }
 
+    // Convenience tag used for all per-stream log lines in this function
+    char stream_tag[32];
+    snprintf(stream_tag, sizeof(stream_tag), "stream_%d", stream_id);
+
     fprintf(stderr, "[Info::%s] Alignment: %d short (max_len≤%zubp) + %d long (max_len>%zubp, dynamic bt)\n",
-            __func__, n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
+            stream_tag, n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
 
     int kernel_threads = 256;
     uint8_t *d_unpacked_query = dev_mem->d_align_unpacked_query;
@@ -478,10 +482,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int total_batches_long = n_long_tasks > 0 ? (int)((n_long_tasks + long_batch_persistent - 1) / long_batch_persistent) : 0;
     int total_batches = total_batches_short + total_batches_long;
     fprintf(stderr, "[Info::%s]   Tier-0 (short): %d batch(es) × up to %zu tasks  [fixed bt stride: %zu×%zu bytes]\n",
-            __func__, total_batches_short, short_batch_persistent,
+            stream_tag, total_batches_short, short_batch_persistent,
             2 * short_task_max_len, short_task_max_len + 1);
     fprintf(stderr, "[Info::%s]   Tier-1 (long):  %d batch(es) × up to %zu tasks  [dynamic bt stride per batch]\n",
-            __func__, total_batches_long, long_batch_persistent);
+            stream_tag, total_batches_long, long_batch_persistent);
 
     size_t max_batch_size = (short_batch_persistent > long_batch_persistent) ?
                              short_batch_persistent : long_batch_persistent;
@@ -550,7 +554,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
         if (n_tasks_in_phase == 0) continue;  // Skip empty phase
 
-        fprintf(stderr, "[Info::%s] === %s: %d tasks ===\n", __func__, phase_name, n_tasks_in_phase);
+        fprintf(stderr, "[Info::%s] === %s: %d tasks ===\n", stream_tag, phase_name, n_tasks_in_phase);
 
         // Problem: result buffers are 120,000 elements but we only clear phase_batch_size
         // This causes long phase to read stale data from short phase!
@@ -1004,14 +1008,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             tasks_processed_in_phase += batch_size;
             total_tasks_processed += batch_size;
             fprintf(stderr, "[Info::%s] %s [%d/%d] tasks=%d slots=%d bt_stride=%zu  (%d/%d done)\n",
-                    __func__, phase_name, batch_num, total_batches,
+                    stream_tag, phase_name, batch_num, total_batches,
                     batch_size, phase_concurrent_slots, batch_max_backtrack_size,
                     tasks_processed_in_phase, n_tasks_in_phase);
         }  // End of batch loop within phase
     }  // End of three-tier loop
 
     fprintf(stderr, "[Info::%s] Alignment complete: %d tasks in %d batches\n",
-            __func__, n_tasks, batch_num);
+            stream_tag, n_tasks, batch_num);
 
     // Cleanup phase-specific arrays
     free(task_indices_short);

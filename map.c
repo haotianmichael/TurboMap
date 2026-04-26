@@ -1381,7 +1381,7 @@ static int g_nm_count = 0, g_nm_total = 0;
 static int g_drop_nm_count = 0;
 static int g_nm_atexit_registered = 0;
 static void g_nm_atexit_handler(void) {
-    fprintf(stderr, "[DEBUG] === FINAL: %d normal mismatches / %d checked, %d dropped mismatches ===\n",
+    fprintf(stderr, "\n[DEBUG] === FINAL: %d normal mismatches / %d checked, %d dropped mismatches ===\n",
             g_nm_count, g_nm_total, g_drop_nm_count);
 }
 

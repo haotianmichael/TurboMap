@@ -12,7 +12,7 @@
 #include "plutils.h"
 #endif  // (__AMD_SPLIT_KERNELS__)
 
-#define MM_VERSION "2.24-mm2-gb-biosys"
+#define MM_VERSION "2.24-TurboMap"
 
 #ifdef __linux__
 #include <sys/resource.h>

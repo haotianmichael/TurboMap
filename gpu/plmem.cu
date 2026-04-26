@@ -454,9 +454,22 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         dev_mem->arena.offset     = 0;
     }
 
-    fprintf(stderr, " [Arena] Align phase needs: %.2f MB (%.2f GB) [max_tasks=%zu, short_batch=%d, long_batch=%d]\n",
-            align_size / (1024.0*1024.0), align_size / (1024.0*1024.0*1024.0),
-            dev_mem->max_align_tasks, dev_mem->short_task_batch_size, dev_mem->long_task_batch_size);
+    fprintf(stderr, " [Arena] Align phase needs: %.2f MB (%.2f GB)\n",
+            align_size / (1024.0*1024.0), align_size / (1024.0*1024.0*1024.0));
+    fprintf(stderr, " [Arena]   max_tasks=%zu  short_batch=%d  long_batch=%d  n_concurrent=%d\n",
+            dev_mem->max_align_tasks, dev_mem->short_task_batch_size,
+            dev_mem->long_task_batch_size, dev_mem->n_align_concurrent_blocks);
+    {
+        size_t bt_p_mb = (size_t)dev_mem->n_align_concurrent_blocks *
+                         dev_mem->max_align_backtrack_size / (1024*1024);
+        size_t bt_off_mb  = (size_t)dev_mem->n_align_concurrent_blocks *
+                            2 * dev_mem->short_task_max_len * sizeof(int) / (1024*1024);
+        size_t bt_off_long_mb = (size_t)dev_mem->n_long_concurrent_slots *
+                                2 * dev_mem->max_align_query_len * sizeof(int) / (1024*1024);
+        fprintf(stderr, " [Arena]   Backtrack pool (shared short+long): %zu MB  "
+                        "bt_off short: %zu MB  bt_off long: %zu MB (%d slots × 100k stride)\n",
+                bt_p_mb, bt_off_mb, bt_off_long_mb, dev_mem->n_long_concurrent_slots);
+    }
 
     // Set up chain phase initially
     setup_chain_phase(dev_mem, anchor_per_batch, range_grid_size, num_cut);

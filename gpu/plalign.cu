@@ -386,22 +386,26 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     // Switch arena from chain phase to align phase
     plmem_phase_to_align(dev_mem);
 
-    // ========== Two-Tier Batched Processing Setup ==========
-    // Strategy: Process short tasks (max_len <= 1000bp) first with large batches,
-    //           then process long tasks (max_len > 1000bp) with smaller batches
-    //
-    // This optimizes memory usage because:
-    // - Short tasks (90% of workload): 10,000 tasks/batch × 1.5MB = ~15GB backtrack
-    // - Long tasks (10% of workload): 200 tasks/batch × 75MB = ~14.3GB backtrack
-
+    // ========== Three-Tier Batched Processing Setup ==========
+    // Tasks are split into two runtime phases based on max sequence length:
+    //   Tier 0 (short): max(qlen,tlen) ≤ short_task_max_len (1000 bp)
+    //     - Fixed bt_p stride = max_antidiag_short × max_n_col_short (2MB/slot)
+    //     - Up to n_concurrent_blocks concurrent slots
+    //   Tier 1 (long): max(qlen,tlen) > short_task_max_len
+    //     - Per-batch dynamic bt_p stride = actual_max_antidiag × actual_max_n_col
+    //       so extra-long reads with large bandwidth (e.g. bw_long=7501) get
+    //       a correctly-sized buffer with fewer concurrent slots
+    //     - Separate bt_off buffer (max_antidiag_long stride) prevents the
+    //       short-tier off arrays (stride 2000) from being overwritten
+    //     - Concurrent slots = min(n_long_concurrent_slots,
+    //                              bt_p_total / batch_max_backtrack_size)
 
     int kernel_blocks = 28;
     size_t short_task_max_len = dev_mem->short_task_max_len;      // 1000bp
     size_t short_batch_size = dev_mem->short_task_batch_size;      // 10,000
     size_t long_batch_size = dev_mem->long_task_batch_size;        // 200
 
-    // Phase 1: Classify tasks by length
-    // CRITICAL: Use max(qlen, tlen) NOT (qlen+tlen) to prevent buffer overflow
+    // Classify tasks into short (tier-0) / long (tier-1) by max sequence length
     int *task_indices_short = (int*)malloc(n_tasks * sizeof(int));
     int *task_indices_long = (int*)malloc(n_tasks * sizeof(int));
     int n_short_tasks = 0;
@@ -416,7 +420,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         }
     }
 
-    fprintf(stderr, "[Info::%s] Two-tier processing: %d short tasks (max_len≤%zubp) + %d long tasks (max_len>%zubp)\n",
+    fprintf(stderr, "[Info::%s] Three-tier alignment: %d short tasks (max_len≤%zubp) + %d long tasks (max_len>%zubp)\n",
             __func__, n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
 
     int kernel_threads = 256;
@@ -473,9 +477,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int total_batches_short = n_short_tasks > 0 ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
     int total_batches_long = n_long_tasks > 0 ? (int)((n_long_tasks + long_batch_persistent - 1) / long_batch_persistent) : 0;
     int total_batches = total_batches_short + total_batches_long;
-    fprintf(stderr, "[Info::%s]   Short: %d kernel launches × %zu tasks/launch (max_align_tasks=%zu)\n",
-            __func__, total_batches_short, short_batch_persistent, (size_t)dev_mem->max_align_tasks);
-    fprintf(stderr, "[Info::%s]   Long:  %d kernel launches × %zu tasks/launch\n",
+    fprintf(stderr, "[Info::%s]   Tier-0 (short): %d batch(es) × up to %zu tasks  [fixed bt stride: %zu×%zu bytes]\n",
+            __func__, total_batches_short, short_batch_persistent,
+            2 * short_task_max_len, short_task_max_len + 1);
+    fprintf(stderr, "[Info::%s]   Tier-1 (long):  %d batch(es) × up to %zu tasks  [dynamic bt stride per batch]\n",
             __func__, total_batches_long, long_batch_persistent);
 
     size_t max_batch_size = (short_batch_persistent > long_batch_persistent) ?
@@ -519,9 +524,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                               d_mqe, d_mqe_t, d_mte, d_mte_q, d_zdropped);
     CHECKCUDAERROR(cudaGetLastError());
 
-    // ========== TWO-TIER BATCHED PROCESSING LOOP ==========
-    // We'll process both phases (short and long) using a unified loop
-    // Phase selector: 0 = short tasks, 1 = long tasks
+    // ========== THREE-TIER BATCHED PROCESSING LOOP ==========
+    // Phase 0 = short tasks (tier-0), phase 1 = long tasks (tier-1)
+    // Tier-1 further adapts bt buffer size per batch (dynamic tier within the loop)
 
     int batch_num = 0;
     int total_tasks_processed = 0;
@@ -532,7 +537,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         int n_tasks_in_phase = (phase == 0) ? n_short_tasks : n_long_tasks;
         // Use persistent-kernel batch sizes (CIGAR-buffer limited, not backtrack-limited)
         size_t current_batch_size = (phase == 0) ? short_batch_persistent : long_batch_persistent;
-        const char *phase_name = (phase == 0) ? "Short Tasks" : "Long Tasks";
+        const char *phase_name = (phase == 0) ? "Tier-0 Short" : "Tier-1 Long";
 
         // Dynamic backtrack buffer sizing based on phase
         // Short phase stride caps n_col at (short_task_max_len + 1) to match plmem alloc, allowing
@@ -545,7 +550,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
         if (n_tasks_in_phase == 0) continue;  // Skip empty phase
 
-        fprintf(stderr, "[Info::%s] === Processing %s (phase %d/2) ===\n", __func__, phase_name, phase + 1);
+        fprintf(stderr, "[Info::%s] === %s: %d tasks ===\n", __func__, phase_name, n_tasks_in_phase);
 
         // Problem: result buffers are 120,000 elements but we only clear phase_batch_size
         // This causes long phase to read stale data from short phase!
@@ -695,14 +700,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // Anti-diagonal backtrack with banding for all task sizes.
             //
             // THREE-TIER buffer management:
-            //   Phase 0 (short): fixed n_col = short_task_max_len+1, antidiag = 2*short_task_max_len
-            //   Phase 1 (long):  per-batch dynamic n_col and antidiag computed from actual tasks
-            //                    Uses a separate bt_off buffer with long antidiag stride (100,000)
-            //                    to avoid corrupting adjacent allocations (the short bt_off only
-            //                    has 2*short_task_max_len=2000 entries per slot).
-            //
-            // Concurrent slots = bt_p_total / per_task_backtrack_bytes, capped at
-            // n_long_concurrent_slots (which sizes the bt_off_long allocation).
+            //   Tier-0 (short): bt_p stride fixed = max_antidiag_short × max_n_col_short
+            //                   bt_off stride = max_antidiag_short (2000) — matches allocation
+            //   Tier-1 (long):  bt_p stride = actual_max_antidiag × actual_max_n_col (per batch)
+            //                   bt_off stride = max_antidiag_long (100,000) — matches long alloc
+            //                   Concurrent slots = min(n_long_slots, bt_p_total / bt_p_stride)
 
             size_t bt_p_total_bytes = (size_t)n_concurrent_blocks *
                                       dev_mem->max_align_backtrack_size;
@@ -769,8 +771,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             {
                 int parallel_threads = 32;   // one warp per block
-                fprintf(stderr, "\n[DEBUG::%s] Phase%d launch: blocks=%d, batch=%d, bt_size=%zu, max_antidiag=%zu\n",
-                        __func__, phase, phase_concurrent_slots, batch_size,
+                fprintf(stderr, "\n[Info::%s] %s batch %d: slots=%d tasks=%d bt_stride=%zu antidiag_stride=%zu\n",
+                        __func__, phase_name, batch_num, phase_concurrent_slots, batch_size,
                         batch_max_backtrack_size, batch_max_antidiag);
                 ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
                                               0, align_stream>>>(
@@ -1021,16 +1023,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             fflush(stderr);
         }  // End of batch loop within phase
 
-        // Phase completion message
-        fprintf(stderr, "\n[Info::%s] === %s completed: %d tasks processed ===\n",
+        fprintf(stderr, "\n[Info::%s] %s done: %d tasks processed\n",
                 __func__, phase_name, n_tasks_in_phase);
-    }  // End of two-phase loop
+    }  // End of three-tier loop
 
-    // Final progress update
-    fprintf(stderr, "[Align Progress] [");
-    for (int i = 0; i < 30; i++) fprintf(stderr, "=");
-    fprintf(stderr, "] 100%% (%d/%d tasks, %d batches) - DONE\n",
-            n_tasks, n_tasks, batch_num);
+    fprintf(stderr, "[Info::%s] Alignment complete: %d tasks, %d batches\n",
+            __func__, n_tasks, batch_num);
 
     // Cleanup phase-specific arrays
     free(task_indices_short);

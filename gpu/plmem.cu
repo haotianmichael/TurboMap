@@ -450,25 +450,35 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     }
 
     // ---- Allocate dedicated long-task bt_p pool from remaining VRAM ----
-    // The shared arena bt_p is sized for short tasks (2 MB/slot × 2560 ≈ 5 GB).
-    // For long tasks each slot may need hundreds of MB, so only ~9 slots fit in the
-    // arena pool.  We grab the remaining free VRAM (after all streams' arenas) to
-    // provide a dedicated pool that can host 30-100 concurrent long-task slots.
+    // The shared arena bt_p is sized for short tasks (2 MB/slot × n_concurrent ≈ 5 GB).
+    // For long tasks each slot needs antidiag × n_col bytes; using the shared pool limits
+    // concurrency.  We grab remaining VRAM (after reserving space for ALL future arenas)
+    // to provide a dedicated pool for more concurrent long-task slots.
     //
-    // Allocation strategy: measure free VRAM after this stream's arena; divide by
-    // the number of streams not yet initialized (including this one), leaving 512 MB
-    // as a global safety margin.
+    // Reservation rule: after this stream's arena, subtract the arena size needed by
+    // every stream that hasn't been initialized yet, plus a 512 MB safety margin.
+    // Only allocate if the resulting budget is at least 256 MB (otherwise pointless).
     {
         size_t free_after_arena = 0, total_tmp = 0;
         cudaMemGetInfo(&free_after_arena, &total_tmp);
-        int streams_remaining = num_streams - this_stream_idx;  // ≥1 (this stream + future ones)
-        const size_t SAFETY = (size_t)512 * 1024 * 1024;  // 512 MB global safety
-        size_t usable = (free_after_arena > SAFETY) ? (free_after_arena - SAFETY) : 0;
-        size_t this_pool = (streams_remaining > 0) ? (usable / streams_remaining) : 0;
+
+        // How many arenas still need to be allocated after this stream?
+        int streams_after_this = num_streams - 1 - this_stream_idx;  // ≥0
+        size_t reserve_for_future = (size_t)streams_after_this * arena_size
+                                    + (size_t)512 * 1024 * 1024;  // 512 MB safety
+
+        size_t usable_for_long_pools = 0;
+        if (free_after_arena > reserve_for_future)
+            usable_for_long_pools = free_after_arena - reserve_for_future;
+
+        // Split equally among ALL streams so each gets a consistent pool size.
+        size_t this_pool = (num_streams > 0) ? (usable_for_long_pools / num_streams) : 0;
 
         dev_mem->d_align_backtrack_p_long = nullptr;
         dev_mem->long_bt_p_pool_bytes = 0;
-        if (this_pool > 0) {
+        // Only bother if the pool is large enough to provide at least a few extra slots.
+        const size_t MIN_USEFUL_LONG_POOL = (size_t)256 * 1024 * 1024;  // 256 MB
+        if (this_pool >= MIN_USEFUL_LONG_POOL) {
             void *long_ptr = nullptr;
             cudaError_t cerr = cudaMalloc(&long_ptr, this_pool);
             if (cerr == cudaSuccess && long_ptr) {
@@ -477,11 +487,13 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             } else {
                 // Non-fatal: fall back to shared arena bt_p for long tasks (fewer concurrent slots)
                 fprintf(stderr, "[Warn] Failed to allocate long bt_p pool (%.2f GB); "
-                        "long-task concurrency will be limited by arena pool.\n",
+                        "long-task concurrency limited to arena pool.\n",
                         this_pool / (1024.0*1024.0*1024.0));
                 cudaGetLastError();  // clear the error
             }
         }
+        // If this_pool < MIN_USEFUL_LONG_POOL (e.g. arena fills nearly all VRAM with 2 streams),
+        // skip the allocation entirely — long tasks fall back to the shared arena bt_p pool.
     }
 
     if (print_info) {

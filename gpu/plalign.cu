@@ -587,11 +587,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         cudaMemset(d_mte_q, 0, max_align_tasks * sizeof(int32_t));*/
 
         int tasks_processed_in_phase = 0;
+        int phase_batch_num = 0;
+        int total_phase_batches = (n_tasks_in_phase > 0) ?
+            (int)((n_tasks_in_phase + (int)current_batch_size - 1) / (int)current_batch_size) : 0;
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
             int batch_size = (tasks_processed_in_phase + current_batch_size <= n_tasks_in_phase) ?
                              current_batch_size : (n_tasks_in_phase - tasks_processed_in_phase);
             batch_num++;
+            phase_batch_num++;
 
             // Clear ONLY result buffers before each batch to prevent reading stale data
             // If a task fails (zdropped etc), kernel may not write to result buffers
@@ -720,6 +724,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             int   *d_bt_off_end_batch       = d_backtrack_off_end;
             int    max_slots_cap            = n_concurrent_blocks;
 
+            // Diagnostic variables for long-batch logging (populated in the phase==1 block below)
+            int    diag_actual_max_qlen  = 0;
+            int    diag_actual_max_tlen  = 0;
+            int    diag_n_exceed         = 0;
+            size_t diag_actual_antidiag  = 0;
+            size_t diag_actual_n_col     = 0;
+
             if (phase == 1) {
                 // Scan this batch to find actual maximum n_col and antidiag needed.
                 // n_col = min(min(qlen, tlen), w+1)  (mirrors kernel line 244-245)
@@ -735,6 +746,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     size_t ad = (size_t)ql + (size_t)tl;
                     if ((size_t)nc > actual_max_n_col)    actual_max_n_col    = nc;
                     if (ad > actual_max_antidiag) actual_max_antidiag = ad;
+                    if (ql > diag_actual_max_qlen) diag_actual_max_qlen = ql;
+                    if (tl > diag_actual_max_tlen) diag_actual_max_tlen = tl;
+                    if (ql > (int)dev_mem->max_align_query_len ||
+                        tl > (int)dev_mem->max_align_query_len)
+                        diag_n_exceed++;
                 }
                 // The bt_p slot stride = actual_max_antidiag × actual_max_n_col.
                 // We use the REAL per-batch values so the bt_p pool is redistributed
@@ -744,6 +760,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     actual_max_antidiag = max_antidiag_long;
 
                 batch_max_backtrack_size = actual_max_antidiag * actual_max_n_col;
+                diag_actual_antidiag = actual_max_antidiag;
+                diag_actual_n_col    = actual_max_n_col;
 
                 // IMPORTANT: batch_max_antidiag passed to the kernel is used as the
                 // per-slot STRIDE in backtrack_off (off = backtrack_off + slot_id * max_antidiag).
@@ -769,6 +787,20 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             if (phase_concurrent_slots > batch_size)
                 phase_concurrent_slots = batch_size;
             if (phase_concurrent_slots < 1) phase_concurrent_slots = 1;
+
+            // For long batches: log actual task dimensions so we can tune max_align_query_len.
+            // max_qlen / max_tlen show what the KSW temp buffer must cover.
+            // exceed_limit counts tasks where max(qlen,tlen) > current limit (causes temp buf overflow).
+            if (phase == 1) {
+                fprintf(stderr,
+                    "[Info::%s] Long batch %d/%d: tasks=%d  max_qlen=%d  max_tlen=%d"
+                    "  antidiag=%zu  n_col=%zu  slots=%d  exceed_limit=%d (limit=%zu)\n",
+                    stream_tag, phase_batch_num, total_phase_batches, batch_size,
+                    diag_actual_max_qlen, diag_actual_max_tlen,
+                    diag_actual_antidiag, diag_actual_n_col,
+                    phase_concurrent_slots,
+                    diag_n_exceed, dev_mem->max_align_query_len);
+            }
 
             // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);

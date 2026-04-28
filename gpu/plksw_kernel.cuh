@@ -256,6 +256,20 @@ __global__ void ksw_fused_persistent_kernel(
         // ========== Main DP Loop: Anti-diagonal Traversal ==========
         int last_st = -1, last_en = -1;
         for (int r = 0; r < qlen + tlen - 1; r++) {
+            // Backtrack-buffer bounds guard.
+            // The bt/off arrays are allocated with max_antidiag slots per task.
+            // If qlen+tlen > max_antidiag the remaining antidiagonals would
+            // write out-of-bounds, corrupting adjacent slots and causing the
+            // GPU kernel to run for excessive iterations (observed: 84s hang).
+            // Rather than corrupt memory, we treat this as an early termination
+            // (equivalent to a z-drop at the buffer limit).  Tasks that hit this
+            // cap are marked zdropped so the CPU result-write path handles them
+            // gracefully — exactly the same as the old max_sw_mat zdrop behaviour.
+            if (r >= (int)max_antidiag) {
+                if (lane_id == 0) ez_zdropped = 1;
+                break;
+            }
+
             // Band boundaries
             int st = 0, en = tlen - 1;
             if (st < r - qlen + 1) st = r - qlen + 1;

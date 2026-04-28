@@ -217,7 +217,15 @@ typedef struct {
     // which is too small for long tasks whose antidiag can reach 2*max_align_query_len (100000).
     int *d_align_backtrack_off_long;
     int *d_align_backtrack_off_end_long;
-    int n_long_concurrent_slots;  // max concurrent slots for the long-task tier
+    int n_long_concurrent_slots;  // max concurrent slots for the long-task tier (bt_off_long cap)
+
+    // Long-task dedicated bt_p pool (cudaMalloc, NOT arena).
+    // The shared arena bt_p is sized for short tasks (2 MB/slot × 2560 = ~5 GB).
+    // For long tasks each slot needs antidiag × n_col bytes (e.g. 533 MB), so only ~9
+    // concurrent slots fit in the shared pool.  This separate pool uses the remaining
+    // VRAM (typically 10-20 GB on a 32 GB card) so long concurrency can reach 30-60 slots.
+    uint8_t *d_align_backtrack_p_long;   // dedicated long bt_p pool (outside arena)
+    size_t   long_bt_p_pool_bytes;       // total bytes allocated for the long pool
     uint32_t *d_align_cigar_buffer;
     int *d_align_cigar_lengths;
     size_t max_align_backtrack_size; // per task
@@ -364,7 +372,8 @@ void plmem_malloc_long_mem(longMemPtr *long_mem, size_t buffer_size_long);
 void plmem_free_host_mem(hostMemPtr *host_mem);
 void plmem_free_long_mem(longMemPtr *long_mem);
 void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
-                             int range_grid_size, int num_cut);
+                             int range_grid_size, int num_cut,
+                             int num_streams);
 void plmem_free_device_mem(deviceMemPtr *dev_mem);
 
 // Phase transitions: reclaim chain memory for alignment and vice versa.

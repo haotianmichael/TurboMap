@@ -710,10 +710,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // THREE-TIER buffer management:
             //   Tier-0 (short): bt_p stride fixed = max_antidiag_short × max_n_col_short
             //                   bt_off stride = max_antidiag_short (2000) — matches allocation
-            //   Tier-1 (long):  bt_p stride = actual_max_antidiag × actual_max_n_col (per batch)
+            //   Tier-1 (long):  bt_p from dedicated long pool (d_align_backtrack_p_long),
+            //                   bt_p stride = actual_max_antidiag × actual_max_n_col (per batch)
             //                   bt_off stride = max_antidiag_long (100,000) — matches long alloc
-            //                   Concurrent slots = min(n_long_slots, bt_p_total / bt_p_stride)
+            //                   Concurrent slots = min(n_long_slots, long_pool / bt_p_stride)
 
+            // Short phase: bt_p pool is the shared arena allocation.
             size_t bt_p_total_bytes = (size_t)n_concurrent_blocks *
                                       dev_mem->max_align_backtrack_size;
 
@@ -723,6 +725,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             int   *d_bt_off_batch           = d_backtrack_off;
             int   *d_bt_off_end_batch       = d_backtrack_off_end;
             int    max_slots_cap            = n_concurrent_blocks;
+            // bt_p pointer for the kernel: short uses arena, long uses dedicated pool
+            uint8_t *d_bt_p_batch           = d_backtrack_p;
 
             // Diagnostic variables for long-batch logging (populated in the phase==1 block below)
             int    diag_actual_max_qlen  = 0;
@@ -775,6 +779,16 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 d_bt_off_end_batch = dev_mem->d_align_backtrack_off_end_long;
                 // Concurrent slots bounded by the long-tier bt_off allocation
                 max_slots_cap = dev_mem->n_long_concurrent_slots;
+
+                // Use the dedicated long bt_p pool (if available) instead of the shared
+                // arena bt_p.  This unlocks 30-100× more concurrent slots for long tasks
+                // by utilizing the unused VRAM that was previously left idle.
+                if (dev_mem->d_align_backtrack_p_long != nullptr) {
+                    d_bt_p_batch    = dev_mem->d_align_backtrack_p_long;
+                    bt_p_total_bytes = dev_mem->long_bt_p_pool_bytes;
+                }
+                // If d_align_backtrack_p_long is null (allocation failed at init), we fall
+                // back to the shared arena bt_p — fewer slots but still correct.
             }
 
             size_t max_slots_this_phase = (batch_max_backtrack_size > 0)
@@ -792,13 +806,18 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // max_qlen / max_tlen show what the KSW temp buffer must cover.
             // exceed_limit counts tasks where max(qlen,tlen) > current limit (causes temp buf overflow).
             if (phase == 1) {
+                const char *pool_src = (dev_mem->d_align_backtrack_p_long != nullptr)
+                                       ? "dedicated" : "arena-fallback";
+                size_t max_slots_from_pool = (batch_max_backtrack_size > 0)
+                    ? (bt_p_total_bytes / batch_max_backtrack_size) : 0;
                 fprintf(stderr,
                     "[Info::%s] Long batch %d/%d: tasks=%d  max_qlen=%d  max_tlen=%d"
-                    "  antidiag=%zu  n_col=%zu  slots=%d  exceed_limit=%d (limit=%zu)\n",
+                    "  antidiag=%zu  n_col=%zu  slots=%d (pool=%s, pool_cap=%zu)"
+                    "  exceed_limit=%d (limit=%zu)\n",
                     stream_tag, phase_batch_num, total_phase_batches, batch_size,
                     diag_actual_max_qlen, diag_actual_max_tlen,
                     diag_actual_antidiag, diag_actual_n_col,
-                    phase_concurrent_slots,
+                    phase_concurrent_slots, pool_src, max_slots_from_pool,
                     diag_n_exceed, dev_mem->max_align_query_len);
             }
 
@@ -819,7 +838,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     d_target_offsets,
                     (gasal_res_t*)device_res,
                     d_mat,
-                    d_backtrack_p,
+                    d_bt_p_batch,
                     d_bt_off_batch,
                     d_bt_off_end_batch,
                     (int)batch_max_backtrack_size,

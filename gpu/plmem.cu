@@ -280,12 +280,10 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     // long tasks (antidiag up to 2*max_align_query_len = 100000).  We allocate a separate pair
     // with the full long-task antidiag stride.  The number of concurrent long-task slots is
     // bounded by both the bt_p pool capacity and this allocation.
-    // n_long_concurrent_slots = bt_p_total / (max_antidiag_long * max_n_col_long_upper)
-    // where max_n_col_long_upper is a safe upper bound for the largest expected bandwidth.
-    // We use 128 as a practical cap: for bw_long=7501 tasks each need ~183 MB of bt_p, so
-    // the actual concurrency will be limited by bt_p (~26 slots) not by this cap.
+    // n_long_concurrent_slots = 512: caps the bt_off_long allocation while the actual
+    // concurrency is dynamically determined by the dedicated long bt_p pool size in plalign.cu.
     size_t max_antidiag_long = 2 * dev_mem->max_align_query_len;  // 100,000
-    dev_mem->n_long_concurrent_slots = 128;
+    dev_mem->n_long_concurrent_slots = 512;
     size_t bt_off_long_bytes = (size_t)dev_mem->n_long_concurrent_slots *
                                max_antidiag_long * sizeof(int);
     dev_mem->d_align_backtrack_off_long     = (int*)arena_alloc(a, bt_off_long_bytes);
@@ -346,6 +344,9 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     static int arena_info_printed = 0;
     int print_info = !arena_info_printed;
     arena_info_printed = 1;
+    // Track stream allocation order so we can partition remaining VRAM evenly.
+    static int g_stream_alloc_idx = 0;
+    int this_stream_idx = g_stream_alloc_idx++;
     cudaSetDevice(CUDA_DEVICE);
 
     // Save parameters for phase transitions
@@ -448,12 +449,48 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         dev_mem->arena.offset     = 0;
     }
 
+    // ---- Allocate dedicated long-task bt_p pool from remaining VRAM ----
+    // The shared arena bt_p is sized for short tasks (2 MB/slot × 2560 ≈ 5 GB).
+    // For long tasks each slot may need hundreds of MB, so only ~9 slots fit in the
+    // arena pool.  We grab the remaining free VRAM (after all streams' arenas) to
+    // provide a dedicated pool that can host 30-100 concurrent long-task slots.
+    //
+    // Allocation strategy: measure free VRAM after this stream's arena; divide by
+    // the number of streams not yet initialized (including this one), leaving 512 MB
+    // as a global safety margin.
+    {
+        size_t free_after_arena = 0, total_tmp = 0;
+        cudaMemGetInfo(&free_after_arena, &total_tmp);
+        int streams_remaining = num_streams - this_stream_idx;  // ≥1 (this stream + future ones)
+        const size_t SAFETY = (size_t)512 * 1024 * 1024;  // 512 MB global safety
+        size_t usable = (free_after_arena > SAFETY) ? (free_after_arena - SAFETY) : 0;
+        size_t this_pool = (streams_remaining > 0) ? (usable / streams_remaining) : 0;
+
+        dev_mem->d_align_backtrack_p_long = nullptr;
+        dev_mem->long_bt_p_pool_bytes = 0;
+        if (this_pool > 0) {
+            void *long_ptr = nullptr;
+            cudaError_t cerr = cudaMalloc(&long_ptr, this_pool);
+            if (cerr == cudaSuccess && long_ptr) {
+                dev_mem->d_align_backtrack_p_long = (uint8_t*)long_ptr;
+                dev_mem->long_bt_p_pool_bytes = this_pool;
+            } else {
+                // Non-fatal: fall back to shared arena bt_p for long tasks (fewer concurrent slots)
+                fprintf(stderr, "[Warn] Failed to allocate long bt_p pool (%.2f GB); "
+                        "long-task concurrency will be limited by arena pool.\n",
+                        this_pool / (1024.0*1024.0*1024.0));
+                cudaGetLastError();  // clear the error
+            }
+        }
+    }
+
     if (print_info) {
         double GB = 1024.0*1024.0*1024.0;
         double bt_p_gb = (double)dev_mem->n_align_concurrent_blocks *
                          dev_mem->max_align_backtrack_size / GB;
         double bt_off_long_gb = (double)dev_mem->n_long_concurrent_slots *
                                 2 * dev_mem->max_align_query_len * sizeof(int) / GB;
+        double long_pool_gb = dev_mem->long_bt_p_pool_bytes / GB;
         fprintf(stderr, "[Info] GPU arena: %.2f GB total, %.2f GB free  (%d stream%s, %.2f GB each)\n",
                 total_mem / GB, free_mem / GB,
                 num_streams, num_streams > 1 ? "s" : "",
@@ -463,8 +500,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         fprintf(stderr, "[Info]   Align config: max_tasks=%zu  short_batch=%d  long_batch=%d  n_concurrent=%d\n",
                 dev_mem->max_align_tasks, dev_mem->short_task_batch_size,
                 dev_mem->long_task_batch_size, dev_mem->n_align_concurrent_blocks);
-        fprintf(stderr, "[Info]   Backtrack pool: %.2f GB  |  bt_off long: %.2f GB (%d slots × 100k stride)\n",
-                bt_p_gb, bt_off_long_gb, dev_mem->n_long_concurrent_slots);
+        fprintf(stderr, "[Info]   Short bt_p pool (arena): %.2f GB  |  Long bt_p pool (dedicated): %.2f GB\n",
+                bt_p_gb, long_pool_gb);
+        fprintf(stderr, "[Info]   bt_off long: %.2f GB (%d slots × 100k stride)\n",
+                bt_off_long_gb, dev_mem->n_long_concurrent_slots);
     }
 
     // Set up chain phase initially
@@ -519,6 +558,12 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
         dev_mem->arena.base       = nullptr;
         dev_mem->arena.total_size = 0;
         dev_mem->arena.offset     = 0;
+    }
+    // Free dedicated long-task bt_p pool (allocated outside arena)
+    if (dev_mem->d_align_backtrack_p_long) {
+        cudaFree(dev_mem->d_align_backtrack_p_long);
+        dev_mem->d_align_backtrack_p_long = nullptr;
+        dev_mem->long_bt_p_pool_bytes = 0;
     }
     // Free pre-allocated pinned host buffers
     cudaFreeHost(dev_mem->h_align_compact_cigar);

@@ -626,9 +626,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
             current_batch_size    = long_batch_persistent;
 
-            // Recompute total_phase_batches for the log
-            total_phase_batches = (int)((n_tasks_in_phase + (int)current_batch_size - 1)
-                                        / (int)current_batch_size);
+            // total_phase_batches will be (re)computed below when it is declared,
+            // using the already-updated current_batch_size. No assignment needed here.
         }
 
         fprintf(stderr, "[Info::%s] === %s: %d tasks ===\n", stream_tag, phase_name, n_tasks_in_phase);

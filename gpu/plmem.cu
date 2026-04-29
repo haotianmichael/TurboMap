@@ -318,7 +318,7 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_mte             = (int32_t*)arena_alloc(a, res);
     dev_mem->d_align_mte_q           = (int32_t*)arena_alloc(a, res);
     dev_mem->d_align_zdropped        = (int32_t*)arena_alloc(a, res);
-    dev_mem->d_align_task_to_align_id= (int32_t*)arena_alloc(a, res);
+    // d_align_task_to_align_id removed — it was always the identity mapping (i→i).
     dev_mem->d_align_mat             = (int8_t*)arena_alloc(a, 25 * sizeof(int8_t));
     dev_mem->d_align_task_counter    = (int*)arena_alloc(a, sizeof(int));
 
@@ -453,7 +453,7 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_mte              = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
     dev_mem->d_align_mte_q            = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
     dev_mem->d_align_zdropped         = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
-    dev_mem->d_align_task_to_align_id = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
+    // d_align_task_to_align_id removed — it was always the identity mapping (i→i).
     dev_mem->d_align_mat              = (int8_t*)arena_alloc(a, 25 * sizeof(int8_t));
 
     // ---- Persistent kernel counter ----
@@ -681,11 +681,24 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         cudaMallocHost(&dev_mem->h_align_target_lens,      mbs * sizeof(uint32_t));
         cudaMallocHost(&dev_mem->h_align_flag,             mbs * sizeof(int32_t));
         cudaMallocHost(&dev_mem->h_align_bw,                mbs * sizeof(int32_t));
-        cudaMallocHost(&dev_mem->h_align_task_to_align_id, mbs * sizeof(int32_t));
+
+        // Pinned sequence staging buffers for H2D — replaces per-batch calloc/free.
+        // Sized to cover the largest possible batch: short or long phase, whichever needs more.
+        {
+            size_t short_seq = (size_t)dev_mem->short_task_batch_size *
+                               (((size_t)dev_mem->short_task_max_len + 7) & ~(size_t)7);
+            size_t long_seq  = (size_t)dev_mem->long_task_batch_size *
+                               (size_t)dev_mem->max_align_query_len;
+            size_t seq_staging = (short_seq > long_seq) ? short_seq : long_seq;
+            dev_mem->h_align_seq_staging_bytes = seq_staging;
+            cudaMallocHost(&dev_mem->h_align_unpacked_query,  seq_staging);
+            cudaMallocHost(&dev_mem->h_align_unpacked_target, seq_staging);
+        }
 
         if (print_info)
-            fprintf(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu)\n",
-                    (cigar_buf_sz * 4 + mbs * 21 * 4) / (1024.0*1024.0*1024.0), mbs);
+            fprintf(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu, seq_staging=%.2f MB each)\n",
+                    (cigar_buf_sz * 4 + mbs * 20 * 4) / (1024.0*1024.0*1024.0), mbs,
+                    dev_mem->h_align_seq_staging_bytes / (1024.0*1024.0));
     }
 
     cudaCheck();
@@ -727,7 +740,8 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFreeHost(dev_mem->h_align_target_lens);
     cudaFreeHost(dev_mem->h_align_flag);
     cudaFreeHost(dev_mem->h_align_bw);
-    cudaFreeHost(dev_mem->h_align_task_to_align_id);
+    cudaFreeHost(dev_mem->h_align_unpacked_query);
+    cudaFreeHost(dev_mem->h_align_unpacked_target);
     cudaCheck();
 }
 

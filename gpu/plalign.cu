@@ -549,7 +549,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     uint32_t *h_target_lens     = dev_mem->h_align_target_lens;
     int32_t  *h_flag            = dev_mem->h_align_flag;
     int32_t  *h_bw              = dev_mem->h_align_bw;
-    int32_t  *h_task_to_align_id = dev_mem->h_align_task_to_align_id;
+    // h_task_to_align_id was always identity (i→i) — use i directly instead.
 
     int8_t h_scoring_matrix[25];
     ksw_gen_simple_mat(5, h_scoring_matrix, opt->a, opt->b, opt->sc_ambi);
@@ -732,59 +732,47 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemset(d_mte_q, 0, batch_size * sizeof(int32_t));
             cudaMemset(d_cigar_lengths, 0, batch_size * sizeof(int));*/
 
-            // Calculate memory requirements for this batch
+            // Pinned staging buffers pre-allocated once in plmem.cu — no per-batch calloc.
+            uint8_t *h_unpacked_query  = dev_mem->h_align_unpacked_query;
+            uint8_t *h_unpacked_target = dev_mem->h_align_unpacked_target;
+
+            // Single pass: compute offsets, fill metadata, copy sequences, pad with N.
             size_t total_query_bytes = 0, total_target_bytes = 0;
             uint32_t max_query_len = 0;
+            const uint8_t N_BASE = 4;
 
-            // Calculate offsets and prepare sequences for this batch
             for (int i = 0; i < batch_size; i++) {
                 int task_idx = current_task_indices[batch_start + i];
+                int qlen = tasks[task_idx].qlen;
+                int tlen = tasks[task_idx].tlen;
 
                 // Align to 8-byte boundary for AGATHA
-                size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
-                size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
+                size_t qlen_aligned = ((qlen + 7) / 8) * 8;
+                size_t tlen_aligned = ((tlen + 7) / 8) * 8;
 
-                h_query_offsets[i] = total_query_bytes;
-                h_target_offsets[i] = total_target_bytes;
-                h_query_lens[i] = tasks[task_idx].qlen;
-                h_target_lens[i] = tasks[task_idx].tlen;
-                h_flag[i] = tasks[task_idx].flag;
-                h_bw[i]   = tasks[task_idx].w;
+                h_query_offsets[i]  = (uint32_t)total_query_bytes;
+                h_target_offsets[i] = (uint32_t)total_target_bytes;
+                h_query_lens[i]     = (uint32_t)qlen;
+                h_target_lens[i]    = (uint32_t)tlen;
+                h_flag[i]           = tasks[task_idx].flag;
+                h_bw[i]             = tasks[task_idx].w;
 
-                total_query_bytes += qlen_aligned;
+                // Copy sequences into pinned staging buffer
+                memcpy(h_unpacked_query  + total_query_bytes,
+                       seq_buffer + tasks[task_idx].qseq_offset, qlen);
+                memcpy(h_unpacked_target + total_target_bytes,
+                       seq_buffer + tasks[task_idx].tseq_offset, tlen);
+
+                // Pad tail with N (0x0F) up to 8-byte alignment
+                for (int j = qlen; j < (int)qlen_aligned; j++)
+                    h_unpacked_query[total_query_bytes + j] = N_BASE;
+                for (int j = tlen; j < (int)tlen_aligned; j++)
+                    h_unpacked_target[total_target_bytes + j] = N_BASE;
+
+                total_query_bytes  += qlen_aligned;
                 total_target_bytes += tlen_aligned;
 
-                if (tasks[task_idx].qlen > max_query_len) {
-                    max_query_len = tasks[task_idx].qlen;
-                }
-
-                // Store task-to-alignment mapping
-                h_task_to_align_id[i] = i;
-            }
-
-
-            // Prepare unpacked sequences for this batch
-            uint8_t *h_unpacked_query = (uint8_t*)calloc(total_query_bytes, 1);
-            uint8_t *h_unpacked_target = (uint8_t*)calloc(total_target_bytes, 1);
-
-            const uint8_t N_BASE = 4;
-            for (int i = 0; i < batch_size; i++) {
-                int task_idx = current_task_indices[batch_start + i];
-                // Copy sequences
-                memcpy(h_unpacked_query + h_query_offsets[i],
-                       seq_buffer + tasks[task_idx].qseq_offset, tasks[task_idx].qlen);
-                memcpy(h_unpacked_target + h_target_offsets[i],
-                       seq_buffer + tasks[task_idx].tseq_offset, tasks[task_idx].tlen);
-
-                // Pad with N (0x0F)
-                size_t qlen_aligned = ((tasks[task_idx].qlen + 7) / 8) * 8;
-                size_t tlen_aligned = ((tasks[task_idx].tlen + 7) / 8) * 8;
-                for (int j = tasks[task_idx].qlen; j < qlen_aligned; j++) {
-                    h_unpacked_query[h_query_offsets[i] + j] = N_BASE;
-                }
-                for (int j = tasks[task_idx].tlen; j < tlen_aligned; j++) {
-                    h_unpacked_target[h_target_offsets[i] + j] = N_BASE;
-                }
+                if ((uint32_t)qlen > max_query_len) max_query_len = qlen;
             }
 
 
@@ -1131,7 +1119,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // Map results back to tasks
             for (int i = 0; i < batch_size; i++) {
                 int task_idx = current_task_indices[batch_start + i];  // Use task index from current phase
-                int align_id = h_task_to_align_id[i];
+                int align_id = i;  // always identity; h_task_to_align_id removed
 
                 tasks[task_idx].score = h_scores[align_id];
                 // In approx_max mode (KSW_EZ_APPROX_MAX), max_q/max_t are not tracked and should be -1
@@ -1189,9 +1177,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
 
 
-            // Cleanup batch buffers
-            free(h_unpacked_query);
-            free(h_unpacked_target);
+            // h_unpacked_query/target point to pinned dev_mem buffers — no free needed.
 
             tasks_processed_in_phase += batch_size;
             total_tasks_processed += batch_size;

@@ -255,7 +255,7 @@ typedef struct {
     int32_t *d_align_mte;            // max score when reaching end of target
     int32_t *d_align_mte_q;          // query position when reaching end of target
     int32_t *d_align_zdropped;       // z-drop flag per task
-    int32_t *d_align_task_to_align_id;
+    // NOTE: d_align_task_to_align_id removed — it was always identity (i→i).
     int8_t *d_align_mat;             // scoring matrix
 
     // Persistent kernel configuration
@@ -324,7 +324,15 @@ typedef struct {
     uint32_t *h_align_target_lens;
     int32_t  *h_align_flag;
     int32_t  *h_align_bw;
-    int32_t  *h_align_task_to_align_id;
+    // NOTE: h_align_task_to_align_id removed — it was always the identity mapping (i→i).
+
+    // Pinned sequence staging buffers for H2D (cudaMallocHost).
+    // Pre-allocated once; reused every batch to avoid per-batch calloc/free
+    // and to enable truly async cudaMemcpyAsync (non-pinned falls back to sync).
+    // Sized for max(short_batch × short_max_len, long_batch × max_align_query_len).
+    uint8_t *h_align_unpacked_query;    // pinned, max_seq_staging_bytes
+    uint8_t *h_align_unpacked_target;   // pinned, max_seq_staging_bytes
+    size_t   h_align_seq_staging_bytes; // capacity of each staging buffer
 
 } deviceMemPtr;
 

@@ -298,6 +298,21 @@ typedef struct {
     int      *bt_h_offset;           // host: per-read offset in d_bt_*_out
     int      *bt_h_n_u;              // host: chains per read
 
+    // Pinned bulk D2H staging for compacted backtrack anchor output.
+    // Pre-allocated once (sized d_bt_max_total_n) to enable a single
+    // bulk cudaMemcpyAsync + one cudaStreamSynchronize for ALL reads,
+    // replacing the previous n_reads separate malloc/D2H/sync/free calls.
+    int32_t  *h_bt_ax_out;    // pinned, d_bt_max_total_n int32_t elements
+    int32_t  *h_bt_ay_out;
+    int32_t  *h_bt_xrev_out;
+    int32_t  *h_bt_yrev_out;
+    // Pinned per-read metadata buffers used inside plbacktrack_gpu.
+    // Previously malloc'd and free'd (or malloc'd and owned across D2H) each batch.
+    int      *h_bt_offset;   // pinned, d_bt_max_n_reads int elements
+    int      *h_bt_n_a;      // pinned, d_bt_max_n_reads int elements
+    int      *h_bt_n_u;      // pinned, d_bt_max_n_reads int elements
+    uint64_t *h_bt_u_all;    // pinned, d_bt_max_total_n uint64_t elements (large D2H)
+
     // ========== Pre-allocated Pinned Host Buffers (alignment D2H/H2D) ==========
     // Allocated once during init, reused across all gpu_align_batch_execute calls.
     // Eliminates 22× cudaMallocHost/cudaFreeHost per batch (each is a mlock syscall).

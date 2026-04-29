@@ -695,10 +695,26 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             cudaMallocHost(&dev_mem->h_align_unpacked_target, seq_staging);
         }
 
+        // Pinned backtrack staging buffers — replaces per-batch malloc/free calls.
+        // d_bt_max_total_n and d_bt_max_n_reads are set by setup_chain_phase() above.
+        {
+            size_t bt_n = dev_mem->d_bt_max_total_n;
+            size_t bt_r = dev_mem->d_bt_max_n_reads;
+            cudaMallocHost(&dev_mem->h_bt_ax_out,   bt_n * sizeof(int32_t));
+            cudaMallocHost(&dev_mem->h_bt_ay_out,   bt_n * sizeof(int32_t));
+            cudaMallocHost(&dev_mem->h_bt_xrev_out, bt_n * sizeof(int32_t));
+            cudaMallocHost(&dev_mem->h_bt_yrev_out, bt_n * sizeof(int32_t));
+            cudaMallocHost(&dev_mem->h_bt_offset,   bt_r * sizeof(int));
+            cudaMallocHost(&dev_mem->h_bt_n_a,      bt_r * sizeof(int));
+            cudaMallocHost(&dev_mem->h_bt_n_u,      bt_r * sizeof(int));
+            cudaMallocHost(&dev_mem->h_bt_u_all,    bt_n * sizeof(uint64_t));
+        }
+
         if (print_info)
-            fprintf(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu, seq_staging=%.2f MB each)\n",
+            fprintf(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu, seq_staging=%.2f MB each, bt_staging=%.2f MB each)\n",
                     (cigar_buf_sz * 4 + mbs * 20 * 4) / (1024.0*1024.0*1024.0), mbs,
-                    dev_mem->h_align_seq_staging_bytes / (1024.0*1024.0));
+                    dev_mem->h_align_seq_staging_bytes / (1024.0*1024.0),
+                    dev_mem->d_bt_max_total_n * sizeof(int32_t) / (1024.0*1024.0));
     }
 
     cudaCheck();
@@ -742,6 +758,14 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFreeHost(dev_mem->h_align_bw);
     cudaFreeHost(dev_mem->h_align_unpacked_query);
     cudaFreeHost(dev_mem->h_align_unpacked_target);
+    cudaFreeHost(dev_mem->h_bt_ax_out);
+    cudaFreeHost(dev_mem->h_bt_ay_out);
+    cudaFreeHost(dev_mem->h_bt_xrev_out);
+    cudaFreeHost(dev_mem->h_bt_yrev_out);
+    cudaFreeHost(dev_mem->h_bt_offset);
+    cudaFreeHost(dev_mem->h_bt_n_a);
+    cudaFreeHost(dev_mem->h_bt_n_u);
+    cudaFreeHost(dev_mem->h_bt_u_all);
     cudaCheck();
 }
 

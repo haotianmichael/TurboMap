@@ -383,10 +383,47 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
     deviceMemPtr *dev_mem = &sp->dev_mem;
     cudaStream_t stream   = sp->cudastream;
 
-    /* D2H all reads uniformly — rebuild host-side a[] from compacted
-     * backtrack output. */
-    for (int i = 0; i < n_read; i++) {
-        plbacktrack_d2h_read(dev_mem, &reads[i], i, km, stream);
+    /* Bulk D2H: copy all 4 compacted anchor arrays in one shot (4 transfers + 1 sync).
+     * Replaces the old per-read loop (n_read × 4 non-pinned mallocs + 4 async D2H +
+     * 1 stream sync = thousands of GPU stalls for large batches). */
+    {
+        // Compute actual compacted span: last valid read's offset + count.
+        int *h_offset = (int*)dev_mem->bt_h_offset;
+        int *h_n_u    = (int*)dev_mem->bt_h_n_u;
+        size_t compacted_total = 0;
+        for (int i = 0; i < n_read; i++) {
+            if (h_n_u[i] > 0) {
+                size_t end = (size_t)(h_offset[i] + reads[i].n);
+                if (end > compacted_total) compacted_total = end;
+            }
+        }
+
+        if (compacted_total > 0) {
+            int32_t *h_ax   = dev_mem->h_bt_ax_out;
+            int32_t *h_ay   = dev_mem->h_bt_ay_out;
+            int32_t *h_xrev = dev_mem->h_bt_xrev_out;
+            int32_t *h_yrev = dev_mem->h_bt_yrev_out;
+            cudaMemcpyAsync(h_ax,   dev_mem->d_bt_ax_out,   compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(h_ay,   dev_mem->d_bt_ay_out,   compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(h_xrev, dev_mem->d_bt_xrev_out, compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+            cudaMemcpyAsync(h_yrev, dev_mem->d_bt_yrev_out, compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
+            cudaStreamSynchronize(stream);  // single sync for all reads
+
+            // CPU-only: unpack per-read anchor data from the bulk host buffer.
+            for (int i = 0; i < n_read; i++) {
+                if (h_n_u[i] <= 0) continue;
+                int ofs   = h_offset[i];
+                int new_n = reads[i].n;
+                mm128_t *new_a;
+                KMALLOC(km, new_a, new_n);
+                for (int j = 0; j < new_n; j++) {
+                    new_a[j].x = ((uint64_t)h_xrev[ofs + j] << 32) | (uint32_t)h_ax[ofs + j];
+                    new_a[j].y = ((uint64_t)h_yrev[ofs + j] << 32) | (uint32_t)h_ay[ofs + j];
+                }
+                kfree(km, reads[i].a);
+                reads[i].a = new_a;
+            }
+        }
     }
     plbacktrack_d2h_finish(dev_mem);
 

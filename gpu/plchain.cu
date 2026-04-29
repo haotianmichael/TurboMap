@@ -384,12 +384,17 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
     cudaStream_t stream   = sp->cudastream;
 
     /* Bulk D2H: copy all 4 compacted anchor arrays in one shot (4 transfers + 1 sync).
-     * Replaces the old per-read loop (n_read × 4 non-pinned mallocs + 4 async D2H +
-     * 1 stream sync = thousands of GPU stalls for large batches). */
+     * Replaces n_read separate per-read D2H calls, each with its own non-pinned malloc
+     * and cudaStreamSynchronize (O(n_read) GPU stalls → O(1)).
+     *
+     * Buffers are allocated per-batch with cudaMallocHost (pinned → truly async D2H).
+     * Pre-allocating at d_bt_max_total_n would lock ~600 MB per stream (38M anchors ×
+     * 4 arrays × 4 bytes) — grossly wasteful.  Per-batch cost: 8 mlock/unlock total. */
     {
-        // Compute actual compacted span: last valid read's offset + count.
         int *h_offset = (int*)dev_mem->bt_h_offset;
         int *h_n_u    = (int*)dev_mem->bt_h_n_u;
+
+        // Compute actual compacted span (last valid read's end).
         size_t compacted_total = 0;
         for (int i = 0; i < n_read; i++) {
             if (h_n_u[i] > 0) {
@@ -399,15 +404,17 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
         }
 
         if (compacted_total > 0) {
-            int32_t *h_ax   = dev_mem->h_bt_ax_out;
-            int32_t *h_ay   = dev_mem->h_bt_ay_out;
-            int32_t *h_xrev = dev_mem->h_bt_xrev_out;
-            int32_t *h_yrev = dev_mem->h_bt_yrev_out;
+            int32_t *h_ax, *h_ay, *h_xrev, *h_yrev;
+            cudaMallocHost(&h_ax,   compacted_total * sizeof(int32_t));
+            cudaMallocHost(&h_ay,   compacted_total * sizeof(int32_t));
+            cudaMallocHost(&h_xrev, compacted_total * sizeof(int32_t));
+            cudaMallocHost(&h_yrev, compacted_total * sizeof(int32_t));
+
             cudaMemcpyAsync(h_ax,   dev_mem->d_bt_ax_out,   compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
             cudaMemcpyAsync(h_ay,   dev_mem->d_bt_ay_out,   compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
             cudaMemcpyAsync(h_xrev, dev_mem->d_bt_xrev_out, compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
             cudaMemcpyAsync(h_yrev, dev_mem->d_bt_yrev_out, compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
-            cudaStreamSynchronize(stream);  // single sync for all reads
+            cudaStreamSynchronize(stream);  // ONE sync for all reads (was n_read syncs before)
 
             // CPU-only: unpack per-read anchor data from the bulk host buffer.
             for (int i = 0; i < n_read; i++) {
@@ -423,6 +430,11 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
                 kfree(km, reads[i].a);
                 reads[i].a = new_a;
             }
+
+            cudaFreeHost(h_ax);
+            cudaFreeHost(h_ay);
+            cudaFreeHost(h_xrev);
+            cudaFreeHost(h_yrev);
         }
     }
     plbacktrack_d2h_finish(dev_mem);

@@ -366,9 +366,9 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
     cudaMemsetAsync(d_xrev_out, 0, sizeof(int32_t) * total_n, stream);
     cudaMemsetAsync(d_yrev_out, 0, sizeof(int32_t) * total_n, stream);
 
-    // Build per-read offset and anchor-count arrays on host (pinned — no malloc).
-    int *h_offset = dev_mem->h_bt_offset;
-    int *h_n_a    = dev_mem->h_bt_n_a;
+    // Build per-read offset and anchor-count arrays on host, then H2D
+    int *h_offset = (int*)malloc(sizeof(int) * n_reads);
+    int *h_n_a    = (int*)malloc(sizeof(int) * n_reads);
     int ofs = 0;
     for (int i = 0; i < n_reads; i++) {
         h_offset[i] = ofs;
@@ -406,8 +406,8 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
         d_zx, d_zy, d_t, d_v, d_offset, min_cnt, min_sc, max_drop,
         n_reads, d_n_v, d_n_u, d_num_elements, d_ofs_end);
 
-    // D2H: n_u per read (needed for per-read w-array sort); use pinned buffer.
-    int *h_n_u = dev_mem->h_bt_n_u;
+    // D2H: n_u per read (needed for per-read w-array sort)
+    int *h_n_u = (int*)malloc(sizeof(int) * n_reads);
     cudaMemcpyAsync(h_n_u, d_n_u, sizeof(int) * n_reads,
                     cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
@@ -427,8 +427,8 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
         d_n_a, n_reads, d_ax_out, d_ay_out, d_xrev_out, d_yrev_out, d_offset, d_ofs_end,
         dev_mem->d_bt_f_in, d_p_abs, d_u, d_zx, d_zy, d_t, d_v, d_n_v);
 
-    // D2H: only u array (per-read chain metadata) — anchor arrays stay on GPU; use pinned buffer.
-    uint64_t *h_u_all = dev_mem->h_bt_u_all;
+    // D2H: only u array (per-read chain metadata) — anchor arrays stay on GPU
+    uint64_t *h_u_all = (uint64_t*)malloc(sizeof(uint64_t) * total_n);
     cudaMemcpyAsync(h_u_all, d_u, sizeof(uint64_t) * total_n, cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
 
@@ -461,13 +461,13 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
         }
     }
 
-    // Store h_offset/h_n_u so finish_backtrack can read them.
-    // These point into pre-allocated pinned buffers (dev_mem->h_bt_offset/h_bt_n_u)
-    // and must NOT be freed in plbacktrack_d2h_finish.
+    // Store h_offset for deferred D2H (freed by plbacktrack_d2h_finish)
     dev_mem->bt_h_offset = h_offset;
     dev_mem->bt_h_n_u    = h_n_u;
 
-    // h_u_all, h_n_a, h_offset, h_n_u all point to pre-allocated pinned buffers — no free.
+    free(h_u_all);
+    free(h_n_a);
+    // h_offset and h_n_u are NOT freed here — owned by dev_mem until d2h_finish.
     // No cudaFree — all device buffers are pre-allocated and reused.
 }
 
@@ -519,8 +519,8 @@ void plbacktrack_d2h_read(deviceMemPtr *dev_mem, chain_read_t *read,
  */
 void plbacktrack_d2h_finish(deviceMemPtr *dev_mem)
 {
-    // bt_h_offset and bt_h_n_u point into pre-allocated pinned buffers
-    // (dev_mem->h_bt_offset / h_bt_n_u) — must NOT be freed here.
+    free(dev_mem->bt_h_offset);
+    free(dev_mem->bt_h_n_u);
     dev_mem->bt_h_offset = NULL;
     dev_mem->bt_h_n_u    = NULL;
 }

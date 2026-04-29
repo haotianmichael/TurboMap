@@ -464,6 +464,10 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
 
 /* ======== Public API ======== */
 
+// Global reserve bytes set by plmem_config_batch() and used by plmem_malloc_device_mem()
+// when sizing the long bt_p pool (so the pool respects the same headroom as auto-config).
+static size_t g_vram_global_reserve = (size_t)512 * 1024 * 1024;  // default 512 MB
+
 void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                               int range_grid_size, int num_cut,
                               int num_streams) {
@@ -591,8 +595,13 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
 
         // How many arenas still need to be allocated after this stream?
         int streams_after_this = num_streams - 1 - this_stream_idx;  // ≥0
-        size_t reserve_for_future = (size_t)streams_after_this * arena_size
-                                    + (size_t)512 * 1024 * 1024;  // 512 MB safety
+        // Use g_vram_global_reserve so the pool respects the same headroom as auto-config.
+        // This is critical for cuda-gdb: if global_vram_reserve_mb is set to e.g. 2048,
+        // the pool will leave 2 GB free for the debugger instead of just 512 MB.
+        size_t pool_safety = (g_vram_global_reserve > (size_t)512 * 1024 * 1024)
+                             ? g_vram_global_reserve
+                             : (size_t)512 * 1024 * 1024;
+        size_t reserve_for_future = (size_t)streams_after_this * arena_size + pool_safety;
 
         size_t usable_for_long_pools = 0;
         if (free_after_arena > reserve_for_future)
@@ -695,26 +704,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             cudaMallocHost(&dev_mem->h_align_unpacked_target, seq_staging);
         }
 
-        // Pinned backtrack staging buffers — replaces per-batch malloc/free calls.
-        // d_bt_max_total_n and d_bt_max_n_reads are set by setup_chain_phase() above.
-        {
-            size_t bt_n = dev_mem->d_bt_max_total_n;
-            size_t bt_r = dev_mem->d_bt_max_n_reads;
-            cudaMallocHost(&dev_mem->h_bt_ax_out,   bt_n * sizeof(int32_t));
-            cudaMallocHost(&dev_mem->h_bt_ay_out,   bt_n * sizeof(int32_t));
-            cudaMallocHost(&dev_mem->h_bt_xrev_out, bt_n * sizeof(int32_t));
-            cudaMallocHost(&dev_mem->h_bt_yrev_out, bt_n * sizeof(int32_t));
-            cudaMallocHost(&dev_mem->h_bt_offset,   bt_r * sizeof(int));
-            cudaMallocHost(&dev_mem->h_bt_n_a,      bt_r * sizeof(int));
-            cudaMallocHost(&dev_mem->h_bt_n_u,      bt_r * sizeof(int));
-            cudaMallocHost(&dev_mem->h_bt_u_all,    bt_n * sizeof(uint64_t));
-        }
-
         if (print_info)
-            fprintf(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu, seq_staging=%.2f MB each, bt_staging=%.2f MB each)\n",
+            fprintf(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu, seq_staging=%.2f MB each)\n",
                     (cigar_buf_sz * 4 + mbs * 20 * 4) / (1024.0*1024.0*1024.0), mbs,
-                    dev_mem->h_align_seq_staging_bytes / (1024.0*1024.0),
-                    dev_mem->d_bt_max_total_n * sizeof(int32_t) / (1024.0*1024.0));
+                    dev_mem->h_align_seq_staging_bytes / (1024.0*1024.0));
     }
 
     cudaCheck();
@@ -758,14 +751,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFreeHost(dev_mem->h_align_bw);
     cudaFreeHost(dev_mem->h_align_unpacked_query);
     cudaFreeHost(dev_mem->h_align_unpacked_target);
-    cudaFreeHost(dev_mem->h_bt_ax_out);
-    cudaFreeHost(dev_mem->h_bt_ay_out);
-    cudaFreeHost(dev_mem->h_bt_xrev_out);
-    cudaFreeHost(dev_mem->h_bt_yrev_out);
-    cudaFreeHost(dev_mem->h_bt_offset);
-    cudaFreeHost(dev_mem->h_bt_n_a);
-    cudaFreeHost(dev_mem->h_bt_n_u);
-    cudaFreeHost(dev_mem->h_bt_u_all);
+    // BT anchor D2H staging buffers are per-batch cudaMallocHost (not pre-allocated).
     cudaCheck();
 }
 
@@ -1142,8 +1128,14 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     size_t gpu_free_mem, gpu_total_mem;
     cudaMemGetInfo(&gpu_free_mem, &gpu_total_mem);
 
-    // Per-stream VRAM budget: leave 256MB global headroom
-    size_t global_reserve = (size_t)256 * 1024 * 1024;
+    // Per-stream VRAM budget: configurable headroom (JSON key "global_vram_reserve_mb").
+    // Also propagated to plmem_malloc_device_mem for the long bt_p pool.
+    // Increase to 1024+ MB when using cuda-gdb so the pool leaves room for the debugger.
+    cJSON *vram_reserve_json = cJSON_GetObjectItem(json, "global_vram_reserve_mb");
+    size_t global_reserve = vram_reserve_json
+        ? (size_t)vram_reserve_json->valueint * 1024 * 1024
+        : (size_t)256 * 1024 * 1024;  // default 256 MB
+    g_vram_global_reserve = global_reserve;  // propagate to bt_p pool sizing
     size_t usable = (gpu_free_mem > global_reserve) ? (gpu_free_mem - global_reserve) : gpu_free_mem;
     size_t avail_mem_per_stream = usable / (*num_stream_);
 

@@ -2452,13 +2452,7 @@ static void* gpu_batch_consumer(void *data) {
                 acc_batch.count++;
                 acc_batch.total_n += read.n;
                 free_queue_read(&read);
-                // Trigger dispatch when anchors are full OR when we've accumulated
-                // enough reads to keep all streams busy (read-count load balancing).
-                // Without the read-count check, small datasets (few reads with few
-                // anchors each) all pile into stream_0, leaving stream_1 idle.
-                int read_thresh = s->batch_max_reads / NUM_GPU_STREAMS;
-                if (acc_batch.total_n >= s->batch_max_anchors ||
-                    acc_batch.count  >= read_thresh) {
+                if (acc_batch.total_n >= s->batch_max_anchors) {
                     is_full = 1;
                     if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
                         fprintf(stderr, "ACC_FULL: count=%d, total_n=%zu\n",
@@ -2485,6 +2479,26 @@ static void* gpu_batch_consumer(void *data) {
                 WAIT_DRAIN(sl);
             }
 
+            // Load-balance: when the queue is exhausted and idle streams remain,
+            // cap this dispatch so leftover reads go to other streams.
+            // Strategy: send ceil(total / (idle+1)) reads to cur_stream, hold
+            // the rest in acc_batch so the next loop iteration dispatches them.
+            // The held-back reads are deep_copy'd from sl->batch BEFORE SIGNAL_DRAIN
+            // (drain worker not yet running), so there is no race on sl->batch.km.
+            int orig_count = acc_batch.count;
+            int lb_cap     = orig_count;  // default: no split
+            if (queue_finished && NUM_GPU_STREAMS > 1) {
+                int n_idle = 0;
+                for (int s_ = 1; s_ < NUM_GPU_STREAMS; s_++) {
+                    if (!slots[(cur_stream + s_) % NUM_GPU_STREAMS].busy)
+                        n_idle++;
+                }
+                if (n_idle > 0 && orig_count > n_idle) {
+                    lb_cap = (orig_count + n_idle) / (n_idle + 1);
+                    acc_batch.count = lb_cap;  // cap before GPU launch
+                }
+            }
+
             if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
                 fprintf(stderr, "LAUNCH_CHAIN(stream=%d): count=%d, total_n=%zu\n",
                         cur_stream, acc_batch.count, acc_batch.total_n);
@@ -2498,8 +2512,9 @@ static void* gpu_batch_consumer(void *data) {
 
             // Safety: if nothing fits at all, these reads exceed GPU capacity
             if (fit == 0) {
+                acc_batch.count = orig_count;  // restore before reset
                 fprintf(stderr, "[WARNING] %d reads exceed GPU chain capacity (stream=%d), "
-                        "skipping\n", acc_batch.count, cur_stream);
+                        "skipping\n", orig_count, cur_stream);
                 mm_trbuf_batch_reset(&acc_batch, s->batch_max_reads, s->p->opt);
                 is_full = 0;
                 continue;
@@ -2524,11 +2539,22 @@ static void* gpu_batch_consumer(void *data) {
                             overflow);
             }
 
+            // Load-balance excess: reads [lb_cap..orig_count-1] were not sent to GPU.
+            // They live in sl->batch.reads[] beyond sl->batch.count=fit, so drain
+            // will not touch them.  Deep-copy them NOW, before SIGNAL_DRAIN starts
+            // the drain worker that will eventually reset sl->batch.km.
+            if (lb_cap < orig_count) {
+                for (int r_ = lb_cap; r_ < orig_count; r_++)
+                    deep_copy_read_to_batch(&acc_batch, &sl->batch.reads[r_], s->p->opt);
+                is_full = 1;  // immediately re-trigger dispatch to next stream
+            }
+
             sl->busy = 1;
 
             // Signal this stream's drain worker (non-blocking)
             SIGNAL_DRAIN(sl);
-            is_full = 0;
+            if (lb_cap == orig_count)  // normal path: no lb split
+                is_full = 0;
 
             // Rotate to next stream
             cur_stream = (cur_stream + 1) % NUM_GPU_STREAMS;

@@ -1172,7 +1172,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             tasks_processed_in_phase += batch_size;
             total_tasks_processed += batch_size;
             fprintf(stderr, "[Info::%s] %s [%d/%d] tasks=%d slots=%d bt_stride=%zu  (%d/%d done)\n",
-                    stream_tag, phase_name, batch_num, total_batches,
+                    stream_tag, phase_name, phase_batch_num, total_phase_batches,
                     batch_size, phase_concurrent_slots, batch_max_backtrack_size,
                     tasks_processed_in_phase, n_tasks_in_phase);
         }  // End of batch loop within phase

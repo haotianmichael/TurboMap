@@ -412,8 +412,32 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int n_short_tasks = 0;
     int n_long_tasks = 0;
 
+    // Hard limits derived from GPU buffer allocation in setup_long_align_phase():
+    //   ksw_temp_per_task  = f(max_align_query_len)   → max(qlen,tlen) must be ≤ limit
+    //   bt_p antidiag buf  = 2 × max_align_query_len  → qlen+tlen must be ≤ 2×limit
+    //   CIGAR buffer       = 2 × max_align_query_len  → qlen+tlen ≤ 2×limit-2 (guard)
+    // Exceeding any of these causes silent memory corruption or wrong results.
+    // Fatal-exit here so the problem is caught before any GPU work starts.
+    const size_t gpu_max_one  = (size_t)dev_mem->max_align_query_len;        // 50000
+    const size_t gpu_max_sum  = 2 * gpu_max_one - 2;  // 99998: tightest (CIGAR guard)
+
     for (int i = 0; i < n_tasks; i++) {
-        size_t max_seq_len = (tasks[i].qlen > tasks[i].tlen) ? tasks[i].qlen : tasks[i].tlen;
+        int ql = tasks[i].qlen;
+        int tl = tasks[i].tlen;
+        size_t max_one = (ql > tl) ? (size_t)ql : (size_t)tl;
+        size_t sum     = (size_t)ql + (size_t)tl;
+
+        if (max_one > gpu_max_one || sum > gpu_max_sum) {
+            fprintf(stderr,
+                "[FATAL] GPU align task %d: qlen=%d tlen=%d exceeds GPU buffer limits "
+                "(max single=%zu bp, max sum=%zu bp). "
+                "GPU ksw_temp/bt_p/CIGAR buffers are sized for max %zu bp per sequence. "
+                "Aborting to prevent memory corruption.\n",
+                i, ql, tl, gpu_max_one, gpu_max_sum, gpu_max_one);
+            exit(EXIT_FAILURE);
+        }
+
+        size_t max_seq_len = max_one;
         if (max_seq_len <= short_task_max_len) {
             task_indices_short[n_short_tasks++] = i;
         } else {

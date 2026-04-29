@@ -1,3 +1,4 @@
+#include <algorithm>
 #include "plalign.cuh"
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
@@ -419,6 +420,17 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             task_indices_long[n_long_tasks++] = i;
         }
     }
+
+    // Sort long tasks by max(qlen,tlen) ascending so same-sized tasks batch together.
+    // The bt_p per slot = actual_max_antidiag × actual_max_n_col is determined by the
+    // largest task in the batch; homogeneous batches keep this tight and maximise
+    // the number of concurrent slots (fewer wasted bytes per slot).
+    std::sort(task_indices_long, task_indices_long + n_long_tasks,
+        [&tasks](int a, int b) {
+            int sa = (tasks[a].qlen > tasks[a].tlen) ? tasks[a].qlen : tasks[a].tlen;
+            int sb = (tasks[b].qlen > tasks[b].tlen) ? tasks[b].qlen : tasks[b].tlen;
+            return sa < sb;
+        });
 
     // Convenience tag used for all per-stream log lines in this function
     char stream_tag[32];

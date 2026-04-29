@@ -638,6 +638,16 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
             current_batch_size    = long_batch_persistent;
 
+            // Fix up global batch counters now that we know the real long batch size.
+            // total_batches was computed pre-transition using the old long_batch_persistent;
+            // recompute so the per-batch "[X/Y]" completion log shows the correct denominator.
+            total_batches_long = (n_long_tasks > 0)
+                ? (int)((n_long_tasks + (int)long_batch_persistent - 1) / (int)long_batch_persistent)
+                : 0;
+            total_batches = total_batches_short + total_batches_long;
+            fprintf(stderr, "[Info::%s]   Tier-1 (long) recalculated: %d batch(es) × up to %zu tasks\n",
+                    stream_tag, total_batches_long, long_batch_persistent);
+
             // total_phase_batches will be (re)computed below when it is declared,
             // using the already-updated current_batch_size. No assignment needed here.
         }

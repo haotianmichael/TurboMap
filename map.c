@@ -2452,7 +2452,13 @@ static void* gpu_batch_consumer(void *data) {
                 acc_batch.count++;
                 acc_batch.total_n += read.n;
                 free_queue_read(&read);
-                if (acc_batch.total_n >= s->batch_max_anchors) {
+                // Trigger dispatch when anchors are full OR when we've accumulated
+                // enough reads to keep all streams busy (read-count load balancing).
+                // Without the read-count check, small datasets (few reads with few
+                // anchors each) all pile into stream_0, leaving stream_1 idle.
+                int read_thresh = s->batch_max_reads / NUM_GPU_STREAMS;
+                if (acc_batch.total_n >= s->batch_max_anchors ||
+                    acc_batch.count  >= read_thresh) {
                     is_full = 1;
                     if (mm_dbg_flag & MM_DBG_PRINT_QNAME)
                         fprintf(stderr, "ACC_FULL: count=%d, total_n=%zu\n",

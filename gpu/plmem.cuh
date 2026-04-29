@@ -381,6 +381,11 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem);
 // Call plmem_phase_to_chain() after alignment completes.
 void plmem_phase_to_align(deviceMemPtr *dev_mem);
 void plmem_phase_to_chain(deviceMemPtr *dev_mem);
+// Transition from short-align layout to long-align layout using the same arena.
+// Resets the arena and redistributes the 15 GB so that bt_p gets ~13 GB.
+// Must be called after the short-task phase is fully complete (stream synced).
+// All GPU pointers in the caller MUST be refreshed from dev_mem after this call.
+void plmem_phase_to_long_align(deviceMemPtr *dev_mem);
 
 // data movement
 void plmem_reorg_input_arr(chain_read_t *reads, int n_read,

@@ -221,6 +221,133 @@ static void setup_chain_phase(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     dev_mem->current_phase = GPU_PHASE_CHAIN;
 }
 
+/* Set up alignment buffers optimised for LONG tasks.
+ * Called once after the short-task phase completes.
+ *
+ * KEY IDEA: the short arena (15 GB) was partitioned as:
+ *   5 GB   short bt_p (2560 slots × 2 MB)
+ *   1 GB   sequence data (250 K tasks × full lengths)
+ *   4 GB   CIGAR (250 K × 2 K ops)
+ *   5 GB   KSW temp + other buffers
+ *
+ * For long tasks we only need ~1000 tasks/batch and 512 slots.
+ * arena_reset() reclaims all 15 GB and re-allocates:
+ *   ~1.5 GB  non-bt_p overhead (seq + CIGAR + temp + meta)
+ *  ~13.5 GB  long bt_p pool  ← the entire point of this transition
+ *
+ * No cudaFree/cudaMalloc: same physical memory, new layout. */
+static void setup_long_align_phase(deviceMemPtr *dev_mem) {
+    gpu_arena_t *a = &dev_mem->arena;
+    arena_reset(a);
+
+    // Batch and slot caps for the long phase
+    // MAX_LONG_BATCH: tasks per kernel launch.  Keep it ≥ n_long_slots_cap so
+    // every slot stays busy; keep it small to minimise CIGAR-buffer overhead.
+    const size_t MAX_LONG_BATCH = 1024;
+    size_t n_long_cap  = (size_t)dev_mem->n_long_concurrent_slots;  // 512
+    size_t max_len     = dev_mem->max_align_query_len;               // 50,000
+    size_t long_cigar  = 2 * max_len;                                // 100,000
+
+    // ---- Sequence data (sized for MAX_LONG_BATCH tasks × max_len bases) ----
+    size_t seq_unp  = MAX_LONG_BATCH * max_len * sizeof(uint8_t);        //  ~50 MB
+    size_t seq_pack = MAX_LONG_BATCH * (max_len / 8) * sizeof(uint32_t); //  ~25 MB
+    size_t meta     = MAX_LONG_BATCH * sizeof(uint32_t);                 //   ~4 MB
+
+    dev_mem->d_align_unpacked_query  = (uint8_t*)arena_alloc(a, seq_unp);
+    dev_mem->d_align_unpacked_target = (uint8_t*)arena_alloc(a, seq_unp);
+    dev_mem->d_align_packed_query    = (uint32_t*)arena_alloc(a, seq_pack);
+    dev_mem->d_align_packed_target   = (uint32_t*)arena_alloc(a, seq_pack);
+    dev_mem->d_align_query_offsets   = (uint32_t*)arena_alloc(a, meta);
+    dev_mem->d_align_target_offsets  = (uint32_t*)arena_alloc(a, meta);
+    dev_mem->d_align_query_lens      = (uint32_t*)arena_alloc(a, meta);
+    dev_mem->d_align_target_lens     = (uint32_t*)arena_alloc(a, meta);
+    dev_mem->d_align_flag            = (int32_t*)arena_alloc(a, meta);
+    dev_mem->d_align_bw              = (int32_t*)arena_alloc(a, meta);
+
+    // Global DP buffer: not used by KSW kernel; keep a 4-byte placeholder
+    dev_mem->d_align_global_buffer = arena_alloc(a, 4);
+
+    // ---- KSW temp buffer: one slot per long-slot-cap entry ----
+    size_t h_arr  = max_len * sizeof(int32_t);
+    size_t sk_arr = (max_len + 1) * 6 * sizeof(int8_t);
+    size_t sq_arr = max_len * 2 * sizeof(uint8_t);
+    dev_mem->align_ksw_temp_per_task = ((h_arr + sk_arr + sq_arr) + 7) & ~7ULL;
+    size_t ksw_temp_bytes = n_long_cap * dev_mem->align_ksw_temp_per_task;  // ~300 MB
+    dev_mem->d_align_ksw_temp_buffer = arena_alloc(a, ksw_temp_bytes);
+    dev_mem->n_align_concurrent_blocks = (int)n_long_cap;  // 512
+
+    // ---- Backtrack offset arrays (placeholder stubs for the short-stride pair) ----
+    // Long tasks use d_align_backtrack_off_long; the short-stride pair is not needed.
+    dev_mem->d_align_backtrack_off     = (int*)arena_alloc(a, sizeof(int));
+    dev_mem->d_align_backtrack_off_end = (int*)arena_alloc(a, sizeof(int));
+    dev_mem->d_align_backtrack_n_col   = (int*)arena_alloc(a, n_long_cap * sizeof(int));
+
+    // ---- Long-task bt_off buffers (same layout as setup_align_phase) ----
+    size_t max_antidiag_long = 2 * max_len;  // 100,000
+    size_t bt_off_long_bytes = n_long_cap * max_antidiag_long * sizeof(int);  // ~410 MB
+    dev_mem->d_align_backtrack_off_long     = (int*)arena_alloc(a, bt_off_long_bytes);
+    dev_mem->d_align_backtrack_off_end_long = (int*)arena_alloc(a, bt_off_long_bytes);
+
+    // ---- CIGAR buffers: sized for MAX_LONG_BATCH × long_cigar_len ----
+    size_t cigar_bytes = MAX_LONG_BATCH * long_cigar * sizeof(uint32_t);  // ~410 MB each
+    dev_mem->max_align_cigar_len    = long_cigar;
+    dev_mem->d_align_cigar_buffer   = (uint32_t*)arena_alloc(a, cigar_bytes);
+    dev_mem->d_align_cigar_lengths  = (int*)arena_alloc(a, MAX_LONG_BATCH * sizeof(int));
+    dev_mem->d_align_compact_cigar  = (uint32_t*)arena_alloc(a, cigar_bytes);
+    dev_mem->d_align_compact_offsets= (uint32_t*)arena_alloc(a,
+                                        (MAX_LONG_BATCH + 1) * sizeof(uint32_t));
+
+    // ---- CUB temp ----
+    dev_mem->align_cub_tmp_size = cub_scan_tmp_size(MAX_LONG_BATCH);
+    dev_mem->d_align_cub_tmp = arena_alloc(a, dev_mem->align_cub_tmp_size);
+
+    // ---- Stats + result buffers ----
+    size_t res = MAX_LONG_BATCH * sizeof(int32_t);
+    dev_mem->d_align_blen            = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_mlen            = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_n_ambi          = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_dp_max          = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_gpu_stats_valid = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_device_res      = arena_alloc(a, sizeof(gasal_res_t));
+    dev_mem->d_align_ez_array        = arena_alloc(a, sizeof(ksw_extz_t) * MAX_LONG_BATCH);
+    dev_mem->d_align_scores          = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_query_ends      = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_target_ends     = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_mqe             = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_mqe_t           = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_mte             = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_mte_q           = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_zdropped        = (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_task_to_align_id= (int32_t*)arena_alloc(a, res);
+    dev_mem->d_align_mat             = (int8_t*)arena_alloc(a, 25 * sizeof(int8_t));
+    dev_mem->d_align_task_counter    = (int*)arena_alloc(a, sizeof(int));
+
+    // ---- bt_p pool: ALL remaining arena space (~13 GB) ----
+    // Leave 16 MB headroom for arena alignment padding of the last alloc.
+    const size_t BT_P_HEADROOM = (size_t)16 * 1024 * 1024;
+    size_t bt_p_avail = arena_remaining(a);
+    if (bt_p_avail > BT_P_HEADROOM) bt_p_avail -= BT_P_HEADROOM;
+    else                             bt_p_avail = 0;
+
+    dev_mem->d_align_backtrack_p  = (uint8_t*)arena_alloc(a, bt_p_avail);
+    dev_mem->max_align_backtrack_size = 0;  // stride now computed per-batch in plalign.cu
+    dev_mem->long_bt_p_pool_bytes = bt_p_avail;
+
+    // Store long batch cap in long_task_batch_size.
+    // DO NOT touch max_align_tasks — setup_align_phase() reads it and would break
+    // if it were changed here (called again next round of short alignment).
+    dev_mem->long_task_batch_size = (int)MAX_LONG_BATCH;
+
+    fprintf(stderr,
+        "[Info] Long-align arena: bt_p=%.2f GB  batch=%zu  slots_cap=%zu"
+        "  ksw_temp=%.0f MB  CIGAR=%.0f MB\n",
+        bt_p_avail / (1024.0*1024.0*1024.0), MAX_LONG_BATCH, n_long_cap,
+        ksw_temp_bytes / (1024.0*1024.0),
+        cigar_bytes * 2 / (1024.0*1024.0));
+
+    dev_mem->current_phase = GPU_PHASE_ALIGN;
+}
+
 /* Set up alignment buffers from arena.
  * Called when transitioning from chain→align phase. */
 static void setup_align_phase(deviceMemPtr *dev_mem) {
@@ -613,6 +740,15 @@ void plmem_phase_to_chain(deviceMemPtr *dev_mem) {
     if (dev_mem->current_phase == GPU_PHASE_CHAIN) return;
     setup_chain_phase(dev_mem, dev_mem->saved_anchor_per_batch,
                       dev_mem->saved_range_grid_size, dev_mem->saved_num_cut);
+}
+
+void plmem_phase_to_long_align(deviceMemPtr *dev_mem) {
+    // Transition from short-align arena layout to long-align layout.
+    // Reuses the same physical cudaMalloc'd block: no cudaFree, no cudaMalloc.
+    // After this call dev_mem->d_align_backtrack_p points to ~13 GB of bt_p
+    // and dev_mem->long_bt_p_pool_bytes reflects its size.
+    // Callers MUST refresh all local GPU pointers from dev_mem after this call.
+    setup_long_align_phase(dev_mem);
 }
 
 

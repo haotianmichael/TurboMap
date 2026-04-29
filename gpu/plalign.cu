@@ -554,6 +554,83 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
         if (n_tasks_in_phase == 0) continue;  // Skip empty phase
 
+        // ── Long-align arena transition ────────────────────────────────────────
+        // When we enter phase 1 (long tasks), the short-align arena layout
+        // wastes ~10 GB on large CIGAR/seq buffers we no longer need.
+        // Transition to long-align layout: same 15 GB physical block, reset and
+        // re-allocated so bt_p gets ~13 GB instead of ~5 GB.
+        // We sync the stream first to ensure all short-phase work is flushed.
+        if (phase == 1) {
+            cudaStreamSynchronize(align_stream);
+
+            plmem_phase_to_long_align(dev_mem);
+
+            // ── Refresh all local GPU pointers from dev_mem ──────────────────
+            d_unpacked_query  = dev_mem->d_align_unpacked_query;
+            d_unpacked_target = dev_mem->d_align_unpacked_target;
+            d_packed_query    = dev_mem->d_align_packed_query;
+            d_packed_target   = dev_mem->d_align_packed_target;
+            d_query_offsets   = dev_mem->d_align_query_offsets;
+            d_target_offsets  = dev_mem->d_align_target_offsets;
+            d_query_lens      = dev_mem->d_align_query_lens;
+            d_target_lens     = dev_mem->d_align_target_lens;
+            d_flag            = dev_mem->d_align_flag;
+            d_bw              = dev_mem->d_align_bw;
+            d_ksw_temp_buffer = dev_mem->d_align_ksw_temp_buffer;
+            ksw_temp_per_task = dev_mem->align_ksw_temp_per_task;
+            d_backtrack_p     = dev_mem->d_align_backtrack_p;  // now ~13 GB pool
+            // d_backtrack_off / d_backtrack_off_end: stubs, not used for long tasks
+            d_backtrack_off     = dev_mem->d_align_backtrack_off;
+            d_backtrack_off_end = dev_mem->d_align_backtrack_off_end;
+            d_cigar_buffer    = dev_mem->d_align_cigar_buffer;
+            d_cigar_lengths   = dev_mem->d_align_cigar_lengths;
+            max_cigar_len     = dev_mem->max_align_cigar_len;  // now 100,000
+            d_mat             = dev_mem->d_align_mat;
+            device_res        = dev_mem->d_align_device_res;
+            d_scores          = dev_mem->d_align_scores;
+            d_query_ends      = dev_mem->d_align_query_ends;
+            d_target_ends     = dev_mem->d_align_target_ends;
+            d_mqe             = dev_mem->d_align_mqe;
+            d_mqe_t           = dev_mem->d_align_mqe_t;
+            d_mte             = dev_mem->d_align_mte;
+            d_mte_q           = dev_mem->d_align_mte_q;
+            d_zdropped        = dev_mem->d_align_zdropped;
+            d_task_counter    = dev_mem->d_align_task_counter;
+            n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;  // now 512
+            d_compact_cigar   = dev_mem->d_align_compact_cigar;
+            d_compact_offsets = dev_mem->d_align_compact_offsets;
+            d_cub_tmp         = dev_mem->d_align_cub_tmp;
+            cub_tmp_size      = dev_mem->align_cub_tmp_size;
+            d_blen            = dev_mem->d_align_blen;
+            d_mlen            = dev_mem->d_align_mlen;
+            d_n_ambi          = dev_mem->d_align_n_ambi;
+            d_dp_max          = dev_mem->d_align_dp_max;
+            d_gpu_stats_valid = dev_mem->d_align_gpu_stats_valid;
+
+            // Re-upload scoring matrix (d_align_mat is at a new arena address)
+            int8_t h_scoring_matrix2[25];
+            ksw_gen_simple_mat(5, h_scoring_matrix2, opt->a, opt->b, opt->sc_ambi);
+            cudaMemcpyAsync(d_mat, h_scoring_matrix2, 25 * sizeof(int8_t),
+                            cudaMemcpyHostToDevice, align_stream);
+
+            // Re-init gasal_res (d_align_device_res is at a new arena address)
+            init_gasal_res<<<1, 1, 0, align_stream>>>(
+                (gasal_res_t*)device_res,
+                d_scores, d_query_ends, d_target_ends,
+                d_mqe, d_mqe_t, d_mte, d_mte_q, d_zdropped);
+
+            // Recompute long batch size from long_task_batch_size
+            // (setup_long_align_phase sets it to MAX_LONG_BATCH = 1024).
+            // max_align_tasks is intentionally NOT changed — setup_align_phase()
+            // reads it for short-phase sizing in subsequent alignment rounds.
+            long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
+            current_batch_size    = long_batch_persistent;
+
+            // Recompute total_phase_batches for the log
+            total_phase_batches = (int)((n_tasks_in_phase + (int)current_batch_size - 1)
+                                        / (int)current_batch_size);
+        }
+
         fprintf(stderr, "[Info::%s] === %s: %d tasks ===\n", stream_tag, phase_name, n_tasks_in_phase);
 
         // Problem: result buffers are 120,000 elements but we only clear phase_batch_size
@@ -725,8 +802,30 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             int   *d_bt_off_batch           = d_backtrack_off;
             int   *d_bt_off_end_batch       = d_backtrack_off_end;
             int    max_slots_cap            = n_concurrent_blocks;
-            // bt_p pointer for the kernel: short uses arena, long uses dedicated pool
-            uint8_t *d_bt_p_batch           = d_backtrack_p;
+            // bt_p pointer and total pool bytes for this batch.
+            // Three possible sources (in priority order):
+            //   1. Long-align arena (after plmem_phase_to_long_align):
+            //        d_backtrack_p was refreshed to the ~13 GB pool;
+            //        long_bt_p_pool_bytes reflects its size.
+            //   2. Dedicated cudaMalloc pool (d_align_backtrack_p_long, single-stream):
+            //        use that pointer and its size from long_bt_p_pool_bytes.
+            //   3. Shared arena bt_p (fallback): d_backtrack_p points to ~5 GB pool.
+            uint8_t *d_bt_p_batch = d_backtrack_p;  // default covers cases 1 and 3
+
+            if (phase == 1) {
+                // Cases 1 & 2 both set long_bt_p_pool_bytes > 0.
+                // Case 1: d_backtrack_p already refreshed to the long arena pool.
+                // Case 2: dedicated pool pointer differs from d_backtrack_p.
+                if (dev_mem->d_align_backtrack_p_long != nullptr) {
+                    // Dedicated cudaMalloc pool (case 2, single-stream).
+                    d_bt_p_batch     = dev_mem->d_align_backtrack_p_long;
+                    bt_p_total_bytes = dev_mem->long_bt_p_pool_bytes;
+                } else if (dev_mem->long_bt_p_pool_bytes > 0) {
+                    // Long-align arena (case 1): d_backtrack_p already refreshed.
+                    bt_p_total_bytes = dev_mem->long_bt_p_pool_bytes;
+                }
+                // Case 3 (no pool): bt_p_total_bytes stays as computed above (~5 GB).
+            }
 
             // Diagnostic variables for long-batch logging (populated in the phase==1 block below)
             int    diag_actual_max_qlen  = 0;
@@ -780,15 +879,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 // Concurrent slots bounded by the long-tier bt_off allocation
                 max_slots_cap = dev_mem->n_long_concurrent_slots;
 
-                // Use the dedicated long bt_p pool (if available) instead of the shared
-                // arena bt_p.  This unlocks 30-100× more concurrent slots for long tasks
-                // by utilizing the unused VRAM that was previously left idle.
-                if (dev_mem->d_align_backtrack_p_long != nullptr) {
-                    d_bt_p_batch    = dev_mem->d_align_backtrack_p_long;
-                    bt_p_total_bytes = dev_mem->long_bt_p_pool_bytes;
-                }
-                // If d_align_backtrack_p_long is null (allocation failed at init), we fall
-                // back to the shared arena bt_p — fewer slots but still correct.
+                // bt_p pool and total bytes were already selected above before the
+                // scan loop; no further override needed here.
             }
 
             size_t max_slots_this_phase = (batch_max_backtrack_size > 0)

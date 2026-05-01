@@ -112,6 +112,20 @@ static size_t cub_scan_tmp_size(size_t n) {
     return tmp_bytes;
 }
 
+// ======== Module-level configuration globals ========
+// Set by plmem_config_batch() (JSON config) before any arena allocation.
+// Declared here so all static setup_*_phase() helpers can see them.
+
+// VRAM headroom to leave free (for OS, cuda-gdb, etc.).
+// Used when sizing the long bt_p pool and when computing per-stream VRAM budgets.
+static size_t g_vram_global_reserve = (size_t)512 * 1024 * 1024;  // default 512 MB
+
+// Maximum long-task batch size (tasks per kernel launch in the long-align phase).
+// Configurable via JSON key "long_task_batch_size" (default 5120).
+// A larger value reduces the number of long batches (fewer host-side iterations)
+// but increases arena CIGAR buffer usage (MAX_LONG_BATCH × 100k ops × 4 B × 2).
+static size_t g_long_task_batch_size_max = 5120;
+
 /* Set up chain + backtrack + voting buffers from arena.
  * Called during init (chain phase first) and after alignment completes. */
 static void setup_chain_phase(deviceMemPtr *dev_mem, size_t anchor_per_batch,
@@ -499,16 +513,6 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
 }
 
 /* ======== Public API ======== */
-
-// Global reserve bytes set by plmem_config_batch() and used by plmem_malloc_device_mem()
-// when sizing the long bt_p pool (so the pool respects the same headroom as auto-config).
-static size_t g_vram_global_reserve = (size_t)512 * 1024 * 1024;  // default 512 MB
-
-// Maximum long-task batch size (tasks per kernel launch in the long-align phase).
-// Configurable via JSON key "long_task_batch_size" (default 5120).
-// A larger value reduces the number of long batches (fewer host-side iterations)
-// but increases arena CIGAR buffer usage (MAX_LONG_BATCH × 100k ops × 4 B × 2).
-static size_t g_long_task_batch_size_max = 5120;
 
 void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                               int range_grid_size, int num_cut,

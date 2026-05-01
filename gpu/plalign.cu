@@ -655,10 +655,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 d_scores, d_query_ends, d_target_ends,
                 d_mqe, d_mqe_t, d_mte, d_mte_q, d_zdropped);
 
-            // Recompute long batch size from long_task_batch_size
-            // (setup_long_align_phase sets it to MAX_LONG_BATCH = 1024).
-            // max_align_tasks is intentionally NOT changed — setup_align_phase()
-            // reads it for short-phase sizing in subsequent alignment rounds.
+            // Recompute long batch size from long_task_batch_size, which was set to
+            // g_long_task_batch_size_max (JSON "long_task_batch_size", default 5120)
+            // by setup_long_align_phase().  max_align_tasks is intentionally NOT
+            // changed — setup_align_phase() reads it for short-phase sizing.
             long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
             current_batch_size    = long_batch_persistent;
 

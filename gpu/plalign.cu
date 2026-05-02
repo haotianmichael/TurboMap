@@ -404,7 +404,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int kernel_blocks = 28;
     size_t short_task_max_len = dev_mem->short_task_max_len;      // 1000bp
     size_t short_batch_size = dev_mem->short_task_batch_size;      // 10,000
-    size_t long_batch_size = dev_mem->long_task_batch_size;        // 200
 
     // Classify tasks into short (tier-0) / long (tier-1) by max sequence length
     int *task_indices_short = (int*)malloc(n_tasks * sizeof(int));
@@ -445,15 +444,23 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         }
     }
 
-    // Sort long tasks by max(qlen,tlen) ascending so same-sized tasks batch together.
-    // The bt_p per slot = actual_max_antidiag × actual_max_n_col is determined by the
-    // largest task in the batch; homogeneous batches keep this tight and maximise
-    // the number of concurrent slots (fewer wasted bytes per slot).
+    // Sort long tasks by DESCENDING estimated bt_stride = (qlen+tlen) × min(min(qlen,tlen), w+1).
+    // Largest bt_stride first → first batch has the hardest tasks.
+    // With dynamic per-batch batch_size = pool_cap × LATENCY_HIDE_FACTOR, the kernel is given
+    // exactly as many tasks as it can process concurrently (× latency hide), so:
+    //   - Large-bt_stride batches: small pool_cap → small batch (few tasks, runs fast)
+    //   - Small-bt_stride batches: large pool_cap → large batch (many tasks, high utilisation)
+    // Without this ordering, ONE large-bt_stride task would dominate ALL 5000+ tasks in the
+    // same batch, collapsing pool_cap for everyone.
     std::sort(task_indices_long, task_indices_long + n_long_tasks,
         [&tasks](int a, int b) {
-            int sa = (tasks[a].qlen > tasks[a].tlen) ? tasks[a].qlen : tasks[a].tlen;
-            int sb = (tasks[b].qlen > tasks[b].tlen) ? tasks[b].qlen : tasks[b].tlen;
-            return sa < sb;
+            int qa = tasks[a].qlen, ta = tasks[a].tlen, wa = tasks[a].w;
+            int qb = tasks[b].qlen, tb = tasks[b].tlen, wb = tasks[b].w;
+            int nca = (qa < ta) ? qa : ta;  if (wa >= 0 && wa + 1 < nca) nca = wa + 1;
+            int ncb = (qb < tb) ? qb : tb;  if (wb >= 0 && wb + 1 < ncb) ncb = wb + 1;
+            size_t sa = (size_t)(qa + ta) * (size_t)nca;  // estimated bt_stride (bytes / sizeof)
+            size_t sb = (size_t)(qb + tb) * (size_t)ncb;
+            return sa > sb;  // DESCENDING: largest bt_stride first
         });
 
     // Convenience tag used for all per-stream log lines in this function
@@ -655,25 +662,21 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 d_scores, d_query_ends, d_target_ends,
                 d_mqe, d_mqe_t, d_mte, d_mte_q, d_zdropped);
 
-            // Recompute long batch size from long_task_batch_size, which was set to
-            // g_long_task_batch_size_max (JSON "long_task_batch_size", default 5120)
-            // by setup_long_align_phase().  max_align_tasks is intentionally NOT
-            // changed — setup_align_phase() reads it for short-phase sizing.
+            // long_task_batch_size is set by setup_long_align_phase() via
+            // compute_long_batch_size(): it is the CIGAR-buffer hard cap on batch size.
+            // Actual per-batch batch_size is further constrained dynamically inside
+            // the while loop below (pool_cap × LATENCY_HIDE_FACTOR).
             long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
-            current_batch_size    = long_batch_persistent;
+            current_batch_size    = long_batch_persistent;  // upper bound; overridden per-batch
 
-            // Fix up global batch counters now that we know the real long batch size.
-            // total_batches was computed pre-transition using the old long_batch_persistent;
-            // recompute so the per-batch "[X/Y]" completion log shows the correct denominator.
+            // total_batches_long is an estimate (actual batch sizes vary dynamically).
             total_batches_long = (n_long_tasks > 0)
                 ? (int)((n_long_tasks + (int)long_batch_persistent - 1) / (int)long_batch_persistent)
                 : 0;
             total_batches = total_batches_short + total_batches_long;
-            fprintf(stderr, "[Info::%s]   Tier-1 (long) recalculated: %d batch(es) × up to %zu tasks\n",
-                    stream_tag, total_batches_long, long_batch_persistent);
-
-            // total_phase_batches will be (re)computed below when it is declared,
-            // using the already-updated current_batch_size. No assignment needed here.
+            fprintf(stderr, "[Info::%s]   Tier-1 (long) CIGAR cap: %zu tasks/batch"
+                    "  (actual batch size determined dynamically by pool_cap × 3)\n",
+                    stream_tag, long_batch_persistent);
         }
 
         fprintf(stderr, "[Info::%s] === %s: %d tasks ===\n", stream_tag, phase_name, n_tasks_in_phase);
@@ -714,8 +717,45 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             (int)((n_tasks_in_phase + (int)current_batch_size - 1) / (int)current_batch_size) : 0;
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
-            int batch_size = (tasks_processed_in_phase + current_batch_size <= n_tasks_in_phase) ?
-                             current_batch_size : (n_tasks_in_phase - tasks_processed_in_phase);
+
+            // ── Dynamic batch sizing for long-task phase ─────────────────────────────
+            // Tasks are sorted DESCENDING by estimated bt_stride = (qlen+tlen)×n_col.
+            // The first task in this batch has the largest bt_stride → lowest pool_cap.
+            // We want batch_size = pool_cap × LATENCY_HIDE_FACTOR so the GPU has
+            // enough concurrent warps to hide global-memory latency without wasting
+            // CIGAR buffer on tasks that won't improve concurrency further.
+            //
+            // pool_cap = bt_p_total / bt_stride_of_first_task (floor)
+            // LATENCY_HIDE_FACTOR = 3: empirical — 3× physical occupancy is sufficient
+            //   for L2-bandwidth-bound KSW bt_p accesses on A100 (tested range: 2–4×).
+            if (phase == 1) {
+                int tidx0  = current_task_indices[batch_start];
+                int ql0    = tasks[tidx0].qlen;
+                int tl0    = tasks[tidx0].tlen;
+                int w0     = tasks[tidx0].w;
+                int nc0    = (ql0 < tl0) ? ql0 : tl0;
+                if (w0 >= 0 && w0 + 1 < nc0) nc0 = w0 + 1;
+                size_t bt_stride0 = (size_t)(ql0 + tl0) * (size_t)nc0;
+
+                // bt_p bytes available to the long phase (set at arena transition)
+                size_t bt_p_avail = (dev_mem->long_bt_p_pool_bytes > 0)
+                                    ? dev_mem->long_bt_p_pool_bytes
+                                    : (size_t)n_concurrent_blocks *
+                                      dev_mem->max_align_backtrack_size;
+
+                const size_t LATENCY_HIDE_FACTOR = 3;
+                size_t pool_cap0 = (bt_stride0 > 0) ? (bt_p_avail / bt_stride0) : (size_t)256;
+                if (pool_cap0 < 1) pool_cap0 = 1;
+
+                size_t dyn_batch = pool_cap0 * LATENCY_HIDE_FACTOR;
+                if (dyn_batch < 64)                          dyn_batch = 64;  // floor
+                if (dyn_batch > (size_t)long_batch_persistent) dyn_batch = (size_t)long_batch_persistent;  // CIGAR cap
+
+                current_batch_size = dyn_batch;
+            }
+
+            int batch_size = (tasks_processed_in_phase + (int)current_batch_size <= n_tasks_in_phase) ?
+                             (int)current_batch_size : (n_tasks_in_phase - tasks_processed_in_phase);
             batch_num++;
             phase_batch_num++;
 

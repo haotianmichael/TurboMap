@@ -120,11 +120,47 @@ static size_t cub_scan_tmp_size(size_t n) {
 // Used when sizing the long bt_p pool and when computing per-stream VRAM budgets.
 static size_t g_vram_global_reserve = (size_t)512 * 1024 * 1024;  // default 512 MB
 
-// Maximum long-task batch size (tasks per kernel launch in the long-align phase).
-// Configurable via JSON key "long_task_batch_size" (default 5120).
-// A larger value reduces the number of long batches (fewer host-side iterations)
-// but increases arena CIGAR buffer usage (MAX_LONG_BATCH × 100k ops × 4 B × 2).
-static size_t g_long_task_batch_size_max = 5120;
+// ── compute_long_batch_size ─────────────────────────────────────────────────────
+// Derives the maximum long-task batch size (CIGAR-buffer bound) from the arena
+// size and resource costs.  The derivation targets pool_cap ≈ n_long_cap, where
+// pool_cap = bt_p_total / TYPICAL_BT_STRIDE and n_long_cap = MAX_LONG_BATCH / L.
+//
+// Arena ≈ batch × K1  +  n_long × per_slot_var  +  bt_p
+//   bt_p ≈ n_long × TYPICAL_BT_STRIDE       (pool_cap = n_long)
+//   n_long = batch / L
+// ⟹  batch = L × arena / (L × K1 + per_slot_var + TYPICAL_BT_STRIDE)
+//
+// K1 = per-task arena cost in Step 1 (seq_unp×2, seq_pack×2, cigar×2, misc).
+// Called from setup_long_align_phase() and plmem_malloc_device_mem().
+static size_t compute_long_batch_size(size_t arena_bytes, size_t max_len) {
+    const size_t L = 3;                                    // latency-hide factor
+    const size_t TYPICAL_BT_STRIDE = (size_t)6 << 20;     // 6 MB per slot (typical)
+    const size_t MAX_CAP = 8192;
+    const size_t MIN_CAP = 64;
+
+    size_t long_cigar     = 2 * max_len;
+    size_t max_antidiag   = 2 * max_len;
+
+    // per_slot_var: ksw_temp + bt_off_long × 2 (per concurrent slot)
+    size_t h_arr  = max_len * sizeof(int32_t);
+    size_t sk_arr = (max_len + 1) * 6 * sizeof(int8_t);
+    size_t sq_arr = max_len * 2 * sizeof(uint8_t);
+    size_t ksw_temp = ((h_arr + sk_arr + sq_arr) + 7) & ~(size_t)7;
+    size_t per_slot_var = ksw_temp + 2 * max_antidiag * sizeof(int);
+
+    // K1: per-task arena cost (seq buffers + CIGAR raw+compact + meta/stats/results)
+    size_t K1 = 2 * max_len * sizeof(uint8_t)              // seq_unp  (q + t)
+              + 2 * (max_len / 8) * sizeof(uint32_t)       // seq_pack (q + t)
+              + 2 * long_cigar * sizeof(uint32_t)           // cigar raw + compact
+              + (size_t)20 * sizeof(uint32_t);              // meta, stats, results (rough)
+
+    size_t denom = L * K1 + per_slot_var + TYPICAL_BT_STRIDE;
+    if (denom == 0) return MIN_CAP;
+    size_t batch = L * arena_bytes / denom;
+    if (batch > MAX_CAP) batch = MAX_CAP;
+    if (batch < MIN_CAP) batch = MIN_CAP;
+    return batch;
+}
 
 /* Set up chain + backtrack + voting buffers from arena.
  * Called during init (chain phase first) and after alignment completes. */
@@ -241,29 +277,31 @@ static void setup_chain_phase(deviceMemPtr *dev_mem, size_t anchor_per_batch,
  * KEY IDEA: the short arena (~15 GB) was partitioned for 250 K short tasks.
  * arena_reset() reclaims all memory and re-partitions for long tasks:
  *
- *   Fixed overhead (batch-proportional, MAX_LONG_BATCH = g_long_task_batch_size_max):
- *     seq data (2 × batch × 50 KB):     ~500 MB  (at batch=5120)
- *     CIGAR   (2 × batch × 100 K ops):  ~4.1 GB  (at batch=5120)
+ *   Fixed overhead (batch-proportional, MAX_LONG_BATCH = auto from compute_long_batch_size):
+ *     seq data (2 × batch × 50 KB):     ~360 MB  (at batch≈3600)
+ *     CIGAR   (2 × batch × 100 K ops):  ~2.9 GB  (at batch≈3600)
  *     stats/results/misc:               ~100 MB
  *
- *   Per-slot variable (n_long_cap computed dynamically from remaining space):
- *     ksw_temp  (600 KB/slot):          ~700 MB  (at 1200 slots)
+ *   Per-slot variable (n_long_cap = MAX_LONG_BATCH / LATENCY_HIDE_FACTOR ≈ 1200 slots):
+ *     ksw_temp  (600 KB/slot):          ~720 MB  (at 1200 slots)
  *     bt_off_long (800 KB/slot × 2):    ~1.9 GB  (at 1200 slots)
  *
  *   bt_p pool (everything remaining):   ~8+ GB  ← primary purpose of this transition
  *
- * n_long_cap is chosen so that pool_cap ≈ n_long_cap, i.e. neither bt_off_long
- * nor bt_p pool is the bottleneck.  See formula comment inside the function.
+ * MAX_LONG_BATCH is derived analytically from arena size so that pool_cap ≈ n_long_cap
+ * (neither bt_off_long nor bt_p is the bottleneck).  No user config required.
  *
  * No cudaFree/cudaMalloc: same physical memory, new layout. */
 static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     gpu_arena_t *a = &dev_mem->arena;
     arena_reset(a);
 
-    // ---- Batch cap: configurable via JSON "long_task_batch_size" (default 5120) ----
-    // A larger value reduces the number of long batches (fewer host-side iterations)
-    // but increases arena CIGAR buffer usage (MAX_LONG_BATCH × 100k ops × 4 B × 2).
-    size_t MAX_LONG_BATCH = g_long_task_batch_size_max;  // default 5120
+    // ---- Batch cap: derived from arena size to balance CIGAR, slots, and bt_p ----
+    // compute_long_batch_size() targets MAX_LONG_BATCH = n_long_cap × LATENCY_HIDE_FACTOR
+    // so pool_cap ≈ n_long_cap ≈ MAX_LONG_BATCH / 3.  The per-batch kernel launch in
+    // plalign.cu further constrains actual batch_size dynamically (see comment there).
+    size_t MAX_LONG_BATCH = compute_long_batch_size(a->total_size,
+                                                     dev_mem->max_align_query_len);
     size_t max_len        = dev_mem->max_align_query_len; // 50,000
     size_t long_cigar     = 2 * max_len;                  // 100,000
     size_t max_antidiag_long = 2 * max_len;               // 100,000 (bt_off stride)
@@ -692,9 +730,9 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         fprintf(stderr, "[Info]   Chain phase: %.2f GB  |  Align phase: %.2f GB\n",
                 chain_size / GB, align_size / GB);
         fprintf(stderr, "[Info]   Align config: max_tasks=%zu  short_batch=%d"
-                "  long_batch_max=%zu  n_concurrent=%d\n",
+                "  long_batch_max=%zu (auto)  n_concurrent=%d\n",
                 dev_mem->max_align_tasks, dev_mem->short_task_batch_size,
-                g_long_task_batch_size_max, dev_mem->n_align_concurrent_blocks);
+                long_batch_max, dev_mem->n_align_concurrent_blocks);
         fprintf(stderr, "[Info]   Short bt_p pool (arena): %.2f GB  |  Long bt_p pool (dedicated): %.2f GB\n",
                 bt_p_gb, long_pool_gb);
         fprintf(stderr, "[Info]   bt_off long (short-phase): %.2f GB (%d slots × 100k stride)"
@@ -710,15 +748,17 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     // (22× cudaMallocHost + 22× cudaFreeHost per batch = expensive mlock syscalls).
     {
         // mbs: max batch size across both phases (drives per-task array sizes).
-        // Short phase uses max_align_tasks tasks; long phase uses g_long_task_batch_size_max.
-        size_t mbs = dev_mem->max_align_tasks;  // 250000 >> g_long_task_batch_size_max
-        if (g_long_task_batch_size_max > mbs) mbs = g_long_task_batch_size_max;
+        // Short phase uses max_align_tasks tasks.
+        // Long phase MAX_LONG_BATCH is derived from arena_size via compute_long_batch_size().
+        size_t long_batch_max = compute_long_batch_size(arena_size, dev_mem->max_align_query_len);
+        size_t mbs = dev_mem->max_align_tasks;
+        if (long_batch_max > mbs) mbs = long_batch_max;
 
         // cigar_buf_sz: max total CIGAR entries across both phases.
-        // Short phase: mbs × short_cigar_len (2000)
-        // Long phase:  g_long_task_batch_size_max × long_cigar_len (100000)
-        size_t short_cigar_total = mbs * dev_mem->max_align_cigar_len;  // 250000×2000
-        size_t long_cigar_total  = g_long_task_batch_size_max * 2 * dev_mem->max_align_query_len;
+        // Short phase: max_align_tasks × short_cigar_len (2000)
+        // Long phase:  long_batch_max × long_cigar_len (100000)
+        size_t short_cigar_total = dev_mem->max_align_tasks * dev_mem->max_align_cigar_len;
+        size_t long_cigar_total  = long_batch_max * 2 * dev_mem->max_align_query_len;
         size_t cigar_buf_sz = (long_cigar_total > short_cigar_total) ? long_cigar_total : short_cigar_total;
         dev_mem->h_align_max_batch = mbs;
 
@@ -747,12 +787,12 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
 
         // Pinned sequence staging buffers for H2D — replaces per-batch calloc/free.
         // Sized to cover the largest possible batch: short or long phase, whichever needs more.
-        // NOTE: use g_long_task_batch_size_max (not dev_mem->long_task_batch_size which at
-        // this point holds the scaled initial value ~266, much smaller than MAX_LONG_BATCH).
+        // long_batch_max computed above via compute_long_batch_size() (same formula as
+        // setup_long_align_phase, avoids referencing a global that no longer exists).
         {
             size_t short_seq = (size_t)dev_mem->short_task_batch_size *
                                (((size_t)dev_mem->short_task_max_len + 7) & ~(size_t)7);
-            size_t long_seq  = g_long_task_batch_size_max *
+            size_t long_seq  = long_batch_max *
                                (size_t)dev_mem->max_align_query_len;
             size_t seq_staging = (short_seq > long_seq) ? short_seq : long_seq;
             dev_mem->h_align_seq_staging_bytes = seq_staging;
@@ -1193,12 +1233,8 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
         : (size_t)256 * 1024 * 1024;  // default 256 MB
     g_vram_global_reserve = global_reserve;  // propagate to bt_p pool sizing
 
-    // Long-task batch size for the long-align phase (JSON key "long_task_batch_size").
-    // Larger = fewer batches but more arena CIGAR memory (batch × 100k ops × 4 B × 2).
-    // Default 5120: reduces 51 batches to ~10 for typical data sizes.
-    cJSON *long_batch_json = cJSON_GetObjectItem(json, "long_task_batch_size");
-    if (long_batch_json && cJSON_IsNumber(long_batch_json) && long_batch_json->valueint > 0)
-        g_long_task_batch_size_max = (size_t)long_batch_json->valueint;
+    // Long-task batch size is derived automatically from arena size in
+    // setup_long_align_phase() via compute_long_batch_size().  No JSON key needed.
 
     size_t usable = (gpu_free_mem > global_reserve) ? (gpu_free_mem - global_reserve) : gpu_free_mem;
     size_t avail_mem_per_stream = usable / (*num_stream_);

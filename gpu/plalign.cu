@@ -674,9 +674,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 ? (int)((n_long_tasks + (int)long_batch_persistent - 1) / (int)long_batch_persistent)
                 : 0;
             total_batches = total_batches_short + total_batches_long;
-            fprintf(stderr, "[Info::%s]   Tier-1 (long) CIGAR cap: %zu tasks/batch"
-                    "  (actual batch size determined dynamically by pool_cap × 3)\n",
-                    stream_tag, long_batch_persistent);
+            fprintf(stderr, "[Info::%s]   Tier-1 (long): CIGAR cap=%zu  bt_p=%.2f GB  slots=%d\n",
+                    stream_tag, long_batch_persistent,
+                    dev_mem->long_bt_p_pool_bytes / (1024.0*1024.0*1024.0),
+                    dev_mem->n_long_concurrent_slots);
         }
 
         fprintf(stderr, "[Info::%s] === %s: %d tasks ===\n", stream_tag, phase_name, n_tasks_in_phase);
@@ -715,6 +716,16 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         int phase_batch_num = 0;
         int total_phase_batches = (n_tasks_in_phase > 0) ?
             (int)((n_tasks_in_phase + (int)current_batch_size - 1) / (int)current_batch_size) : 0;
+
+        // Repeat-suppression state for long-phase batch logging.
+        // When consecutive batches have identical (bt_stride, slots, batch_size),
+        // we print the first, accumulate the rest, and flush with "×N" when params change.
+        size_t rep_bt_stride  = 0;
+        int    rep_slots      = 0;
+        int    rep_batch_size = 0;
+        int    rep_count      = 0;   // number of suppressed identical batches after the first
+        int    rep_done_start = 0;   // tasks_processed_in_phase when the group started
+
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
 
@@ -972,24 +983,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 phase_concurrent_slots = batch_size;
             if (phase_concurrent_slots < 1) phase_concurrent_slots = 1;
 
-            // For long batches: log actual task dimensions so we can tune max_align_query_len.
-            // max_qlen / max_tlen show what the KSW temp buffer must cover.
-            // exceed_limit counts tasks where max(qlen,tlen) > current limit (causes temp buf overflow).
-            if (phase == 1) {
-                const char *pool_src = (dev_mem->d_align_backtrack_p_long != nullptr)
-                                       ? "dedicated" : "arena-fallback";
-                size_t max_slots_from_pool = (batch_max_backtrack_size > 0)
-                    ? (bt_p_total_bytes / batch_max_backtrack_size) : 0;
-                fprintf(stderr,
-                    "[Info::%s] Long batch %d/%d: tasks=%d  max_qlen=%d  max_tlen=%d"
-                    "  antidiag=%zu  n_col=%zu  slots=%d (pool=%s, pool_cap=%zu)"
-                    "  exceed_limit=%d (limit=%zu)\n",
-                    stream_tag, phase_batch_num, total_phase_batches, batch_size,
-                    diag_actual_max_qlen, diag_actual_max_tlen,
-                    diag_actual_antidiag, diag_actual_n_col,
-                    phase_concurrent_slots, pool_src, max_slots_from_pool,
-                    diag_n_exceed, dev_mem->max_align_query_len);
-            }
+            // Pre-batch long-phase log removed; info merged into post-batch line below.
 
             // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
@@ -1226,10 +1220,56 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             tasks_processed_in_phase += batch_size;
             total_tasks_processed += batch_size;
-            fprintf(stderr, "[Info::%s] %s [%d/%d] tasks=%d slots=%d bt_stride=%zu  (%d/%d done)\n",
-                    stream_tag, phase_name, phase_batch_num, total_phase_batches,
-                    batch_size, phase_concurrent_slots, batch_max_backtrack_size,
-                    tasks_processed_in_phase, n_tasks_in_phase);
+
+            if (phase == 0) {
+                // Short phase: one batch, single line is enough.
+                fprintf(stderr, "[Info::%s] %s [%d/%d] tasks=%d slots=%d bt_stride=%zu  (%d/%d done)\n",
+                        stream_tag, phase_name, phase_batch_num, total_phase_batches,
+                        batch_size, phase_concurrent_slots, batch_max_backtrack_size,
+                        tasks_processed_in_phase, n_tasks_in_phase);
+            } else {
+                // Long phase: merged one-line log with repeat suppression.
+                // bt_stride in MB (2 decimal places) and n_col from diag vars.
+                double bt_mb = batch_max_backtrack_size / (1024.0 * 1024.0);
+
+                bool same = (batch_max_backtrack_size == rep_bt_stride &&
+                             phase_concurrent_slots   == rep_slots      &&
+                             batch_size               == rep_batch_size);
+                if (same) {
+                    // Suppress this line — just count it.
+                    rep_count++;
+                } else {
+                    // Flush any accumulated repeats from the previous group.
+                    if (rep_count > 0) {
+                        fprintf(stderr,
+                            "[Info::%s]   ... ×%d more identical batches"
+                            "  (%d/%d done)\n",
+                            stream_tag, rep_count,
+                            tasks_processed_in_phase - batch_size, n_tasks_in_phase);
+                        rep_count = 0;
+                    }
+                    // Print this batch.
+                    fprintf(stderr,
+                        "[Info::%s] Long [%d] tasks=%d  n_col=%zu  bt=%.2fMB  slots=%d"
+                        "  (%d/%d done)\n",
+                        stream_tag, phase_batch_num,
+                        batch_size, diag_actual_n_col, bt_mb, phase_concurrent_slots,
+                        tasks_processed_in_phase, n_tasks_in_phase);
+                    rep_bt_stride  = batch_max_backtrack_size;
+                    rep_slots      = phase_concurrent_slots;
+                    rep_batch_size = batch_size;
+                    rep_done_start = tasks_processed_in_phase - batch_size;
+                }
+                // After the very last batch in this phase, flush any trailing repeats.
+                if (tasks_processed_in_phase >= n_tasks_in_phase && rep_count > 0) {
+                    fprintf(stderr,
+                        "[Info::%s]   ... ×%d more identical batches"
+                        "  (%d/%d done)\n",
+                        stream_tag, rep_count,
+                        tasks_processed_in_phase, n_tasks_in_phase);
+                    rep_count = 0;
+                }
+            }
         }  // End of batch loop within phase
     }  // End of three-tier loop
 

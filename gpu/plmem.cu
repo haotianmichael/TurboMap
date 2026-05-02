@@ -433,13 +433,18 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     // if it were changed here (called again next round of short alignment).
     dev_mem->long_task_batch_size = (int)MAX_LONG_BATCH;
 
-    fprintf(stderr,
-        "[Info] Long-align arena: bt_p=%.2f GB  batch=%zu  slots=%zu"
-        "  ksw_temp=%.0f MB  CIGAR=%.0f MB  bt_off=%.0f MB\n",
-        bt_p_avail / (1024.0*1024.0*1024.0), MAX_LONG_BATCH, n_long_cap,
-        ksw_temp_bytes / (1024.0*1024.0),
-        cigar_bytes * 2 / (1024.0*1024.0),
-        bt_off_long_bytes * 2 / (1024.0*1024.0));
+    // Print once even when multiple streams each call this function.
+    static bool s_long_arena_logged = false;
+    if (!s_long_arena_logged) {
+        s_long_arena_logged = true;
+        fprintf(stderr,
+            "[Info] Long-align arena: bt_p=%.2f GB  batch=%zu  slots=%zu"
+            "  ksw_temp=%.0f MB  CIGAR=%.0f MB  bt_off=%.0f MB\n",
+            bt_p_avail / (1024.0*1024.0*1024.0), MAX_LONG_BATCH, n_long_cap,
+            ksw_temp_bytes / (1024.0*1024.0),
+            cigar_bytes * 2 / (1024.0*1024.0),
+            bt_off_long_bytes * 2 / (1024.0*1024.0));
+    }
 
     dev_mem->current_phase = GPU_PHASE_ALIGN;
 }

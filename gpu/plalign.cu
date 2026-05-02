@@ -522,13 +522,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t long_batch_persistent   = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;
 
     int total_batches_short = n_short_tasks > 0 ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
-    int total_batches_long = n_long_tasks > 0 ? (int)((n_long_tasks + long_batch_persistent - 1) / long_batch_persistent) : 0;
-    int total_batches = total_batches_short + total_batches_long;
     fprintf(stderr, "[Info::%s]   Tier-0 (short): %d batch(es) × up to %zu tasks  [fixed bt stride: %zu×%zu bytes]\n",
             stream_tag, total_batches_short, short_batch_persistent,
             2 * short_task_max_len, short_task_max_len + 1);
-    fprintf(stderr, "[Info::%s]   Tier-1 (long):  %d batch(es) × up to %zu tasks  [dynamic bt stride per batch]\n",
-            stream_tag, total_batches_long, long_batch_persistent);
+    // Tier-1 (long): batch count is determined dynamically per-batch (bt_stride-sorted tasks,
+    // batch_size = pool_cap × LATENCY_HIDE_FACTOR).  Do not print an estimate here; the actual
+    // count is shown at the end ("Alignment complete: X tasks in Y batches").
+    fprintf(stderr, "[Info::%s]   Tier-1 (long):  %d tasks  [bt_stride-sorted; batch count determined dynamically]\n",
+            stream_tag, n_long_tasks);
 
     size_t max_batch_size = (short_batch_persistent > long_batch_persistent) ?
                              short_batch_persistent : long_batch_persistent;
@@ -668,12 +669,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // the while loop below (pool_cap × LATENCY_HIDE_FACTOR).
             long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
             current_batch_size    = long_batch_persistent;  // upper bound; overridden per-batch
-
-            // total_batches_long is an estimate (actual batch sizes vary dynamically).
-            total_batches_long = (n_long_tasks > 0)
-                ? (int)((n_long_tasks + (int)long_batch_persistent - 1) / (int)long_batch_persistent)
-                : 0;
-            total_batches = total_batches_short + total_batches_long;
             fprintf(stderr, "[Info::%s]   Tier-1 (long): CIGAR cap=%zu  bt_p=%.2f GB  slots=%d\n",
                     stream_tag, long_batch_persistent,
                     dev_mem->long_bt_p_pool_bytes / (1024.0*1024.0*1024.0),

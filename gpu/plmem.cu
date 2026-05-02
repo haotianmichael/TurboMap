@@ -724,6 +724,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         // skip the allocation entirely — long tasks fall back to the shared arena bt_p pool.
     }
 
+    // Compute long_batch_max here (outside the pinned-buffer block) so it is visible
+    // to the print_info log below as well as the cudaMallocHost calls that follow.
+    size_t long_batch_max = compute_long_batch_size(arena_size, dev_mem->max_align_query_len);
+
     if (print_info) {
         double GB = 1024.0*1024.0*1024.0;
         double bt_p_gb = (double)dev_mem->n_align_concurrent_blocks *
@@ -756,9 +760,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     // (22× cudaMallocHost + 22× cudaFreeHost per batch = expensive mlock syscalls).
     {
         // mbs: max batch size across both phases (drives per-task array sizes).
-        // Short phase uses max_align_tasks tasks.
-        // Long phase MAX_LONG_BATCH is derived from arena_size via compute_long_batch_size().
-        size_t long_batch_max = compute_long_batch_size(arena_size, dev_mem->max_align_query_len);
+        // long_batch_max already computed above via compute_long_batch_size().
         size_t mbs = dev_mem->max_align_tasks;
         if (long_batch_max > mbs) mbs = long_batch_max;
 

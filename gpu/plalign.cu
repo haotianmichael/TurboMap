@@ -639,7 +639,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             d_mte_q           = dev_mem->d_align_mte_q;
             d_zdropped        = dev_mem->d_align_zdropped;
             d_task_counter    = dev_mem->d_align_task_counter;
-            n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;  // now 512
+            n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;  // now n_long_cap (dynamic)
             d_compact_cigar   = dev_mem->d_align_compact_cigar;
             d_compact_offsets = dev_mem->d_align_compact_offsets;
             d_cub_tmp         = dev_mem->d_align_cub_tmp;
@@ -737,11 +737,16 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 if (w0 >= 0 && w0 + 1 < nc0) nc0 = w0 + 1;
                 size_t bt_stride0 = (size_t)(ql0 + tl0) * (size_t)nc0;
 
-                // bt_p bytes available to the long phase (set at arena transition)
+                // bt_p bytes available to the long phase (set at arena transition).
+                // long_bt_p_pool_bytes holds either the dedicated cudaMalloc pool size
+                // (if one was allocated in plmem_malloc_device_mem) or the arena bt_p
+                // size (set by setup_long_align_phase when no dedicated pool exists).
+                // Fallback: n_long_concurrent_slots × TYPICAL_BT_STRIDE (safe floor).
+                const size_t TYPICAL_BT_STRIDE_FALLBACK = (size_t)6 << 20;
                 size_t bt_p_avail = (dev_mem->long_bt_p_pool_bytes > 0)
                                     ? dev_mem->long_bt_p_pool_bytes
-                                    : (size_t)n_concurrent_blocks *
-                                      dev_mem->max_align_backtrack_size;
+                                    : (size_t)dev_mem->n_long_concurrent_slots *
+                                      TYPICAL_BT_STRIDE_FALLBACK;
 
                 const size_t LATENCY_HIDE_FACTOR = 3;
                 size_t pool_cap0 = (bt_stride0 > 0) ? (bt_p_avail / bt_stride0) : (size_t)256;

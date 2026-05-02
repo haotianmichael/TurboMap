@@ -416,9 +416,17 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     if (bt_p_avail > BT_P_HEADROOM) bt_p_avail -= BT_P_HEADROOM;
     else                             bt_p_avail = 0;
 
-    dev_mem->d_align_backtrack_p      = (uint8_t*)arena_alloc(a, bt_p_avail);
-    dev_mem->max_align_backtrack_size  = 0;   // stride computed per-batch in plalign.cu
-    dev_mem->long_bt_p_pool_bytes      = bt_p_avail;
+    dev_mem->d_align_backtrack_p     = (uint8_t*)arena_alloc(a, bt_p_avail);
+    dev_mem->max_align_backtrack_size = 0;   // stride computed per-batch in plalign.cu
+
+    // Update long_bt_p_pool_bytes ONLY if there is no dedicated cudaMalloc pool.
+    // When a dedicated pool exists (d_align_backtrack_p_long != nullptr), the field
+    // already holds its correct size (set in plmem_malloc_device_mem) and must NOT
+    // be overwritten: plalign.cu uses it as the bound for pool_cap, and clobbering it
+    // with the (potentially larger) arena bt_p would cause pool_cap to exceed the
+    // dedicated pool's physical allocation → out-of-bounds GPU memory access.
+    if (dev_mem->d_align_backtrack_p_long == nullptr)
+        dev_mem->long_bt_p_pool_bytes = bt_p_avail;
 
     // Store long batch cap in long_task_batch_size.
     // DO NOT touch max_align_tasks — setup_align_phase() reads it and would break

@@ -226,6 +226,11 @@ typedef struct {
     // VRAM (typically 10-20 GB on a 32 GB card) so long concurrency can reach 30-60 slots.
     uint8_t *d_align_backtrack_p_long;   // dedicated long bt_p pool (outside arena)
     size_t   long_bt_p_pool_bytes;       // total bytes allocated for the long pool
+    // When USE_GRIDDED_BT=1, the same byte pool (d_align_backtrack_p or
+    // d_align_backtrack_p_long) is logically reinterpreted at batch-dispatch
+    // time as [dblock][scratch] for the gridded traceback path.  See
+    // gpu/plgrid_config.h.  No additional fields needed here — the split is
+    // computed in plalign.cu based on per-batch max_antidiag / max_n_col.
     uint32_t *d_align_cigar_buffer;
     int *d_align_cigar_lengths;
     size_t max_align_backtrack_size; // per task

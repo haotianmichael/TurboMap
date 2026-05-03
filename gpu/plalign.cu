@@ -3,6 +3,7 @@
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
+#include "plgrid_kernel.cuh"   // gridded traceback (compile-time gated by USE_GRIDDED_BT)
 // plksw2_kernel.cuh (CUDASW4-style column-parallel) no longer used; unified anti-diagonal kernel
 #include <cub/device/device_scan.cuh>
 // NVTX3 C API (nvtxRangePushA/nvtxRangePop) already available via cub/detail/nvtx.cuh
@@ -985,35 +986,110 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             {
                 int parallel_threads = 32;   // one warp per block
-                // batch summary printed after completion (see below)
-                ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
-                                              0, align_stream>>>(
-                    d_task_counter,
-                    d_packed_query,
-                    d_packed_target,
-                    d_query_lens,
-                    d_target_lens,
-                    d_query_offsets,
-                    d_target_offsets,
-                    (gasal_res_t*)device_res,
-                    d_mat,
-                    d_bt_p_batch,
-                    d_bt_off_batch,
-                    d_bt_off_end_batch,
-                    (int)batch_max_backtrack_size,
-                    (int)batch_max_antidiag,
-                    d_ksw_temp_buffer,
-                    d_flag,
-                    d_bw,
-                    ksw_temp_per_task,
-                    batch_size,
-                    5,              // m = alphabet size (ACGTN)
-                    opt->zdrop,
-                    opt->end_bonus,
-                    cigar_buffer ? d_cigar_buffer  : NULL,
-                    cigar_buffer ? d_cigar_lengths : NULL,
-                    (int)current_max_cigar_len
-                );
+
+#if USE_GRIDDED_BT
+                /* ─────────── Gridded traceback path (long phase only) ─────────── */
+                /* For phase==1 we replace the per-cell bt_p direction-byte storage  */
+                /* with a much smaller G-spaced delta-state checkpoint table         */
+                /* (dblock) plus a per-slot scratch buffer used during backtrack     */
+                /* replay.  See gpu/plgrid_config.h for the design.                  */
+                if (phase == 1 && cigar_buffer) {
+                    const size_t G = (size_t)GRID_BLOCK_SIZE;
+                    size_t batch_n_col = (size_t)diag_actual_n_col;
+                    if (batch_n_col == 0) batch_n_col = 1;
+                    size_t n_ckpt = ((size_t)batch_max_antidiag + G - 1) / G;
+                    size_t dblock_per_slot  =
+                        n_ckpt * (size_t)GRID_NUM_DELTA_ARRAYS * batch_n_col;
+                    size_t scratch_per_slot = G * batch_n_col;
+                    size_t total_per_slot   = dblock_per_slot + scratch_per_slot;
+                    if (total_per_slot == 0) total_per_slot = 1;
+
+                    /* Re-derive concurrency from the gridded per-slot footprint —    */
+                    /* much smaller than batch_max_backtrack_size, so this typically  */
+                    /* gives ~10-20× more slots for super-long batches.               */
+                    size_t grid_slots_from_pool =
+                        (size_t)bt_p_total_bytes / total_per_slot;
+                    int grid_slots = (int)grid_slots_from_pool;
+                    if (grid_slots > max_slots_cap) grid_slots = max_slots_cap;
+                    if (grid_slots > batch_size)    grid_slots = batch_size;
+                    if (grid_slots < 1)             grid_slots = 1;
+                    phase_concurrent_slots = grid_slots;   /* override for logging too */
+
+                    /* Pool layout: [dblock area: grid_slots × dblock_per_slot]      */
+                    /*              [scratch area: grid_slots × scratch_per_slot]    */
+                    int8_t  *grid_dblock_pool  = (int8_t*)d_bt_p_batch;
+                    uint8_t *grid_scratch_pool = (uint8_t*)d_bt_p_batch
+                        + (size_t)grid_slots * dblock_per_slot;
+
+                    ksw_gridded_forward_kernel<<<grid_slots, parallel_threads,
+                                                 0, align_stream>>>(
+                        d_task_counter,
+                        d_packed_query, d_packed_target,
+                        d_query_lens,   d_target_lens,
+                        d_query_offsets, d_target_offsets,
+                        (gasal_res_t*)device_res, d_mat,
+                        grid_dblock_pool, dblock_per_slot,
+                        d_bt_off_batch, d_bt_off_end_batch,
+                        (int)batch_max_antidiag, (int)batch_n_col,
+                        d_ksw_temp_buffer, d_flag, d_bw,
+                        ksw_temp_per_task, batch_size,
+                        5, opt->zdrop, opt->end_bonus,
+                        d_cigar_lengths
+                    );
+
+                    /* Reset task counter for the backtrack pass.                   */
+                    cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
+
+                    ksw_gridded_backtrack_kernel<<<grid_slots, parallel_threads,
+                                                   0, align_stream>>>(
+                        d_task_counter,
+                        d_packed_query, d_packed_target,
+                        d_query_lens,   d_target_lens,
+                        d_query_offsets, d_target_offsets,
+                        (gasal_res_t*)device_res, d_mat,
+                        grid_dblock_pool, dblock_per_slot,
+                        grid_scratch_pool, scratch_per_slot,
+                        d_bt_off_batch, d_bt_off_end_batch,
+                        (int)batch_max_antidiag, (int)batch_n_col,
+                        d_ksw_temp_buffer, d_flag, d_bw,
+                        ksw_temp_per_task, batch_size, 5,
+                        d_cigar_buffer, d_cigar_lengths,
+                        (int)current_max_cigar_len
+                    );
+                } else
+#endif
+                {
+                    // Legacy per-cell bt_p path (always for short phase, also long
+                    // phase when USE_GRIDDED_BT=0).
+                    ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
+                                                  0, align_stream>>>(
+                        d_task_counter,
+                        d_packed_query,
+                        d_packed_target,
+                        d_query_lens,
+                        d_target_lens,
+                        d_query_offsets,
+                        d_target_offsets,
+                        (gasal_res_t*)device_res,
+                        d_mat,
+                        d_bt_p_batch,
+                        d_bt_off_batch,
+                        d_bt_off_end_batch,
+                        (int)batch_max_backtrack_size,
+                        (int)batch_max_antidiag,
+                        d_ksw_temp_buffer,
+                        d_flag,
+                        d_bw,
+                        ksw_temp_per_task,
+                        batch_size,
+                        5,              // m = alphabet size (ACGTN)
+                        opt->zdrop,
+                        opt->end_bonus,
+                        cigar_buffer ? d_cigar_buffer  : NULL,
+                        cigar_buffer ? d_cigar_lengths : NULL,
+                        (int)current_max_cigar_len
+                    );
+                }
             }
 
             cudaError_t kernel_err = cudaGetLastError();

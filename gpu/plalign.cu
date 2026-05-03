@@ -6,6 +6,15 @@
 #include "plgrid_kernel.cuh"   // gridded traceback (compile-time gated by USE_GRIDDED_BT)
 // plksw2_kernel.cuh (CUDASW4-style column-parallel) no longer used; unified anti-diagonal kernel
 #include <cub/device/device_scan.cuh>
+
+/* Compile-time announcement: the user passes `make GRID=1` to enable.        */
+/* If you don't see this message in the nvcc output, your build did not       */
+/* recompile plalign.cu — try `make clean && make GRID=1`.                    */
+#if USE_GRIDDED_BT
+#pragma message ("plalign.cu: USE_GRIDDED_BT = 1  (gridded traceback path COMPILED IN)")
+#else
+#pragma message ("plalign.cu: USE_GRIDDED_BT = 0  (legacy bt_p path only)")
+#endif
 // NVTX3 C API (nvtxRangePushA/nvtxRangePop) already available via cub/detail/nvtx.cuh
 
 
@@ -374,6 +383,21 @@ extern "C" void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                             uint8_t *seq_buffer, uint32_t *cigar_buffer, int stream_id) {
     if (n_tasks <= 0) return;
+
+    /* One-time announcement of compile-time gridded flag.  Lets the user      */
+    /* verify whether the binary they're running has gridded traceback baked   */
+    /* in.  Look for "[Info] Gridded traceback ..." in stderr.                  */
+    static bool s_grid_announced = false;
+    if (!s_grid_announced) {
+        s_grid_announced = true;
+#if USE_GRIDDED_BT
+        fprintf(stderr, "[Info] Gridded traceback ENABLED (USE_GRIDDED_BT=1, G=%d)\n",
+                GRID_BLOCK_SIZE);
+#else
+        fprintf(stderr, "[Info] Gridded traceback DISABLED (USE_GRIDDED_BT=0; legacy bt_p path)\n");
+#endif
+    }
+
     nvtxRangePushA("gpu_align_batch_execute");
     cudaSetDevice(0);
     gpu_align_copy_param();
@@ -994,6 +1018,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 /* (dblock) plus a per-slot scratch buffer used during backtrack     */
                 /* replay.  See gpu/plgrid_config.h for the design.                  */
                 if (phase == 1 && cigar_buffer) {
+                    static bool s_grid_path_taken = false;
+                    if (!s_grid_path_taken) {
+                        s_grid_path_taken = true;
+                        fprintf(stderr, "[Info] Gridded long-phase dispatch ACTIVE (first long batch on stream)\n");
+                    }
                     const size_t G = (size_t)GRID_BLOCK_SIZE;
                     size_t batch_n_col = (size_t)diag_actual_n_col;
                     if (batch_n_col == 0) batch_n_col = 1;

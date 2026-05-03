@@ -992,6 +992,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 // scan loop; no further override needed here.
             }
 
+            // Per-batch path marker for the post-batch log (set by the dispatch).
+            char batch_path_tag = 'L';   // L = legacy bt_p, G = gridded
+
             size_t max_slots_this_phase = (batch_max_backtrack_size > 0)
                 ? (bt_p_total_bytes / batch_max_backtrack_size)
                 : (size_t)n_concurrent_blocks;
@@ -1012,36 +1015,56 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 int parallel_threads = 32;   // one warp per block
 
 #if USE_GRIDDED_BT
-                /* ─────────── Gridded traceback path (long phase only) ─────────── */
-                /* For phase==1 we replace the per-cell bt_p direction-byte storage  */
-                /* with a much smaller G-spaced delta-state checkpoint table         */
-                /* (dblock) plus a per-slot scratch buffer used during backtrack     */
-                /* replay.  See gpu/plgrid_config.h for the design.                  */
+                /* ─────────── Gridded traceback dispatch (long phase only) ───────── */
+                /* For phase==1 we MAY replace the per-cell bt_p path with the        */
+                /* gridded path (smaller per-slot memory → more concurrent slots).    */
+                /*                                                                    */
+                /* Trade-off: gridded incurs ~2× compute (forward + backtrack         */
+                /* replay).  So we only switch when the slot increase ≥ 2× — that's   */
+                /* exactly when the legacy path is bt_stride-bound rather than        */
+                /* batch_size-bound.  For small-bt_stride batches (where legacy       */
+                /* already saturates batch_size) gridded only adds replay overhead.   */
+                bool use_grid = false;
+                size_t grid_dblock_per_slot = 0, grid_scratch_per_slot = 0;
+                int grid_slots = 0;
                 if (phase == 1 && cigar_buffer) {
-                    static bool s_grid_path_taken = false;
-                    if (!s_grid_path_taken) {
-                        s_grid_path_taken = true;
-                        fprintf(stderr, "[Info] Gridded long-phase dispatch ACTIVE (first long batch on stream)\n");
-                    }
                     const size_t G = (size_t)GRID_BLOCK_SIZE;
                     size_t batch_n_col = (size_t)diag_actual_n_col;
                     if (batch_n_col == 0) batch_n_col = 1;
                     size_t n_ckpt = ((size_t)batch_max_antidiag + G - 1) / G;
-                    size_t dblock_per_slot  =
+                    grid_dblock_per_slot  =
                         n_ckpt * (size_t)GRID_NUM_DELTA_ARRAYS * batch_n_col;
-                    size_t scratch_per_slot = G * batch_n_col;
-                    size_t total_per_slot   = dblock_per_slot + scratch_per_slot;
+                    grid_scratch_per_slot = G * batch_n_col;
+                    size_t total_per_slot = grid_dblock_per_slot + grid_scratch_per_slot;
                     if (total_per_slot == 0) total_per_slot = 1;
 
-                    /* Re-derive concurrency from the gridded per-slot footprint —    */
-                    /* much smaller than batch_max_backtrack_size, so this typically  */
-                    /* gives ~10-20× more slots for super-long batches.               */
-                    size_t grid_slots_from_pool =
-                        (size_t)bt_p_total_bytes / total_per_slot;
-                    int grid_slots = (int)grid_slots_from_pool;
+                    int grid_slots_raw = (int)((size_t)bt_p_total_bytes / total_per_slot);
+                    grid_slots = grid_slots_raw;
                     if (grid_slots > max_slots_cap) grid_slots = max_slots_cap;
                     if (grid_slots > batch_size)    grid_slots = batch_size;
                     if (grid_slots < 1)             grid_slots = 1;
+
+                    /* Effective slot count for the legacy path on this batch.       */
+                    int legacy_slots = phase_concurrent_slots;
+
+                    /* Switch to gridded only when it ≥ doubles concurrency.  This   */
+                    /* covers the 2× compute overhead of replay.                     */
+                    use_grid = (grid_slots >= 2 * legacy_slots);
+
+                    static bool s_grid_path_taken = false;
+                    if (use_grid && !s_grid_path_taken) {
+                        s_grid_path_taken = true;
+                        fprintf(stderr, "[Info] Gridded long-phase dispatch ACTIVE "
+                                "(first batch with grid_slots %d ≥ 2× legacy_slots %d)\n",
+                                grid_slots, legacy_slots);
+                    }
+                }
+                if (use_grid) {
+                    batch_path_tag = 'G';
+                    size_t dblock_per_slot  = grid_dblock_per_slot;
+                    size_t scratch_per_slot = grid_scratch_per_slot;
+                    size_t batch_n_col = (size_t)diag_actual_n_col;
+                    if (batch_n_col == 0) batch_n_col = 1;
                     phase_concurrent_slots = grid_slots;   /* override for logging too */
 
                     /* Pool layout: [dblock area: grid_slots × dblock_per_slot]      */
@@ -1350,9 +1373,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     }
                     // Print this batch.
                     fprintf(stderr,
-                        "[Info::%s] Long [%d] tasks=%d  n_col=%zu  bt=%.2fMB  slots=%d"
+                        "[Info::%s] Long [%d|%c] tasks=%d  n_col=%zu  bt=%.2fMB  slots=%d"
                         "  (%d/%d done)\n",
-                        stream_tag, phase_batch_num,
+                        stream_tag, phase_batch_num, batch_path_tag,
                         batch_size, diag_actual_n_col, bt_mb, phase_concurrent_slots,
                         tasks_processed_in_phase, n_tasks_in_phase);
                     rep_bt_stride  = batch_max_backtrack_size;

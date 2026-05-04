@@ -796,6 +796,16 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             batch_num++;
             phase_batch_num++;
 
+            /* ─── NVTX outer range for the entire batch ───
+             * Label format: "<P>[B<N>|n=<size>]"  where P = S/L (short/long).
+             * Slot count is appended later in the kernel-launch sub-range.
+             * Open the batch range here; closed at the end of map_results.    */
+            char nvtx_batch_label[64];
+            snprintf(nvtx_batch_label, sizeof(nvtx_batch_label),
+                     "%c[B%d|n=%d]", (phase == 0) ? 'S' : 'L',
+                     phase_batch_num, batch_size);
+            nvtxRangePushA(nvtx_batch_label);
+
             // Clear ONLY result buffers before each batch to prevent reading stale data
             // If a task fails (zdropped etc), kernel may not write to result buffers
             // Without clearing, we'd read previous batch's stale results
@@ -818,6 +828,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             uint32_t max_query_len = 0;
             const uint8_t N_BASE = 4;
 
+            nvtxRangePushA("host_prep");
             for (int i = 0; i < batch_size; i++) {
                 int task_idx = current_task_indices[batch_start + i];
                 int qlen = tasks[task_idx].qlen;
@@ -851,9 +862,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
                 if ((uint32_t)qlen > max_query_len) max_query_len = qlen;
             }
-
+            nvtxRangePop(); // host_prep
 
             // Copy batch data to GPU (async on align_stream so chain stream stays free)
+            nvtxRangePushA("h2d");
             cudaMemcpyAsync(d_unpacked_query, h_unpacked_query,
                             total_query_bytes, cudaMemcpyHostToDevice, align_stream);
             cudaMemcpyAsync(d_unpacked_target, h_unpacked_target,
@@ -870,10 +882,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                             batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
             cudaMemcpyAsync(d_bw, h_bw,
                             batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
-
-
+            nvtxRangePop(); // h2d
 
             // Launch packing kernel
+            nvtxRangePushA("pack_launch");
             int query_tasks_per_thread = (int)ceil((double)total_query_bytes /
                                                   (8 * kernel_threads * kernel_blocks));
             int target_tasks_per_thread = (int)ceil((double)total_target_bytes /
@@ -889,6 +901,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 total_query_bytes / 4,
                 total_target_bytes / 4
             );
+            nvtxRangePop(); // pack_launch
 
             // ===== Persistent KSW Kernel (unified anti-diagonal, int32 dual-affine) =====
             // Both phases use the same fused persistent kernel with direct int32 H/E/F/E2/F2.
@@ -944,6 +957,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             size_t diag_actual_antidiag  = 0;
             size_t diag_actual_n_col     = 0;
 
+            if (phase == 1) nvtxRangePushA("long_setup");
             if (phase == 1) {
                 // Scan this batch to find actual maximum n_col and antidiag needed.
                 // n_col = min(min(qlen, tlen), w+1)  (mirrors kernel line 244-245)
@@ -992,6 +1006,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 // bt_p pool and total bytes were already selected above before the
                 // scan loop; no further override needed here.
             }
+            if (phase == 1) nvtxRangePop(); // long_setup
 
             // Per-batch path marker for the post-batch log (set by the dispatch).
             char batch_path_tag = 'L';   // L = legacy bt_p, G = gridded
@@ -1008,6 +1023,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             if (phase_concurrent_slots < 1) phase_concurrent_slots = 1;
 
             // Pre-batch long-phase log removed; info merged into post-batch line below.
+
+            /* NVTX: kernel-launch range with slot count in label so a specific  */
+            /* batch (e.g. slots=15 super-long) can be located in nsys easily.   */
+            char nvtx_kernel_label[64];
+            snprintf(nvtx_kernel_label, sizeof(nvtx_kernel_label),
+                     "kernel:s=%d", phase_concurrent_slots);
+            nvtxRangePushA(nvtx_kernel_label);
 
             // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
@@ -1142,9 +1164,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel launch failed: %s\n",
                         cudaGetErrorString(kernel_err));
             }
+            nvtxRangePop(); // kernel:s=N
 
             // P1/P2/P3: GPU compaction + fix_cigar + stats before D2H
             // This eliminates the 960MB stride CIGAR D2H transfer and the CPU mm_fix_cigar/mm_update_extra loop.
+            nvtxRangePushA("compact_launch");
             if (cigar_buffer) {
                 // Step A: compute per-task compact offsets via exclusive prefix sum
                 cub::DeviceScan::ExclusiveSum(d_cub_tmp, cub_tmp_size,
@@ -1168,9 +1192,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     batch_size
                 );
             }
+            nvtxRangePop(); // compact_launch
 
             // D2H Sync 1: small arrays — CIGAR lengths, scores, endpoints, GPU stats
             // The compact CIGAR bulk D2H happens after we know total_cigar_ops (see Sync 2 below).
+            nvtxRangePushA("d2h_small");
             if (cigar_buffer) {
                 cudaMemcpyAsync(h_cigar_lengths, d_cigar_lengths,
                                 batch_size * sizeof(int), cudaMemcpyDeviceToHost, align_stream);
@@ -1190,9 +1216,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemcpyAsync(h_mte,   d_mte,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_mte_q, d_mte_q, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_zdropped, d_zdropped, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+            nvtxRangePop(); // d2h_small
 
             // Sync 1: wait for small arrays (D2H above) to arrive on host
+            // This is where the CPU actually waits for the GPU forward kernel +
+            // compact + D2H to all complete.  Long bars here = GPU bottleneck.
+            nvtxRangePushA("sync1_wait_gpu");
             cudaStreamSynchronize(align_stream);
+            nvtxRangePop(); // sync1_wait_gpu
             kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel execution failed: %s\n",
@@ -1228,6 +1259,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // shrink CIGARs in-place. The data in d_compact_cigar is still at the ORIGINAL
             // offsets. We must copy d_compact_offsets from GPU rather than recomputing from
             // the updated h_cigar_lengths, which would produce wrong (shifted) offsets.
+            nvtxRangePushA("d2h_cigar");
             int total_cigar_ops = 0;
             if (cigar_buffer) {
                 // Validate cigar lengths
@@ -1270,8 +1302,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     cudaStreamSynchronize(align_stream);
                 }
             }
+            nvtxRangePop(); // d2h_cigar
 
             // Map results back to tasks
+            nvtxRangePushA("map_results");
             for (int i = 0; i < batch_size; i++) {
                 int task_idx = current_task_indices[batch_start + i];  // Use task index from current phase
                 int align_id = i;  // always identity; h_task_to_align_id removed
@@ -1330,7 +1364,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
                 tasks[task_idx].zdropped = h_zdropped[align_id] ? 1 : 0;
             }
-
+            nvtxRangePop(); // map_results
+            nvtxRangePop(); // outer batch (S/L[B<N>|n=...])
 
             // h_unpacked_query/target point to pinned dev_mem buffers — no free needed.
 

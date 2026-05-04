@@ -4,6 +4,10 @@ CONFIG			+= $(if $(MAX_MICRO_BATCH),-DMICRO_BATCH=\($(MAX_MICRO_BATCH)\))
 # See gpu/plgrid_config.h for the design.  Default is OFF (legacy path).
 CONFIG			+= $(if $(GRID),-DUSE_GRIDDED_BT=1)
 
+# Enable verbose [Info...] logging from plmem.cu / plalign.cu:  make PRINT=1
+# See gpu/pllog.h.  Default OFF — fewer fprintfs = faster (small).
+CONFIG			+= $(if $(PRINT),-DPRINT=1)
+
 ifeq ($(GPU), AMD)
     GPUARCH    ?= $(strip $(shell rocminfo |grep -m 1 -E gfx[^0]{1} | sed -e 's/ *Name: *//'))
 else

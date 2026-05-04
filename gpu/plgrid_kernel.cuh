@@ -401,9 +401,9 @@ __global__ void ksw_gridded_forward_kernel(
     uint32_t *target_batch_offsets,
     gasal_res_t *device_res,
     int8_t *device_mat,
-    int8_t *dblock_buf,           /* per-slot stride = max_dblock_per_slot     */
-    size_t dblock_per_slot,        /* bytes                                      */
-    int *backtrack_off,
+    int8_t *dblock_buf,           /* per-task stride = dblock_per_task         */
+    size_t dblock_per_task,        /* bytes                                      */
+    int *backtrack_off,            /* per-task indexed: stride = max_antidiag   */
     int *backtrack_off_end,
     int max_antidiag,
     int max_n_col_per_slot,        /* width of each delta sub-array per ckpt    */
@@ -528,10 +528,15 @@ __global__ void ksw_gridded_forward_kernel(
         int approx_max  = !!(flag & KSW_EZ_APPROX_MAX);
         int right_align = !!(flag & KSW_EZ_RIGHT);
 
-        /* Per-task slot pointers into the global dblock buffer.            */
-        int8_t *slot_dblock = dblock_buf + (size_t)slot_id * dblock_per_slot;
-        int    *off     = backtrack_off     + (size_t)slot_id * max_antidiag;
-        int    *off_end = backtrack_off_end + (size_t)slot_id * max_antidiag;
+        /* CRITICAL: dblock + off arrays must be indexed by task_id, NOT     */
+        /* slot_id, because the persistent kernel atomic-grabs tasks         */
+        /* dynamically.  The backtrack kernel (separate launch) re-grabs     */
+        /* tasks in a different slot→task assignment, so per-slot indexing   */
+        /* would have backtrack reading the WRONG task's checkpoints.        */
+        /* (temp_buffer is per-slot — only used within one task at a time.)  */
+        int8_t *task_dblock = dblock_buf + (size_t)task_id * dblock_per_task;
+        int    *off     = backtrack_off     + (size_t)task_id * max_antidiag;
+        int    *off_end = backtrack_off_end + (size_t)task_id * max_antidiag;
 
         int last_st = -1, last_en = -1;
         int total_diags = qlen + tlen - 1;
@@ -644,7 +649,7 @@ __global__ void ksw_gridded_forward_kernel(
             /* antidiag (no need to save right before termination).        */
             if (with_cigar && ((r + 1) % GRID_BLOCK_SIZE) == 0 && (r + 1) < total_diags) {
                 int ckpt_idx = (r + 1) / GRID_BLOCK_SIZE - 1;  /* 0-indexed */
-                int8_t *ckpt_base = slot_dblock +
+                int8_t *ckpt_base = task_dblock +
                     (size_t)ckpt_idx * GRID_CKPT_STRIDE_BYTES(max_n_col_per_slot);
                 grid_save_checkpoint(ckpt_base, max_n_col_per_slot,
                                      st0, en0,
@@ -718,11 +723,11 @@ __global__ void ksw_gridded_backtrack_kernel(
     uint32_t *target_batch_offsets,
     gasal_res_t *device_res,
     int8_t *device_mat,
-    int8_t *dblock_buf,           /* per-slot stride = dblock_per_slot          */
-    size_t  dblock_per_slot,
+    int8_t *dblock_buf,           /* per-task stride = dblock_per_task          */
+    size_t  dblock_per_task,
     uint8_t *scratch_buf,         /* per-slot stride = G * max_n_col_per_slot   */
     size_t  scratch_per_slot,
-    int *backtrack_off,
+    int *backtrack_off,            /* per-task indexed: stride = max_antidiag    */
     int *backtrack_off_end,
     int max_antidiag,
     int max_n_col_per_slot,
@@ -826,11 +831,14 @@ __global__ void ksw_gridded_backtrack_kernel(
         }
         __syncwarp();
 
-        /* Per-task pointers into global dblock + per-slot scratch.          */
-        int8_t  *slot_dblock  = dblock_buf  + (size_t)slot_id * dblock_per_slot;
+        /* dblock + off MUST be per-task (indexed by task_id) — see forward  */
+        /* kernel comment.  Slot-id indexing here would read another task's  */
+        /* checkpoints, since slot→task assignment differs across the two    */
+        /* kernel launches.  scratch is per-slot (used within one task only).*/
+        int8_t  *task_dblock  = dblock_buf  + (size_t)task_id * dblock_per_task;
         uint8_t *slot_scratch = scratch_buf + (size_t)slot_id * scratch_per_slot;
-        int *off     = backtrack_off     + (size_t)slot_id * max_antidiag;
-        int *off_end = backtrack_off_end + (size_t)slot_id * max_antidiag;
+        int *off     = backtrack_off     + (size_t)task_id * max_antidiag;
+        int *off_end = backtrack_off_end + (size_t)task_id * max_antidiag;
 
         /* Replay state — which G-block currently in scratch (-1 = none).    */
         int cached_block = -1;
@@ -896,7 +904,7 @@ __global__ void ksw_gridded_backtrack_kernel(
                     }
                     __syncwarp();
 
-                    int8_t *ckpt_base = slot_dblock +
+                    int8_t *ckpt_base = task_dblock +
                         (size_t)ckpt_idx * GRID_CKPT_STRIDE_BYTES(max_n_col_per_slot);
                     grid_load_checkpoint(ckpt_base, max_n_col_per_slot,
                                          prev_st, prev_en,

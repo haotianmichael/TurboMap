@@ -4,6 +4,7 @@
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
 #include "plgrid_kernel.cuh"   // gridded traceback (compile-time gated by USE_GRIDDED_BT)
+#include "pllog.h"             // PLOG_INFO macro (gated by PRINT)
 // plksw2_kernel.cuh (CUDASW4-style column-parallel) no longer used; unified anti-diagonal kernel
 #include <cub/device/device_scan.cuh>
 
@@ -391,10 +392,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     if (!s_grid_announced) {
         s_grid_announced = true;
 #if USE_GRIDDED_BT
-        fprintf(stderr, "[Info] Gridded traceback ENABLED (USE_GRIDDED_BT=1, G=%d)\n",
+        PLOG_INFO(stderr, "[Info] Gridded traceback ENABLED (USE_GRIDDED_BT=1, G=%d)\n",
                 GRID_BLOCK_SIZE);
 #else
-        fprintf(stderr, "[Info] Gridded traceback DISABLED (USE_GRIDDED_BT=0; legacy bt_p path)\n");
+        PLOG_INFO(stderr, "[Info] Gridded traceback DISABLED (USE_GRIDDED_BT=0; legacy bt_p path)\n");
 #endif
     }
 
@@ -492,7 +493,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     char stream_tag[32];
     snprintf(stream_tag, sizeof(stream_tag), "stream_%d", stream_id);
 
-    fprintf(stderr, "[Info::%s] Alignment: %d short (max_len≤%zubp) + %d long (max_len>%zubp, dynamic bt)\n",
+    PLOG_INFO(stderr, "[Info::%s] Alignment: %d short (max_len≤%zubp) + %d long (max_len>%zubp, dynamic bt)\n",
             stream_tag, n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
 
     int kernel_threads = 256;
@@ -547,13 +548,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t long_batch_persistent   = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;
 
     int total_batches_short = n_short_tasks > 0 ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
-    fprintf(stderr, "[Info::%s]   Tier-0 (short): %d batch(es) × up to %zu tasks  [fixed bt stride: %zu×%zu bytes]\n",
+    PLOG_INFO(stderr, "[Info::%s]   Tier-0 (short): %d batch(es) × up to %zu tasks  [fixed bt stride: %zu×%zu bytes]\n",
             stream_tag, total_batches_short, short_batch_persistent,
             2 * short_task_max_len, short_task_max_len + 1);
     // Tier-1 (long): batch count is determined dynamically per-batch (bt_stride-sorted tasks,
     // batch_size = pool_cap × LATENCY_HIDE_FACTOR).  Do not print an estimate here; the actual
     // count is shown at the end ("Alignment complete: X tasks in Y batches").
-    fprintf(stderr, "[Info::%s]   Tier-1 (long):  %d tasks  [bt_stride-sorted; batch count determined dynamically]\n",
+    PLOG_INFO(stderr, "[Info::%s]   Tier-1 (long):  %d tasks  [bt_stride-sorted; batch count determined dynamically]\n",
             stream_tag, n_long_tasks);
 
     size_t max_batch_size = (short_batch_persistent > long_batch_persistent) ?
@@ -694,13 +695,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // the while loop below (pool_cap × LATENCY_HIDE_FACTOR).
             long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
             current_batch_size    = long_batch_persistent;  // upper bound; overridden per-batch
-            fprintf(stderr, "[Info::%s]   Tier-1 (long): CIGAR cap=%zu  bt_p=%.2f GB  slots=%d\n",
+            PLOG_INFO(stderr, "[Info::%s]   Tier-1 (long): CIGAR cap=%zu  bt_p=%.2f GB  slots=%d\n",
                     stream_tag, long_batch_persistent,
                     dev_mem->long_bt_p_pool_bytes / (1024.0*1024.0*1024.0),
                     dev_mem->n_long_concurrent_slots);
         }
 
-        fprintf(stderr, "[Info::%s] === %s: %d tasks ===\n", stream_tag, phase_name, n_tasks_in_phase);
+        PLOG_INFO(stderr, "[Info::%s] === %s: %d tasks ===\n", stream_tag, phase_name, n_tasks_in_phase);
 
         // Problem: result buffers are 120,000 elements but we only clear phase_batch_size
         // This causes long phase to read stale data from short phase!
@@ -1016,62 +1017,54 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
 #if USE_GRIDDED_BT
                 /* ─────────── Gridded traceback dispatch (long phase only) ───────── */
-                /* For phase==1 we MAY replace the per-cell bt_p path with the        */
-                /* gridded path (smaller per-slot memory → more concurrent slots).    */
-                /*                                                                    */
-                /* Trade-off: gridded incurs ~2× compute (forward + backtrack         */
-                /* replay).  So we only switch when the slot increase ≥ 2× — that's   */
-                /* exactly when the legacy path is bt_stride-bound rather than        */
-                /* batch_size-bound.  For small-bt_stride batches (where legacy       */
-                /* already saturates batch_size) gridded only adds replay overhead.   */
+                /* dblock + off arrays are PER-TASK (correctness — slot→task         */
+                /* binding differs between forward and backtrack kernel launches).   */
+                /* Pool layout for this batch:                                        */
+                /*   [dblock: batch_size × dblock_per_task] [scratch: n_slots × spp] */
+                /* n_slots is then determined by remaining pool for scratch, capped   */
+                /* by batch_size and max_slots_cap.                                   */
                 bool use_grid = false;
-                size_t grid_dblock_per_slot = 0, grid_scratch_per_slot = 0;
+                size_t grid_dblock_per_task = 0, grid_scratch_per_slot = 0;
+                size_t grid_dblock_total_bytes = 0;
                 int grid_slots = 0;
                 if (phase == 1 && cigar_buffer) {
                     const size_t G = (size_t)GRID_BLOCK_SIZE;
                     size_t batch_n_col = (size_t)diag_actual_n_col;
                     if (batch_n_col == 0) batch_n_col = 1;
                     size_t n_ckpt = ((size_t)batch_max_antidiag + G - 1) / G;
-                    grid_dblock_per_slot  =
+                    grid_dblock_per_task  =
                         n_ckpt * (size_t)GRID_NUM_DELTA_ARRAYS * batch_n_col;
                     grid_scratch_per_slot = G * batch_n_col;
-                    size_t total_per_slot = grid_dblock_per_slot + grid_scratch_per_slot;
-                    if (total_per_slot == 0) total_per_slot = 1;
+                    grid_dblock_total_bytes = (size_t)batch_size * grid_dblock_per_task;
 
-                    int grid_slots_raw = (int)((size_t)bt_p_total_bytes / total_per_slot);
-                    grid_slots = grid_slots_raw;
-                    if (grid_slots > max_slots_cap) grid_slots = max_slots_cap;
-                    if (grid_slots > batch_size)    grid_slots = batch_size;
-                    if (grid_slots < 1)             grid_slots = 1;
+                    if (grid_dblock_total_bytes < (size_t)bt_p_total_bytes) {
+                        size_t scratch_avail =
+                            (size_t)bt_p_total_bytes - grid_dblock_total_bytes;
+                        size_t n_slots_from_scratch =
+                            (grid_scratch_per_slot > 0)
+                            ? (scratch_avail / grid_scratch_per_slot) : 1;
+                        grid_slots = (int)n_slots_from_scratch;
+                        if (grid_slots > max_slots_cap) grid_slots = max_slots_cap;
+                        if (grid_slots > batch_size)    grid_slots = batch_size;
+                        if (grid_slots < 1)             grid_slots = 1;
 
-                    /* Effective slot count for the legacy path on this batch.       */
-                    int legacy_slots = phase_concurrent_slots;
-
-                    /* Switch to gridded only when it ≥ doubles concurrency.  This   */
-                    /* covers the 2× compute overhead of replay.                     */
-                    use_grid = (grid_slots >= 2 * legacy_slots);
-
-                    static bool s_grid_path_taken = false;
-                    if (use_grid && !s_grid_path_taken) {
-                        s_grid_path_taken = true;
-                        fprintf(stderr, "[Info] Gridded long-phase dispatch ACTIVE "
-                                "(first batch with grid_slots %d ≥ 2× legacy_slots %d)\n",
-                                grid_slots, legacy_slots);
+                        /* Switch to gridded only when slot gain ≥ 2× to cover the   */
+                        /* 2× compute overhead of replay.                            */
+                        int legacy_slots = phase_concurrent_slots;
+                        use_grid = (grid_slots >= 2 * legacy_slots);
                     }
                 }
                 if (use_grid) {
                     batch_path_tag = 'G';
-                    size_t dblock_per_slot  = grid_dblock_per_slot;
-                    size_t scratch_per_slot = grid_scratch_per_slot;
                     size_t batch_n_col = (size_t)diag_actual_n_col;
                     if (batch_n_col == 0) batch_n_col = 1;
                     phase_concurrent_slots = grid_slots;   /* override for logging too */
 
-                    /* Pool layout: [dblock area: grid_slots × dblock_per_slot]      */
-                    /*              [scratch area: grid_slots × scratch_per_slot]    */
+                    /* Pool layout: [dblock: batch_size × dblock_per_task]           */
+                    /*              [scratch: grid_slots × scratch_per_slot]         */
                     int8_t  *grid_dblock_pool  = (int8_t*)d_bt_p_batch;
                     uint8_t *grid_scratch_pool = (uint8_t*)d_bt_p_batch
-                        + (size_t)grid_slots * dblock_per_slot;
+                        + grid_dblock_total_bytes;
 
                     ksw_gridded_forward_kernel<<<grid_slots, parallel_threads,
                                                  0, align_stream>>>(
@@ -1080,7 +1073,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         d_query_lens,   d_target_lens,
                         d_query_offsets, d_target_offsets,
                         (gasal_res_t*)device_res, d_mat,
-                        grid_dblock_pool, dblock_per_slot,
+                        grid_dblock_pool, grid_dblock_per_task,
                         d_bt_off_batch, d_bt_off_end_batch,
                         (int)batch_max_antidiag, (int)batch_n_col,
                         d_ksw_temp_buffer, d_flag, d_bw,
@@ -1099,8 +1092,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         d_query_lens,   d_target_lens,
                         d_query_offsets, d_target_offsets,
                         (gasal_res_t*)device_res, d_mat,
-                        grid_dblock_pool, dblock_per_slot,
-                        grid_scratch_pool, scratch_per_slot,
+                        grid_dblock_pool, grid_dblock_per_task,
+                        grid_scratch_pool, grid_scratch_per_slot,
                         d_bt_off_batch, d_bt_off_end_batch,
                         (int)batch_max_antidiag, (int)batch_n_col,
                         d_ksw_temp_buffer, d_flag, d_bw,
@@ -1346,7 +1339,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             if (phase == 0) {
                 // Short phase: one batch, single line is enough.
-                fprintf(stderr, "[Info::%s] %s [%d/%d] tasks=%d slots=%d bt_stride=%zu  (%d/%d done)\n",
+                PLOG_INFO(stderr, "[Info::%s] %s [%d/%d] tasks=%d slots=%d bt_stride=%zu  (%d/%d done)\n",
                         stream_tag, phase_name, phase_batch_num, total_phase_batches,
                         batch_size, phase_concurrent_slots, batch_max_backtrack_size,
                         tasks_processed_in_phase, n_tasks_in_phase);
@@ -1364,7 +1357,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 } else {
                     // Flush any accumulated repeats from the previous group.
                     if (rep_count > 0) {
-                        fprintf(stderr,
+                        PLOG_INFO(stderr,
                             "[Info::%s]   ... ×%d more identical batches"
                             "  (%d/%d done)\n",
                             stream_tag, rep_count,
@@ -1372,7 +1365,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         rep_count = 0;
                     }
                     // Print this batch.
-                    fprintf(stderr,
+                    PLOG_INFO(stderr,
                         "[Info::%s] Long [%d|%c] tasks=%d  n_col=%zu  bt=%.2fMB  slots=%d"
                         "  (%d/%d done)\n",
                         stream_tag, phase_batch_num, batch_path_tag,
@@ -1385,7 +1378,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
                 // After the very last batch in this phase, flush any trailing repeats.
                 if (tasks_processed_in_phase >= n_tasks_in_phase && rep_count > 0) {
-                    fprintf(stderr,
+                    PLOG_INFO(stderr,
                         "[Info::%s]   ... ×%d more identical batches"
                         "  (%d/%d done)\n",
                         stream_tag, rep_count,
@@ -1396,7 +1389,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         }  // End of batch loop within phase
     }  // End of three-tier loop
 
-    fprintf(stderr, "[Info::%s] Alignment complete: %d tasks in %d batches\n",
+    PLOG_INFO(stderr, "[Info::%s] Alignment complete: %d tasks in %d batches\n",
             stream_tag, n_tasks, batch_num);
 
     // Cleanup phase-specific arrays

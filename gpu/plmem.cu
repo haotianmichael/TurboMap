@@ -9,6 +9,7 @@
 #include "plmem.cuh"
 #include "plrange.cuh"
 #include "plscore.cuh"
+#include "pllog.h"
 #include <time.h>
 #define CUDA_DEVICE 0
 typedef struct {
@@ -753,21 +754,21 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         double bt_off_long_gb = (double)dev_mem->n_long_concurrent_slots *
                                 2 * dev_mem->max_align_query_len * sizeof(int) / GB;
         double long_pool_gb = dev_mem->long_bt_p_pool_bytes / GB;
-        fprintf(stderr, "[Info] GPU arena: %.2f GB total, %.2f GB free  (%d stream%s, %.2f GB each)\n",
+        PLOG_INFO(stderr, "[Info] GPU arena: %.2f GB total, %.2f GB free  (%d stream%s, %.2f GB each)\n",
                 total_mem / GB, free_mem / GB,
                 num_streams, num_streams > 1 ? "s" : "",
                 arena_size / GB);
-        fprintf(stderr, "[Info]   Chain phase: %.2f GB  |  Align phase: %.2f GB\n",
+        PLOG_INFO(stderr, "[Info]   Chain phase: %.2f GB  |  Align phase: %.2f GB\n",
                 chain_size / GB, align_size / GB);
-        fprintf(stderr, "[Info]   Align config: max_tasks=%zu  short_batch=%d"
+        PLOG_INFO(stderr, "[Info]   Align config: max_tasks=%zu  short_batch=%d"
                 "  long_batch_max=%zu (%s)  n_concurrent=%d\n",
                 dev_mem->max_align_tasks, dev_mem->short_task_batch_size,
                 long_batch_max,
                 g_long_cigar_batch_override > 0 ? "manual" : "auto",
                 dev_mem->n_align_concurrent_blocks);
-        fprintf(stderr, "[Info]   Short bt_p pool (arena): %.2f GB  |  Long bt_p pool (dedicated): %.2f GB\n",
+        PLOG_INFO(stderr, "[Info]   Short bt_p pool (arena): %.2f GB  |  Long bt_p pool (dedicated): %.2f GB\n",
                 bt_p_gb, long_pool_gb);
-        fprintf(stderr, "[Info]   bt_off long (short-phase): %.2f GB (%d slots × 100k stride)"
+        PLOG_INFO(stderr, "[Info]   bt_off long (short-phase): %.2f GB (%d slots × 100k stride)"
                 "  [long-phase slots computed dynamically at arena transition]\n",
                 bt_off_long_gb, dev_mem->n_long_concurrent_slots);
     }
@@ -831,7 +832,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         }
 
         if (print_info)
-            fprintf(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu, seq_staging=%.2f MB each)\n",
+            PLOG_INFO(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu, seq_staging=%.2f MB each)\n",
                     (cigar_buf_sz * 4 + mbs * 20 * 4) / (1024.0*1024.0*1024.0), mbs,
                     dev_mem->h_align_seq_staging_bytes / (1024.0*1024.0));
     }
@@ -1337,7 +1338,7 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     }
     if (*long_seg_buffer_size_ < 1000000) *long_seg_buffer_size_ = 1000000;
 
-    fprintf(stderr, "[Info::plmem] Auto-config for %d streams (%.1f GB free, %.1f GB/stream, "
+    PLOG_INFO(stderr, "[Info::plmem] Auto-config for %d streams (%.1f GB free, %.1f GB/stream, "
             "%.0f B/anchor): max_total_n=%zu, max_read=%d, long_seg_buf=%zu\n",
             *num_stream_, gpu_free_mem / (1024.0*1024.0*1024.0),
             avail_mem_per_stream / (1024.0*1024.0*1024.0), total_per_n,

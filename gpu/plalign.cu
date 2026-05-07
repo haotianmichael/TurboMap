@@ -946,18 +946,24 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             uint8_t *d_bt_p_batch = d_backtrack_p;  // default covers cases 1 and 3
 
             if (phase == 1) {
-                // Cases 1 & 2 both set long_bt_p_pool_bytes > 0.
-                // Case 1: d_backtrack_p already refreshed to the long arena pool.
-                // Case 2: dedicated pool pointer differs from d_backtrack_p.
-                if (dev_mem->d_align_backtrack_p_long != nullptr) {
-                    // Dedicated cudaMalloc pool (case 2, single-stream).
+                // Both arena and dedicated pool may exist.  Pick the LARGER —
+                // a tiny dedicated pool (e.g. 250 MB on memory-tight machines)
+                // would otherwise block a much larger arena pool from being
+                // used and cause OOB writes when batch bt_stride > dedicated.
+                size_t arena_bytes = dev_mem->long_arena_bt_p_bytes;
+                size_t dedi_bytes  = (dev_mem->d_align_backtrack_p_long != nullptr)
+                                     ? dev_mem->long_bt_p_pool_bytes : 0;
+                if (dedi_bytes > arena_bytes) {
+                    // Dedicated pool is bigger — use it.
                     d_bt_p_batch     = dev_mem->d_align_backtrack_p_long;
-                    bt_p_total_bytes = dev_mem->long_bt_p_pool_bytes;
-                } else if (dev_mem->long_bt_p_pool_bytes > 0) {
-                    // Long-align arena (case 1): d_backtrack_p already refreshed.
-                    bt_p_total_bytes = dev_mem->long_bt_p_pool_bytes;
+                    bt_p_total_bytes = dedi_bytes;
+                } else if (arena_bytes > 0) {
+                    // Arena pool is bigger (or only arena exists).
+                    d_bt_p_batch     = d_backtrack_p;  // refreshed by plmem_phase_to_long_align
+                    bt_p_total_bytes = arena_bytes;
                 }
-                // Case 3 (no pool): bt_p_total_bytes stays as computed above (~5 GB).
+                // If neither has a meaningful size, bt_p_total_bytes keeps the
+                // short-tier estimate computed above.
             }
 
             // Diagnostic variables for long-batch logging (populated in the phase==1 block below)
@@ -1022,6 +1028,31 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             // Per-batch path marker for the post-batch log (set by the dispatch).
             char batch_path_tag = 'L';   // L = legacy bt_p, G = gridded
+
+            /* Safety guard: even after picking the larger pool, a pathological */
+            /* batch may have bt_stride larger than ANY available pool.  In that*/
+            /* case we cannot safely launch — would OOB the bt_p buffer.  Skip */
+            /* this batch (CIGAR will be empty; tasks fall back to CPU).        */
+            if (phase == 1 && batch_max_backtrack_size > bt_p_total_bytes) {
+                fprintf(stderr,
+                    "[ERROR] Long batch [%d] needs bt_stride=%.2f MB but largest "
+                    "available pool is only %.2f MB.  Skipping batch (tasks will "
+                    "fall back to CPU).\n",
+                    phase_batch_num,
+                    batch_max_backtrack_size / (1024.0*1024.0),
+                    bt_p_total_bytes / (1024.0*1024.0));
+                /* Mark all tasks zdropped = fall back to CPU.                  */
+                for (int i = 0; i < batch_size; i++) {
+                    int tidx = current_task_indices[batch_start + i];
+                    tasks[tidx].zdropped  = 1;
+                    tasks[tidx].score     = KSW_NEG_INF;
+                    tasks[tidx].n_cigar   = 0;
+                }
+                tasks_processed_in_phase += batch_size;
+                total_tasks_processed    += batch_size;
+                nvtxRangePop(); /* outer batch */
+                continue;
+            }
 
             size_t max_slots_this_phase = (batch_max_backtrack_size > 0)
                 ? (bt_p_total_bytes / batch_max_backtrack_size)

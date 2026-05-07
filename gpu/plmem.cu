@@ -433,12 +433,16 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_backtrack_p     = (uint8_t*)arena_alloc(a, bt_p_avail);
     dev_mem->max_align_backtrack_size = 0;   // stride computed per-batch in plalign.cu
 
-    // Update long_bt_p_pool_bytes ONLY if there is no dedicated cudaMalloc pool.
-    // When a dedicated pool exists (d_align_backtrack_p_long != nullptr), the field
-    // already holds its correct size (set in plmem_malloc_device_mem) and must NOT
-    // be overwritten: plalign.cu uses it as the bound for pool_cap, and clobbering it
-    // with the (potentially larger) arena bt_p would cause pool_cap to exceed the
-    // dedicated pool's physical allocation → out-of-bounds GPU memory access.
+    // ALWAYS record the arena bt_p size separately so the dispatch code can
+    // compare it against the dedicated pool and pick the larger.  Without this,
+    // a tiny dedicated pool (e.g. 250 MB on a 40GB A100 where arena ate most
+    // free VRAM) would be unconditionally used by plalign.cu, even when arena
+    // has 14+ GB of bt_p sitting idle — leading to OOB writes when the batch's
+    // bt_stride exceeds the dedicated pool size.
+    dev_mem->long_arena_bt_p_bytes = bt_p_avail;
+
+    // long_bt_p_pool_bytes still defaults to the arena size when no dedicated
+    // pool exists.  Backward-compat path for existing dispatch.
     if (dev_mem->d_align_backtrack_p_long == nullptr)
         dev_mem->long_bt_p_pool_bytes = bt_p_avail;
 

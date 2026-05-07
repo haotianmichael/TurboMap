@@ -3,6 +3,7 @@
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
+#include "plksw_shared_kernel.cuh"  // shared-memory long kernel (compile-time gated by USE_SHARED_LONG_KERNEL)
 #include "plgrid_kernel.cuh"   // gridded traceback (compile-time gated by USE_GRIDDED_BT)
 #include "pllog.h"             // PLOG_INFO macro (gated by PRINT)
 // plksw2_kernel.cuh (CUDASW4-style column-parallel) no longer used; unified anti-diagonal kernel
@@ -15,6 +16,15 @@
 #pragma message ("plalign.cu: USE_GRIDDED_BT = 1  (gridded traceback path COMPILED IN)")
 #else
 #pragma message ("plalign.cu: USE_GRIDDED_BT = 0  (legacy bt_p path only)")
+#endif
+
+#ifndef USE_SHARED_LONG_KERNEL
+#define USE_SHARED_LONG_KERNEL 0
+#endif
+#if USE_SHARED_LONG_KERNEL
+#pragma message ("plalign.cu: USE_SHARED_LONG_KERNEL = 1  (shared-mem long kernel COMPILED IN)")
+#else
+#pragma message ("plalign.cu: USE_SHARED_LONG_KERNEL = 0")
 #endif
 // NVTX3 C API (nvtxRangePushA/nvtxRangePop) already available via cub/detail/nvtx.cuh
 
@@ -956,6 +966,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             int    diag_n_exceed         = 0;
             size_t diag_actual_antidiag  = 0;
             size_t diag_actual_n_col     = 0;
+            int    batch_max_tlen        = 0;  /* used by shared-mem long kernel dispatch */
 
             if (phase == 1) nvtxRangePushA("long_setup");
             if (phase == 1) {
@@ -975,6 +986,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     if (ad > actual_max_antidiag) actual_max_antidiag = ad;
                     if (ql > diag_actual_max_qlen) diag_actual_max_qlen = ql;
                     if (tl > diag_actual_max_tlen) diag_actual_max_tlen = tl;
+                    if (tl > batch_max_tlen)       batch_max_tlen       = tl;
                     if (ql > (int)dev_mem->max_align_query_len ||
                         tl > (int)dev_mem->max_align_query_len)
                         diag_n_exceed++;
@@ -1037,6 +1049,64 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             {
                 int parallel_threads = 32;   // one warp per block
 
+#if USE_SHARED_LONG_KERNEL
+                /* ─────────── Shared-memory long kernel dispatch ──────────────────── */
+                /* Triggers when:                                                     */
+                /*   - long phase (phase == 1)                                        */
+                /*   - all tasks fit shared limit (max_tlen ≤ SHARED_KERNEL_TLEN_LIMIT)*/
+                /*   - legacy bt_p budget is the bottleneck (phase_concurrent_slots   */
+                /*     < 100), so we WON'T hurt regular-long batches that already     */
+                /*     have many slots.                                               */
+                /* Per-block shared mem = 6 × (max_tlen+1) bytes for delta arrays.    */
+                bool use_shared = (phase == 1 &&
+                                   batch_max_tlen > 0 &&
+                                   batch_max_tlen <= SHARED_KERNEL_TLEN_LIMIT &&
+                                   phase_concurrent_slots < 100);
+                if (use_shared) {
+                    /* One-shot driver opt-in for >48 KB shared per block.          */
+                    static bool s_shared_attr_set = false;
+                    if (!s_shared_attr_set) {
+                        cudaFuncSetAttribute(ksw_long_shared_kernel,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            SHARED_KERNEL_MAX_BYTES);
+                        s_shared_attr_set = true;
+                    }
+                    size_t shared_bytes =
+                        (size_t)6 * (size_t)(batch_max_tlen + 1);
+
+                    batch_path_tag = 'H';   /* H = sHared */
+
+                    ksw_long_shared_kernel<<<phase_concurrent_slots, parallel_threads,
+                                             shared_bytes, align_stream>>>(
+                        d_task_counter,
+                        d_packed_query,
+                        d_packed_target,
+                        d_query_lens,
+                        d_target_lens,
+                        d_query_offsets,
+                        d_target_offsets,
+                        (gasal_res_t*)device_res,
+                        d_mat,
+                        d_bt_p_batch,
+                        d_bt_off_batch,
+                        d_bt_off_end_batch,
+                        (int)batch_max_backtrack_size,
+                        (int)batch_max_antidiag,
+                        d_ksw_temp_buffer,
+                        d_flag,
+                        d_bw,
+                        ksw_temp_per_task,
+                        batch_size,
+                        5,
+                        opt->zdrop,
+                        opt->end_bonus,
+                        cigar_buffer ? d_cigar_buffer  : NULL,
+                        cigar_buffer ? d_cigar_lengths : NULL,
+                        (int)current_max_cigar_len,
+                        batch_max_tlen
+                    );
+                } else
+#endif
 #if USE_GRIDDED_BT
                 /* ─────────── Gridded traceback dispatch (long phase only) ───────── */
                 /* dblock + off arrays are PER-TASK (correctness — slot→task         */

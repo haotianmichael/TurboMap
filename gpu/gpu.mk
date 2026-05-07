@@ -8,6 +8,10 @@ CONFIG			+= $(if $(GRID),-DUSE_GRIDDED_BT=1)
 # See gpu/pllog.h.  Default OFF — fewer fprintfs = faster (small).
 CONFIG			+= $(if $(PRINT),-DPRINT=1)
 
+# Enable shared-memory long-task kernel (super-long bottleneck batches): make SHARED=1
+# See gpu/plksw_shared_kernel.cuh.  Default OFF (legacy global-mem kernel).
+CONFIG			+= $(if $(SHARED),-DUSE_SHARED_LONG_KERNEL=1)
+
 ifeq ($(GPU), AMD)
     GPUARCH    ?= $(strip $(shell rocminfo |grep -m 1 -E gfx[^0]{1} | sed -e 's/ *Name: *//'))
 else

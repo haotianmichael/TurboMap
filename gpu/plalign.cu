@@ -4,27 +4,12 @@
 #include "plmem.cuh"  // For deviceMemPtr
 #include "plksw_kernel.cuh"
 #include "plksw_shared_kernel.cuh"  // shared-memory long kernel (compile-time gated by USE_SHARED_LONG_KERNEL)
-#include "plgrid_kernel.cuh"   // gridded traceback (compile-time gated by USE_GRIDDED_BT)
-#include "pllog.h"             // PLOG_INFO macro (gated by PRINT)
+#include "pllog.h"                  // PLOG_INFO macro (gated by PRINT)
 // plksw2_kernel.cuh (CUDASW4-style column-parallel) no longer used; unified anti-diagonal kernel
 #include <cub/device/device_scan.cuh>
 
-/* Compile-time announcement: the user passes `make GRID=1` to enable.        */
-/* If you don't see this message in the nvcc output, your build did not       */
-/* recompile plalign.cu — try `make clean && make GRID=1`.                    */
-#if USE_GRIDDED_BT
-#pragma message ("plalign.cu: USE_GRIDDED_BT = 1  (gridded traceback path COMPILED IN)")
-#else
-#pragma message ("plalign.cu: USE_GRIDDED_BT = 0  (legacy bt_p path only)")
-#endif
-
 #ifndef USE_SHARED_LONG_KERNEL
 #define USE_SHARED_LONG_KERNEL 0
-#endif
-#if USE_SHARED_LONG_KERNEL
-#pragma message ("plalign.cu: USE_SHARED_LONG_KERNEL = 1  (shared-mem long kernel COMPILED IN)")
-#else
-#pragma message ("plalign.cu: USE_SHARED_LONG_KERNEL = 0")
 #endif
 // NVTX3 C API (nvtxRangePushA/nvtxRangePop) already available via cub/detail/nvtx.cuh
 
@@ -395,19 +380,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                             uint8_t *seq_buffer, uint32_t *cigar_buffer, int stream_id) {
     if (n_tasks <= 0) return;
 
-    /* One-time announcement of compile-time gridded flag.  Lets the user      */
-    /* verify whether the binary they're running has gridded traceback baked   */
-    /* in.  Look for "[Info] Gridded traceback ..." in stderr.                  */
-    static bool s_grid_announced = false;
-    if (!s_grid_announced) {
-        s_grid_announced = true;
-#if USE_GRIDDED_BT
-        PLOG_INFO(stderr, "[Info] Gridded traceback ENABLED (USE_GRIDDED_BT=1, G=%d)\n",
-                GRID_BLOCK_SIZE);
-#else
-        PLOG_INFO(stderr, "[Info] Gridded traceback DISABLED (USE_GRIDDED_BT=0; legacy bt_p path)\n");
-#endif
+#if USE_SHARED_LONG_KERNEL
+    static bool s_shared_announced = false;
+    if (!s_shared_announced) {
+        s_shared_announced = true;
+        PLOG_INFO(stderr, "[Info] Shared-mem long kernel ENABLED (USE_SHARED_LONG_KERNEL=1)\n");
     }
+#endif
 
     nvtxRangePushA("gpu_align_batch_execute");
     cudaSetDevice(0);
@@ -819,16 +798,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             batch_num++;
             phase_batch_num++;
 
-            /* ─── NVTX outer range for the entire batch ───
-             * Label format: "<P>[B<N>|n=<size>]"  where P = S/L (short/long).
-             * Slot count is appended later in the kernel-launch sub-range.
-             * Open the batch range here; closed at the end of map_results.    */
-            char nvtx_batch_label[64];
-            snprintf(nvtx_batch_label, sizeof(nvtx_batch_label),
-                     "%c[B%d|n=%d]", (phase == 0) ? 'S' : 'L',
-                     phase_batch_num, batch_size);
-            nvtxRangePushA(nvtx_batch_label);
-
             // Clear ONLY result buffers before each batch to prevent reading stale data
             // If a task fails (zdropped etc), kernel may not write to result buffers
             // Without clearing, we'd read previous batch's stale results
@@ -851,7 +820,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             uint32_t max_query_len = 0;
             const uint8_t N_BASE = 4;
 
-            nvtxRangePushA("host_prep");
             for (int i = 0; i < batch_size; i++) {
                 int task_idx = current_task_indices[batch_start + i];
                 int qlen = tasks[task_idx].qlen;
@@ -885,10 +853,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
                 if ((uint32_t)qlen > max_query_len) max_query_len = qlen;
             }
-            nvtxRangePop(); // host_prep
 
             // Copy batch data to GPU (async on align_stream so chain stream stays free)
-            nvtxRangePushA("h2d");
             cudaMemcpyAsync(d_unpacked_query, h_unpacked_query,
                             total_query_bytes, cudaMemcpyHostToDevice, align_stream);
             cudaMemcpyAsync(d_unpacked_target, h_unpacked_target,
@@ -905,10 +871,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                             batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
             cudaMemcpyAsync(d_bw, h_bw,
                             batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
-            nvtxRangePop(); // h2d
 
             // Launch packing kernel
-            nvtxRangePushA("pack_launch");
             int query_tasks_per_thread = (int)ceil((double)total_query_bytes /
                                                   (8 * kernel_threads * kernel_blocks));
             int target_tasks_per_thread = (int)ceil((double)total_target_bytes /
@@ -924,7 +888,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 total_query_bytes / 4,
                 total_target_bytes / 4
             );
-            nvtxRangePop(); // pack_launch
 
             // ===== Persistent KSW Kernel (unified anti-diagonal, int32 dual-affine) =====
             // Both phases use the same fused persistent kernel with direct int32 H/E/F/E2/F2.
@@ -987,7 +950,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             size_t diag_actual_n_col     = 0;
             int    batch_max_tlen        = 0;  /* used by shared-mem long kernel dispatch */
 
-            if (phase == 1) nvtxRangePushA("long_setup");
             if (phase == 1) {
                 // Scan this batch to find actual maximum n_col and antidiag needed.
                 // n_col = min(min(qlen, tlen), w+1)  (mirrors kernel line 244-245)
@@ -1037,10 +999,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 // bt_p pool and total bytes were already selected above before the
                 // scan loop; no further override needed here.
             }
-            if (phase == 1) nvtxRangePop(); // long_setup
 
             // Per-batch path marker for the post-batch log (set by the dispatch).
-            char batch_path_tag = 'L';   // L = legacy bt_p, G = gridded
+            char batch_path_tag = 'L';   // L = legacy, H = sHared-mem long kernel
 
             /* Safety guard: even after picking the larger pool, a pathological */
             /* batch may have bt_stride larger than ANY available pool.  In that*/
@@ -1063,7 +1024,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
                 tasks_processed_in_phase += batch_size;
                 total_tasks_processed    += batch_size;
-                nvtxRangePop(); /* outer batch */
                 continue;
             }
 
@@ -1080,13 +1040,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             // Pre-batch long-phase log removed; info merged into post-batch line below.
 
-            /* NVTX: kernel-launch range with slot count in label so a specific  */
-            /* batch (e.g. slots=15 super-long) can be located in nsys easily.   */
-            char nvtx_kernel_label[64];
-            snprintf(nvtx_kernel_label, sizeof(nvtx_kernel_label),
-                     "kernel:s=%d", phase_concurrent_slots);
-            nvtxRangePushA(nvtx_kernel_label);
-
             // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
@@ -1094,154 +1047,99 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 int parallel_threads = 32;   // one warp per block
 
 #if USE_SHARED_LONG_KERNEL
-                /* ─────────── Shared-memory long kernel dispatch ──────────────────── */
-                /* Triggers when:                                                     */
-                /*   - long phase (phase == 1)                                        */
-                /*   - all tasks fit shared limit (max_tlen ≤ SHARED_KERNEL_TLEN_LIMIT)*/
-                /*   - legacy bt_p budget is the bottleneck (phase_concurrent_slots   */
-                /*     < 100), so we WON'T hurt regular-long batches that already     */
-                /*     have many slots.                                               */
-                /* Per-block shared mem = 6 × (max_tlen+1) bytes for delta arrays.    */
-                bool use_shared = (phase == 1 &&
-                                   batch_max_tlen > 0 &&
-                                   batch_max_tlen <= SHARED_KERNEL_TLEN_LIMIT &&
-                                   phase_concurrent_slots < 100);
-                if (use_shared) {
-                    /* One-shot driver opt-in for >48 KB shared per block.          */
+                /* Query device's per-block shared-mem opt-in cap once.        *
+                 * V100 (CC 7.0) = 96 KB; A100 (CC 8.0) = 163 KB.              */
+                static int s_device_shared_cap = 0;
+                if (s_device_shared_cap == 0) {
+                    cudaDeviceGetAttribute(&s_device_shared_cap,
+                        cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+                    if (s_device_shared_cap <= 0) s_device_shared_cap = 48 * 1024;
+                }
+                /* ─── Shared-memory long kernel dispatch (long phase only) ─── *
+                 * Triggers when:
+                 *   1) phase == 1 (long phase)
+                 *   2) bt_p budget is the bottleneck (phase_concurrent_slots < 100)
+                 *      — avoids slowing down regular long batches that already
+                 *      have many slots
+                 *   3) per-batch max_tlen fits one of the shared variants
+                 *
+                 * Two shared variants tried in order of effectiveness:
+                 *   FULL    (6 deltas in shared)  —  needs 6 × (max_tlen+1) ≤
+                 *                                   per-block shared cap.
+                 *                                   A100: tlen ≤ 27000.
+                 *                                   V100: tlen ≤ 16000 (rare).
+                 *   PARTIAL (3 hottest in shared) —  needs 3 × (max_tlen+1) ≤ cap.
+                 *                                   V100: tlen ≤ 32000 (super-long fits).
+                 *                                   A100: tlen ≤ 54000.
+                 *                                   ~60% reduction in slow accesses.
+                 */
+                int use_shared_variant = 0;  /* 0 = none, 1 = full, 2 = partial */
+                size_t shared_bytes_full    = (size_t)6 * (size_t)(batch_max_tlen + 1);
+                size_t shared_bytes_partial = (size_t)3 * (size_t)(batch_max_tlen + 1);
+                if (phase == 1 &&
+                    batch_max_tlen > 0 &&
+                    phase_concurrent_slots < 100) {
+                    if (shared_bytes_full <= (size_t)s_device_shared_cap) {
+                        use_shared_variant = 1;
+                    } else if (shared_bytes_partial <= (size_t)s_device_shared_cap) {
+                        use_shared_variant = 2;
+                    }
+                }
+                if (use_shared_variant > 0) {
+                    /* One-shot driver opt-in for >48 KB shared per block —     *
+                     * use the device's actual cap.                              */
                     static bool s_shared_attr_set = false;
                     if (!s_shared_attr_set) {
                         cudaFuncSetAttribute(ksw_long_shared_kernel,
                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            SHARED_KERNEL_MAX_BYTES);
+                            s_device_shared_cap);
+                        cudaFuncSetAttribute(ksw_long_shared3_kernel,
+                            cudaFuncAttributeMaxDynamicSharedMemorySize,
+                            s_device_shared_cap);
                         s_shared_attr_set = true;
                     }
-                    size_t shared_bytes =
-                        (size_t)6 * (size_t)(batch_max_tlen + 1);
+                    batch_path_tag = (use_shared_variant == 1) ? 'H' : 'P';
 
-                    batch_path_tag = 'H';   /* H = sHared */
-
-                    ksw_long_shared_kernel<<<phase_concurrent_slots, parallel_threads,
-                                             shared_bytes, align_stream>>>(
-                        d_task_counter,
-                        d_packed_query,
-                        d_packed_target,
-                        d_query_lens,
-                        d_target_lens,
-                        d_query_offsets,
-                        d_target_offsets,
-                        (gasal_res_t*)device_res,
-                        d_mat,
-                        d_bt_p_batch,
-                        d_bt_off_batch,
-                        d_bt_off_end_batch,
-                        (int)batch_max_backtrack_size,
-                        (int)batch_max_antidiag,
-                        d_ksw_temp_buffer,
-                        d_flag,
-                        d_bw,
-                        ksw_temp_per_task,
-                        batch_size,
-                        5,
-                        opt->zdrop,
-                        opt->end_bonus,
-                        cigar_buffer ? d_cigar_buffer  : NULL,
-                        cigar_buffer ? d_cigar_lengths : NULL,
-                        (int)current_max_cigar_len,
-                        batch_max_tlen
-                    );
-                } else
-#endif
-#if USE_GRIDDED_BT
-                /* ─────────── Gridded traceback dispatch (long phase only) ───────── */
-                /* dblock + off arrays are PER-TASK (correctness — slot→task         */
-                /* binding differs between forward and backtrack kernel launches).   */
-                /* Pool layout for this batch:                                        */
-                /*   [dblock: batch_size × dblock_per_task] [scratch: n_slots × spp] */
-                /* n_slots is then determined by remaining pool for scratch, capped   */
-                /* by batch_size and max_slots_cap.                                   */
-                bool use_grid = false;
-                size_t grid_dblock_per_task = 0, grid_scratch_per_slot = 0;
-                size_t grid_dblock_total_bytes = 0;
-                int grid_slots = 0;
-                if (phase == 1 && cigar_buffer) {
-                    const size_t G = (size_t)GRID_BLOCK_SIZE;
-                    size_t batch_n_col = (size_t)diag_actual_n_col;
-                    if (batch_n_col == 0) batch_n_col = 1;
-                    size_t n_ckpt = ((size_t)batch_max_antidiag + G - 1) / G;
-                    grid_dblock_per_task  =
-                        n_ckpt * (size_t)GRID_NUM_DELTA_ARRAYS * batch_n_col;
-                    grid_scratch_per_slot = G * batch_n_col;
-                    grid_dblock_total_bytes = (size_t)batch_size * grid_dblock_per_task;
-
-                    if (grid_dblock_total_bytes < (size_t)bt_p_total_bytes) {
-                        size_t scratch_avail =
-                            (size_t)bt_p_total_bytes - grid_dblock_total_bytes;
-                        size_t n_slots_from_scratch =
-                            (grid_scratch_per_slot > 0)
-                            ? (scratch_avail / grid_scratch_per_slot) : 1;
-                        grid_slots = (int)n_slots_from_scratch;
-                        if (grid_slots > max_slots_cap) grid_slots = max_slots_cap;
-                        if (grid_slots > batch_size)    grid_slots = batch_size;
-                        if (grid_slots < 1)             grid_slots = 1;
-
-                        /* Switch to gridded only when slot gain ≥ 2× to cover the   */
-                        /* 2× compute overhead of replay.                            */
-                        int legacy_slots = phase_concurrent_slots;
-                        use_grid = (grid_slots >= 2 * legacy_slots);
+                    if (use_shared_variant == 1) {
+                        ksw_long_shared_kernel<<<phase_concurrent_slots, parallel_threads,
+                                                 shared_bytes_full, align_stream>>>(
+                            d_task_counter,
+                            d_packed_query, d_packed_target,
+                            d_query_lens, d_target_lens,
+                            d_query_offsets, d_target_offsets,
+                            (gasal_res_t*)device_res, d_mat,
+                            d_bt_p_batch, d_bt_off_batch, d_bt_off_end_batch,
+                            (int)batch_max_backtrack_size, (int)batch_max_antidiag,
+                            d_ksw_temp_buffer, d_flag, d_bw,
+                            ksw_temp_per_task, batch_size, 5,
+                            opt->zdrop, opt->end_bonus,
+                            cigar_buffer ? d_cigar_buffer  : NULL,
+                            cigar_buffer ? d_cigar_lengths : NULL,
+                            (int)current_max_cigar_len,
+                            batch_max_tlen);
+                    } else {
+                        ksw_long_shared3_kernel<<<phase_concurrent_slots, parallel_threads,
+                                                  shared_bytes_partial, align_stream>>>(
+                            d_task_counter,
+                            d_packed_query, d_packed_target,
+                            d_query_lens, d_target_lens,
+                            d_query_offsets, d_target_offsets,
+                            (gasal_res_t*)device_res, d_mat,
+                            d_bt_p_batch, d_bt_off_batch, d_bt_off_end_batch,
+                            (int)batch_max_backtrack_size, (int)batch_max_antidiag,
+                            d_ksw_temp_buffer, d_flag, d_bw,
+                            ksw_temp_per_task, batch_size, 5,
+                            opt->zdrop, opt->end_bonus,
+                            cigar_buffer ? d_cigar_buffer  : NULL,
+                            cigar_buffer ? d_cigar_lengths : NULL,
+                            (int)current_max_cigar_len,
+                            batch_max_tlen);
                     }
-                }
-                if (use_grid) {
-                    batch_path_tag = 'G';
-                    size_t batch_n_col = (size_t)diag_actual_n_col;
-                    if (batch_n_col == 0) batch_n_col = 1;
-                    phase_concurrent_slots = grid_slots;   /* override for logging too */
-
-                    /* Pool layout: [dblock: batch_size × dblock_per_task]           */
-                    /*              [scratch: grid_slots × scratch_per_slot]         */
-                    int8_t  *grid_dblock_pool  = (int8_t*)d_bt_p_batch;
-                    uint8_t *grid_scratch_pool = (uint8_t*)d_bt_p_batch
-                        + grid_dblock_total_bytes;
-
-                    ksw_gridded_forward_kernel<<<grid_slots, parallel_threads,
-                                                 0, align_stream>>>(
-                        d_task_counter,
-                        d_packed_query, d_packed_target,
-                        d_query_lens,   d_target_lens,
-                        d_query_offsets, d_target_offsets,
-                        (gasal_res_t*)device_res, d_mat,
-                        grid_dblock_pool, grid_dblock_per_task,
-                        d_bt_off_batch, d_bt_off_end_batch,
-                        (int)batch_max_antidiag, (int)batch_n_col,
-                        d_ksw_temp_buffer, d_flag, d_bw,
-                        ksw_temp_per_task, batch_size,
-                        5, opt->zdrop, opt->end_bonus,
-                        d_cigar_lengths
-                    );
-
-                    /* Reset task counter for the backtrack pass.                   */
-                    cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
-
-                    ksw_gridded_backtrack_kernel<<<grid_slots, parallel_threads,
-                                                   0, align_stream>>>(
-                        d_task_counter,
-                        d_packed_query, d_packed_target,
-                        d_query_lens,   d_target_lens,
-                        d_query_offsets, d_target_offsets,
-                        (gasal_res_t*)device_res, d_mat,
-                        grid_dblock_pool, grid_dblock_per_task,
-                        grid_scratch_pool, grid_scratch_per_slot,
-                        d_bt_off_batch, d_bt_off_end_batch,
-                        (int)batch_max_antidiag, (int)batch_n_col,
-                        d_ksw_temp_buffer, d_flag, d_bw,
-                        ksw_temp_per_task, batch_size, 5,
-                        d_cigar_buffer, d_cigar_lengths,
-                        (int)current_max_cigar_len
-                    );
                 } else
 #endif
                 {
                     // Legacy per-cell bt_p path (always for short phase, also long
-                    // phase when USE_GRIDDED_BT=0).
+                    // phase when SHARED kernel was not picked above).
                     ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
                                                   0, align_stream>>>(
                         d_task_counter,
@@ -1278,11 +1176,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel launch failed: %s\n",
                         cudaGetErrorString(kernel_err));
             }
-            nvtxRangePop(); // kernel:s=N
 
             // P1/P2/P3: GPU compaction + fix_cigar + stats before D2H
             // This eliminates the 960MB stride CIGAR D2H transfer and the CPU mm_fix_cigar/mm_update_extra loop.
-            nvtxRangePushA("compact_launch");
             if (cigar_buffer) {
                 // Step A: compute per-task compact offsets via exclusive prefix sum
                 cub::DeviceScan::ExclusiveSum(d_cub_tmp, cub_tmp_size,
@@ -1306,11 +1202,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     batch_size
                 );
             }
-            nvtxRangePop(); // compact_launch
 
             // D2H Sync 1: small arrays — CIGAR lengths, scores, endpoints, GPU stats
             // The compact CIGAR bulk D2H happens after we know total_cigar_ops (see Sync 2 below).
-            nvtxRangePushA("d2h_small");
             if (cigar_buffer) {
                 cudaMemcpyAsync(h_cigar_lengths, d_cigar_lengths,
                                 batch_size * sizeof(int), cudaMemcpyDeviceToHost, align_stream);
@@ -1330,14 +1224,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemcpyAsync(h_mte,   d_mte,   batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_mte_q, d_mte_q, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_zdropped, d_zdropped, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
-            nvtxRangePop(); // d2h_small
 
             // Sync 1: wait for small arrays (D2H above) to arrive on host
-            // This is where the CPU actually waits for the GPU forward kernel +
-            // compact + D2H to all complete.  Long bars here = GPU bottleneck.
-            nvtxRangePushA("sync1_wait_gpu");
             cudaStreamSynchronize(align_stream);
-            nvtxRangePop(); // sync1_wait_gpu
             kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel execution failed: %s\n",
@@ -1373,7 +1262,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // shrink CIGARs in-place. The data in d_compact_cigar is still at the ORIGINAL
             // offsets. We must copy d_compact_offsets from GPU rather than recomputing from
             // the updated h_cigar_lengths, which would produce wrong (shifted) offsets.
-            nvtxRangePushA("d2h_cigar");
             int total_cigar_ops = 0;
             if (cigar_buffer) {
                 // Validate cigar lengths
@@ -1416,10 +1304,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     cudaStreamSynchronize(align_stream);
                 }
             }
-            nvtxRangePop(); // d2h_cigar
 
             // Map results back to tasks
-            nvtxRangePushA("map_results");
             for (int i = 0; i < batch_size; i++) {
                 int task_idx = current_task_indices[batch_start + i];  // Use task index from current phase
                 int align_id = i;  // always identity; h_task_to_align_id removed
@@ -1478,8 +1364,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
                 tasks[task_idx].zdropped = h_zdropped[align_id] ? 1 : 0;
             }
-            nvtxRangePop(); // map_results
-            nvtxRangePop(); // outer batch (S/L[B<N>|n=...])
 
             // h_unpacked_query/target point to pinned dev_mem buffers — no free needed.
 

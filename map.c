@@ -31,14 +31,14 @@ static volatile long g_dbgcmp_gpu_nu    = 0;  /* sum of GPU n_chains      */
 static volatile long g_dbgcmp_rmq_nu    = 0;  /* sum of RMQ n_chains      */
 #endif /* DEBUG_CHAIN_COMPARE */
 
-#define __AMD_SPLIT_KERNELS__ 1
+#define GPU_PIPELINE 1
 struct mm_tbuf_s {
 	void *km;
 	int rep_len, frag_gap; // updated per read. 
 	double timers[MM_N_THR_TIMERS];
 }; // per thread
 
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
 
 #include "plutils.h"
 
@@ -87,7 +87,7 @@ void *mm_tbuf_get_km(mm_tbuf_t *b)
 	return b->km;
 }
 
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
 void mm_trbuf_batch_init(mm_batch_trbuf_t *batch_, int batch_max_reads) {
     batch_->count = 0;
     batch_->total_n = 0;
@@ -373,7 +373,7 @@ static mm_reg1_t *align_regs(const mm_mapopt_t *opt, const mm_idx_t *mi, void *k
 	return regs;
 }
 
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
 void mm_map_seed(const mm_idx_t *mi, const mm_mapopt_t *opt,
                  chain_read_t *read_, mm_tbuf_t *b, void *km) {
     int n_segs = read_->n_seg;
@@ -897,7 +897,7 @@ typedef struct {
 	int *n_reg, *seg_off, *n_seg, *rep_len, *frag_gap;
 	mm_reg1_t **reg;
 	mm_tbuf_t **buf;
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
     mm_trbuf_t **trbuf;
 	int batch_max_reads;
     size_t batch_max_anchors;
@@ -956,7 +956,7 @@ void mm_consolidate_timers(step_t *s, pipeline_t *p)
 }
 
 
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
 
 void mm_trbuf_is_full(mm_trbuf_t* tr, step_t *s){
     while (tr->acc_batch.total_n > s->batch_max_anchors) { // if the batch is full
@@ -997,7 +997,7 @@ void mm_trbuf_is_full(mm_trbuf_t* tr, step_t *s){
 }
 #endif
 
-#ifndef __AMD_SPLIT_KERNELS__
+#ifndef GPU_PIPELINE
 static void worker_for(void *_data, long i, int tid) // kt_for() callback
 {
     step_t *s = (step_t*)_data;
@@ -1131,7 +1131,7 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			s->buf = (mm_tbuf_t**)calloc(p->n_threads, sizeof(mm_tbuf_t*));
 			for (i = 0; i < p->n_threads; ++i)
 				s->buf[i] = mm_tbuf_init();
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
 			s->trbuf = (mm_trbuf_t**)calloc(p->n_threads, sizeof(mm_trbuf_t*));
 #endif
 
@@ -1150,7 +1150,7 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			return s;
 		} else free(s);
     } else if (step == 1) { // step 1: map
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
 		return kt_worker_manager(shared, in);
 #endif
     } else if (step == 2) { // step 2: output
@@ -1315,7 +1315,7 @@ int mm_split_merge(int n_segs, const char **fn, const mm_mapopt_t *opt, int n_sp
 
 
 /*********************************GPU Wrapper Func**********************/
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
 
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                                    uint8_t *seq_buffer, uint32_t *cigar_buffer, int stream_id);							   

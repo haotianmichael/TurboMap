@@ -49,7 +49,7 @@ static void *ktf_worker(void *data)
 	}
 	while ((i = steal_work(w->t)) >= 0)
 		w->t->func(w->t->data, i, w - w->t->w);
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
 	// call func one last time for this thread to signal end of all reads
 	w->t->func(w->t->data, -1, w - w->t->w);
 #endif
@@ -73,7 +73,7 @@ void kt_for(int n_threads, void (*func)(void*,long,int), void *data, long n)
 	} else {
 		long j;
 		for (j = 0; j < n; ++j) func(data, j, 0);
-#if defined(__AMD_SPLIT_KERNELS__)
+#if defined(GPU_PIPELINE)
 		// call once at the end to signal end of all reads
 		func(data, -1, 0);
 #endif

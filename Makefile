@@ -1,4 +1,4 @@
-CFLAGS_NDEBUG = -DNDEBUG -O0 
+CFLAGS_NDEBUG = -DNDEBUG -O3
 CDEBUG_FLAGS= -g -O0 #-Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-sign-compare -Wno-unused-function -Wno-c++17-extensions -Wno-\#warnings #-O0 -DNDEBUG
 CPPFLAGS=	-DHAVE_KALLOC
 CPPFLAGS+= 	$(if $(MAX_MICRO_BATCH),-DMAX_MICRO_BATCH=\($(MAX_MICRO_BATCH)\))

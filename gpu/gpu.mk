@@ -23,10 +23,9 @@ INCLUDES		+= -I gpu
 ###################################################
 COMPUTE_ARCH    = $(GPUARCH:sm_%=compute_%)
 GPU_CC 			= nvcc
-GPU_FLAGS		= -rdc=true -gencode arch=$(COMPUTE_ARCH),code=$(GPUARCH) -diag-suppress=177 -diag-suppress=1650
+GPU_FLAGS		= -rdc=true -gencode arch=$(COMPUTE_ARCH),code=$(GPUARCH) -diag-suppress=177 -diag-suppress=1650 -maxrregcount=255
 CUDANALYZEFLAG	= -Xptxas -v
 CUDATESTFLAG	= -G
-CUDADEBUGFLAG	= -maxrregcount=128
 
 ifeq ($(DEBUG),analyze)
 	GPU_FLAGS	+= $(CUDANALYZEFLAG)

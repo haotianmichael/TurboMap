@@ -12,7 +12,6 @@
 #include "khash.h"
 #include "gpu/plalign.cuh"
 #include "ksw2.h"
-#include <nvToolsExt.h>
 
 /* -----------------------------------------------------------------------
  * DEBUG_CHAIN_COMPARE: compile-time flag to compare GPU-DP-chain output
@@ -1389,10 +1388,8 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                        const mm_mapopt_t *opt,
                                        const mm_idx_t *mi, void *km)
 {
-    nvtxRangePushA("gpu_batch_process_results");
-    if (gpu_batch->n_tasks == 0) { nvtxRangePop(); return; }
-   
-    qsort(gpu_batch->tasks, gpu_batch->n_tasks, 
+    if (gpu_batch->n_tasks == 0) return;
+    qsort(gpu_batch->tasks, gpu_batch->n_tasks,
           sizeof(gpu_align_task_t), task_compare);
     
     int current_read = -1, current_reg = -1;
@@ -1809,7 +1806,6 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             }
         }
     }
-    nvtxRangePop();
 }
 
 /* Forward declarations for align.c functions that lack header declarations */
@@ -1975,26 +1971,20 @@ static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
 static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s, int stream_id)
 {
-    nvtxRangePushA("prepare_align_batch_gpu");
     gpu_align_batch_t *gpu_batch = gpu_align_batch_init(batch->count, batch->km);
 
     // Process each read and collect alignment tasks
-    nvtxRangePushA("pre_align_helper_gpu_loop");
     for (int iread = 0; iread < batch->count; iread++) {
         pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
                             	batch->km, gpu_batch, iread);
     }
-    nvtxRangePop();
 
     // Submit all tasks to GPU and process results
-    nvtxRangePushA("gpu_submit_and_process");
     gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km, stream_id);
-    nvtxRangePop();
 
     // CPU fallback: align any r2 regions created by z-drop splits during GPU
     // result processing.  These regions were inserted into ctx->regs0 by
     // mm_split_reg+mm_insert_reg but have no CIGAR yet (p==NULL).
-    nvtxRangePushA("zdrop_split_cpu_fallback");
     for (int iread = 0; iread < batch->count; iread++) {
         read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
         for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
@@ -2030,17 +2020,13 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
             }
         }
     }
-    nvtxRangePop();
 
-    nvtxRangePushA("post_align_helper_gpu_loop");
 	for (int iread = 0; iread < batch->count; iread++) {
         post_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
                          		gpu_batch, batch->km, iread);
     }
-    nvtxRangePop();
 
 	// After Align
-    nvtxRangePushA("result_copyback");
 	int pe_ori = s->p->opt->pe_ori;
 	for (int iread = 0; iread < batch->count; iread++) {
 		int i = batch->reads[iread].seq.i;
@@ -2085,7 +2071,6 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
 			//fprintf(stderr, "QT\t%s\t%d\t%.6f\n", s->seq[off].name, tid, realtime() - t);
     }
 
-    nvtxRangePop(); // result_copyback
 
 	// Final cleanup for each read
     for (int iread = 0; iread < batch->count; iread++) {
@@ -2097,7 +2082,6 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     kfree(batch->km, gpu_batch->cigar_buffer);
     kfree(batch->km, gpu_batch->read_ctxs);
     kfree(batch->km, gpu_batch);
-    nvtxRangePop(); // prepare_align_batch_gpu
 }
 
 static seeded_queue_t *g_seeded_queue = NULL;
@@ -2311,22 +2295,16 @@ static void* drain_worker_fn(void *arg) {
             fprintf(stderr, "DRAIN_WORKER(%d): count=%d\n", sid, slot->batch.count);
 
         // ── Process main batch (chain already launched by consumer) ──
-        nvtxRangePushA("sync_chain_gpu");
         sync_chain_gpu(sid);
-        nvtxRangePop();
 
-        nvtxRangePushA("start_backtrack_gpu");
         int bt_n = 0;
         start_backtrack_gpu(s->p->mi, s->p->opt, slot->batch.reads,
                             sid, slot->batch.km, &bt_n);
-        nvtxRangePop();
         // bt_n == batch.count: backtrack processes exactly what chain fitted.
         // Chain overflow was put back into acc_batch by the consumer.
 
-        nvtxRangePushA("finish_backtrack_gpu");
         finish_backtrack_gpu(s->p->mi, s->p->opt, slot->batch.reads,
                              bt_n, sid, slot->batch.km);
-        nvtxRangePop();
 
         slot->batch.count = bt_n;
         copy_rep_frag(s, &slot->batch);
@@ -2504,9 +2482,7 @@ static void* gpu_batch_consumer(void *data) {
                         cur_stream, acc_batch.count, acc_batch.total_n);
 
             // Launch chain on stream[cur_stream] (async)
-            nvtxRangePushA("launch_chain_gpu");
             int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count, cur_stream);
-            nvtxRangePop();
 
             int fit = acc_batch.count - overflow;
 

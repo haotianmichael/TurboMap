@@ -3,7 +3,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include "plscore.cuh"
-#include "hipify.cuh"
+#include "cuda_utils.cuh"
 
 /* 
 
@@ -113,20 +113,18 @@ inline __device__ void compute_sc_seg_one_wf(const int32_t* anchors_x, const int
         f[i] = MM_QSPAN;
         p[i] = 0;
     }
-#ifndef USEHIP
-        __syncwarp(); // NOTE: single warp, no need to sync
-#endif // USEHIP
+        __syncwarp();
     for (size_t i=start_idx; i < end_idx; i++) {
         int32_t range_i = range[i];
         for (int32_t j = tid; j < range_i; j += blockDim.x) {
             int32_t sc = comput_sc(
-                                anchors_x[i+j+1], 
-                                anchors_y[i+j+1], 
-                                anchors_x[i], 
+                                anchors_x[i+j+1],
+                                anchors_y[i+j+1],
+                                anchors_x[i],
                                 anchors_y[i],
                                 sid [i+j+1],
                                 sid [i],
-                                blk_misc.max_dist_x, blk_misc.max_dist_y, blk_misc.bw, blk_misc.chn_pen_gap, 
+                                blk_misc.max_dist_x, blk_misc.max_dist_y, blk_misc.bw, blk_misc.chn_pen_gap,
                                 blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg);
             if (sc == INT32_MIN) continue;
             sc += f[i];
@@ -136,9 +134,7 @@ inline __device__ void compute_sc_seg_one_wf(const int32_t* anchors_x, const int
 
             }
         }
-#ifndef USEHIP
-        __syncwarp(); // NOTE: single warp, no need to sync
-#endif // USEHIP
+        __syncwarp();
     }
     
 }
@@ -182,104 +178,6 @@ inline __device__ void compute_sc_seg_multi_wf(const int32_t* anchors_x, const i
     
 }
 
-#define NUM_ANCHORS_PREFETCH 1024
-
-// inline __device__ void compute_sc_seg_shared(const int64_t* anchors_x, const int64_t* anchors_y, int32_t* range, 
-//                     size_t start_idx, size_t end_idx,
-//                     int32_t* f, uint16_t* p
-// ){
-//     Misc blk_misc = misc;
-//     int tid = threadIdx.x;
-//     int bid = blockIdx.x;
-//     // init f and p
-//     for (size_t i=start_idx+tid; i < end_idx; i += blockDim.x) {
-//         f[i] = anchors_y[i] >> 32 & 0xff;
-//         p[i] = 0;
-//     }
-//     __syncthreads();
-//     // assert(range[end_idx-1] == 0);
-//     __shared__ int64_t anchors_x_shared[NUM_ANCHORS_PREFETCH];
-
-//     __shared__ int64_t anchors_y_shared[NUM_ANCHORS_PREFETCH];
-//     size_t prefetch_end_idx = 0;
-//     unsigned int prefetch_smem_offset = 0;
-//     for (size_t i = start_idx; i < end_idx; i++) {
-//         int32_t range_i = range[i];
-//         // if (range_i + i >= end_idx)
-//         //     printf("range_i %d i %lu start_idx %lu, end_idx %lu\n", range_i, i, start_idx, end_idx);
-//         // assert(range_i + i < end_idx);
-//         for (int32_t j = tid; j < range_i; j += blockDim.x) {
-//             int32_t sc = comput_sc(
-//                                 anchors_x[i+j+1], 
-//                                 anchors_y[i+j+1], 
-//                                 anchors_x[i], 
-//                                 anchors_y[i],
-//                                 blk_misc.max_dist_x, blk_misc.max_dist_y, blk_misc.bw, blk_misc.chn_pen_gap, 
-//                                 blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg);
-//             if (sc == INT32_MIN) continue;
-//             sc += f[i];
-//             if (sc >= f[i+j+1] && sc != (anchors_y[i+j+1]>>32 & 0xff)) {
-//                 f[i+j+1] = sc;
-//                 p[i+j+1] = j+1;
-
-//             }
-//         }
-//         __syncthreads();
-//     }
-// }
-
-// inline __device__ void compute_sc_long_seg_one_wf(const int64_t* anchors_x, const int64_t* anchors_y, int32_t* range, 
-//                     size_t start_idx, size_t end_idx,
-//                     int32_t* f, uint16_t* p
-// ){
-//     Misc blk_misc = misc;
-//     int tid = threadIdx.x;
-//     // int bid = blockIdx.x;
-//     // NOTE: smallest alignd offset that is greater than start_idx
-//     //      anchor_offset = tid;
-//     //      while (anchor_offset <= start_idx) anchor_offset += blockDim.x;
-//     int anchor_offset = tid + (start_idx - tid + blockDim.x) / blockDim.x * blockDim.x;
-//     // init f and p
-//     for (size_t i=anchor_offset; i < end_idx; i += blockDim.x) {
-//         f[i] = anchors_y[i] >> 32 & 0xff;
-//         p[i] = 0;
-//     }
-//     // int64_t local_anchors[10];
-//     int64_t anchor_x = anchors_x[anchor_offset];
-//     int64_t anchor_y = anchors_y[anchor_offset];
-//     __syncthreads();
-//     // assert(range[end_idx-1] == 0);
-//     for (size_t i=start_idx; i < end_idx; i++) {
-//         int32_t range_i = range[i];
-//         // if (range_i + i >= end_idx)
-//         //     printf("range_i %d i %lu start_idx %lu, end_idx %lu\n", range_i, i, start_idx, end_idx);
-//         // assert(range_i + i < end_idx);
-//         // for (int32_t j = tid; j < range_i; j += blockDim.x) {
-//         for (unsigned j = anchor_offset; j < i+range_i+1; j += blockDim.x) {
-//             anchor_x = anchors_x[j];
-//             anchor_y = anchors_y[j];
-//             int32_t sc = comput_sc(
-//                                 anchor_x, 
-//                                 anchor_y, 
-//                                 anchors_x[i], 
-//                                 anchors_y[i],
-//                                 blk_misc.max_dist_x, blk_misc.max_dist_y, blk_misc.bw, blk_misc.chn_pen_gap, 
-//                                 blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg);
-//             if (sc == INT32_MIN) continue;
-//             sc += f[i];
-//             if (sc >= f[j] && sc != (anchors_y[j]>>32 & 0xff)) {
-//                 f[j] = sc;
-//                 p[j] = j+1;
-//             }
-//         }
-//         anchor_offset += (anchor_offset <= i+1) * blockDim.x; // update anchor offset
-//         __syncthreads();
-//     }
-    
-// }
-
-
-
 /* kernels begin */
 
 
@@ -303,9 +201,7 @@ __global__ void score_generation_short(
     int bid = blockIdx.x;
 
     size_t long_seg_start_idx;
-#ifndef USEHIP
     __shared__ size_t long_seg_start_idx_shared;
-#endif
 
     for(int segid = bid; segid < seg_count; segid += gridDim.x){
         size_t start_idx = seg_start_arr[segid];
@@ -328,13 +224,8 @@ __global__ void score_generation_short(
                 /* Allocate space in long seg buffer */
                 long_seg_start_idx = atomicAdd((unsigned long long int*)total_n_long, (unsigned long long int)end_idx - start_idx);
                 if (long_seg_start_idx + (end_idx - start_idx) >= buffer_size_long){ // long segement buffer is full
-                /* rollback total_n_long */
-#ifdef USEHIP
-                    atomicSub((unsigned long long int*)total_n_long, (unsigned long long int)end_idx - start_idx);
-#else // CUDA. CUDA does not support atomicSub for unsigned long long int. 
-                    atomicAdd((unsigned long long int*)total_n_long, (unsigned long long int)(start_idx - end_idx)); 
-
-#endif // USEHIP
+                /* rollback total_n_long — CUDA lacks atomicSub for ull, use negative add */
+                    atomicAdd((unsigned long long int*)total_n_long, (unsigned long long int)(start_idx - end_idx));
                     long_seg_start_idx = SIZE_MAX;
                     // fallback to mid kernel
                     int mid_seg_idx = atomicAdd((unsigned long long int*)mid_seg_count, 1);
@@ -348,15 +239,11 @@ __global__ void score_generation_short(
                     long_seg_og[long_seg_idx].end_idx = end_idx;
                 }
             }
-            // broadcast long_seg_start_idx to all scalar registers
-#ifdef USEHIP
-            long_seg_start_idx = __builtin_amdgcn_readfirstlane(long_seg_start_idx);
-#else       
+            // broadcast long_seg_start_idx to all threads in warp
             if (tid == 0) long_seg_start_idx_shared = long_seg_start_idx;
             __syncwarp();
             long_seg_start_idx = long_seg_start_idx_shared;
             __syncwarp();
-#endif
             if (long_seg_start_idx == SIZE_MAX)
                 continue;  // failed to allocate long_seg buffer
             for (uint64_t idx = tid; idx < end_idx - start_idx; idx += blockDim.x){
@@ -480,15 +367,9 @@ __global__ void score_generation_naive(int32_t* anchors_x, int32_t* anchors_y, i
 score_kernel_config_t score_kernel_config;
 
 void plscore_upload_misc(Misc input_misc) {
-#ifdef USEHIP
-    hipMemcpyToSymbol(HIP_SYMBOL(misc), &input_misc, sizeof(Misc));
-    hipMemcpyToSymbol(HIP_SYMBOL(long_seg_cutoff), &score_kernel_config.long_seg_cutoff, sizeof(int));
-    hipMemcpyToSymbol(HIP_SYMBOL(mid_seg_cutoff), &score_kernel_config.mid_seg_cutoff, sizeof(int));
-#else
     cudaMemcpyToSymbol(misc, &input_misc, sizeof(Misc));
     cudaMemcpyToSymbol(long_seg_cutoff, &score_kernel_config.long_seg_cutoff, sizeof(int));
     cudaMemcpyToSymbol(mid_seg_cutoff, &score_kernel_config.mid_seg_cutoff, sizeof(int));
-#endif
     cudaCheck();
 }
 

@@ -3,14 +3,10 @@
 #include <stdio.h>
 #include <assert.h>
 #include "plrange.cuh"
-#include "hipify.cuh"
+#include "cuda_utils.cuh"
 
 
-/* 
-
-CUDA/HIP kernel for range selection using forward chaining
-
-*/
+/* CUDA kernel for range selection using forward chaining */
 
 /* kernels begin */
 __constant__ int d_max_dist_x;
@@ -122,97 +118,6 @@ __global__ void range_selection_kernel_naive(const int32_t* ax, const int32_t* r
     }
 }
 
-// __global__ void range_selection_kernel(const int64_t* ax, size_t *start_idx_arr, size_t *read_end_idx_arr, int32_t *range){
-//     int tid = threadIdx.x;
-//     int bid = blockIdx.x;
-
-//     size_t start_idx = start_idx_arr[bid];
-//     size_t read_end_idx = read_end_idx_arr[bid];
-//     size_t end_idx = start_idx + MAX_ANCHOR_PER_BLOCK;
-//     end_idx = end_idx > read_end_idx ? read_end_idx : end_idx;
-
-//     size_t load_anchor_idx = 100;
-//     size_t load_smem_idx;
-//     size_t cal_idx = start_idx + threadIdx.x;
-//     int32_t cal_smem = tid;
-//     __shared__ int64_t smem[NUM_ANCHOR_IN_SMEM];
-
-//     /* prefetch anchors */
-//     load_smem_idx = tid;
-//     load_anchor_idx = start_idx + tid;
-//     // if (tid == 20) printf("load_smem_idx %d, load_anchor_idx %lu\n", load_smem_idx, load_anchor_idx);
-//     for (int i = 0; i < PREFETCH_ANCHORS_RANGE/NUM_THREADS_RANGE && load_anchor_idx < read_end_idx; ++i){
-//         // if (tid == 20) printf("load_smem_idx %d, load_anchor_idx %lu\n", load_smem_idx, load_anchor_idx);
-//         smem[load_smem_idx] = ax[load_anchor_idx];
-//         load_smem_idx += NUM_THREADS_RANGE;
-//         load_anchor_idx += NUM_THREADS_RANGE;
-//     }
-
-//     int iter = (NUM_ANCHOR_IN_SMEM - PREFETCH_ANCHORS_RANGE)/NUM_THREADS_RANGE; // iterations before another load is needed
-//     while (cal_idx < end_idx) { // tail threads may skip this loop
-//         /* load anchors */
-//         load_smem_idx = load_smem_idx >= NUM_ANCHOR_IN_SMEM ? load_smem_idx - NUM_ANCHOR_IN_SMEM : load_smem_idx;
-//         for (int i = 0; i < iter && load_anchor_idx < end_idx + PREFETCH_ANCHORS_RANGE; ++i){
-//             // if (tid == 20) printf("load it load_smem_idx %d, load_anchor_idx %lu\n", load_smem_idx, load_anchor_idx);
-//             smem[load_smem_idx] = ax[load_anchor_idx];
-//             load_smem_idx += NUM_THREADS_RANGE;
-//             load_anchor_idx += NUM_THREADS_RANGE;
-//             load_smem_idx = load_smem_idx >= NUM_ANCHOR_IN_SMEM ? load_smem_idx - NUM_ANCHOR_IN_SMEM : load_smem_idx;
-//         }
-
-//         __syncthreads();
-        
-//         /* calculate sucessor range */
-//         for (int i = 0; i < iter && cal_idx < end_idx; ++i){
-//             int64_t anchor = smem[cal_smem];
-
-//             size_t st = cal_idx + PREFETCH_ANCHORS_RANGE < read_end_idx ? cal_idx + PREFETCH_ANCHORS_RANGE : read_end_idx-1;
-//             int32_t st_smem = cal_smem + st - cal_idx;
-//             st_smem = st_smem >= NUM_ANCHOR_IN_SMEM ? st_smem - NUM_ANCHOR_IN_SMEM : st_smem;
-//             // if (tid == 20) printf("cal idx %lu, cal_mem %d, st %lu, st_smem %d\n", cal_idx, cal_smem, st,st_smem);
-
-//             // if (tid == 20) printf("anchor.x %d, smem[st_smem] %d, anchor.x+MAX_DIST_X%d\n", anchor, smem[st_smem], anchor+MAX_DIST_X);
-
-//             while (st > cal_idx && 
-//                         (anchor>> 32 != smem[st_smem] >> 32 ||
-//                             smem[st_smem] > anchor + d_max_dist_x
-//                         )
-//                     ){
-//                 // if (bid == 25)
-//                 // printf("while 0 bid %d tid %d cal_idx %d\n", bid, tid, cal_idx);
-//                 --st;
-//                 if (st_smem == 0) st_smem = NUM_ANCHOR_IN_SMEM-1;
-//                 else --st_smem;
-//             }
-            
-//             /* NOTE: fallback: succussor is not prefetched */
-//             if (st >= PREFETCH_ANCHORS_RANGE + cal_idx){
-//                 st = cal_idx + MAX_ITER < read_end_idx ? i + MAX_ITER : read_end_idx-1;
-//                 while(
-//                     anchor >> 32 != ax[st] >> 32 || 
-//                     ax[st] > anchor + d_max_dist_x // check from global memory
-//                 ){
-//                     --st;
-//                     // if (bid == 25)
-//                     // printf("while 1 bid %d tid %d\n", bid, tid);
-//                 }
-
-//             }
-//             range[cal_idx] = st - cal_idx;
-//             cal_smem += NUM_THREADS_RANGE;
-//             cal_smem = cal_smem >= NUM_ANCHOR_IN_SMEM ? cal_smem - NUM_ANCHOR_IN_SMEM : cal_smem;
-//             cal_idx += NUM_THREADS_RANGE;
-//             // if (bid == 25)
-//             // printf("for loop i %d bid %d tid %d\n", i, bid, tid);
-//         }
-//         // if (bid == 25)
-//         // printf("outer while bid %d tid %d\n", bid, tid);
-//         __syncthreads();
-
-//     }
-    
-// }
-
 /* kernels end */
 
 #ifdef __cplusplus
@@ -223,18 +128,11 @@ extern "C" {
 range_kernel_config_t range_kernel_config;
 
 void plrange_upload_misc(Misc misc){
-#ifdef USEHIP
-    hipMemcpyToSymbol(HIP_SYMBOL(d_max_dist_x), &misc.max_dist_x, sizeof(int));
-    hipMemcpyToSymbol(HIP_SYMBOL(d_max_iter), &misc.max_iter, sizeof(int));
-    hipMemcpyToSymbol(HIP_SYMBOL(d_cut_check_anchors),
-                      &range_kernel_config.cut_check_anchors, sizeof(int));
-#else
     cudaCheck();
     cudaMemcpyToSymbol(d_max_dist_x, &misc.max_dist_x, sizeof(int));
     cudaMemcpyToSymbol(d_max_iter, &misc.max_iter, sizeof(int));
     cudaMemcpyToSymbol(d_cut_check_anchors,
                        &range_kernel_config.cut_check_anchors, sizeof(int));
-#endif  // USEHIP
     cudaCheck();
 }
 

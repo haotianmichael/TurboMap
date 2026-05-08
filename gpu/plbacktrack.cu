@@ -5,7 +5,7 @@
 #include <thrust/sort.h>
 #include <thrust/execution_policy.h>
 #include "plbacktrack.cuh"
-#include "hipify.cuh"
+#include "cuda_utils.cuh"
 #include "mmpriv.h"
 
 // Kernel configuration constants

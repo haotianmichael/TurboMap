@@ -1,6 +1,6 @@
 #ifndef _PLMEM_CUH_
 #define _PLMEM_CUH_
-#include "hipify.cuh"
+#include "cuda_utils.cuh"
 #include "plchain.h"
 #include "plutils.h"
 

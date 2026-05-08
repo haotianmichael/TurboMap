@@ -1,18 +1,12 @@
-GPU				?= 		AMD
+GPUARCH			?= sm_70
 CONFIG			+= $(if $(MAX_MICRO_BATCH),-DMICRO_BATCH=\($(MAX_MICRO_BATCH)\))
 # Enable verbose [Info...] logging from plmem.cu / plalign.cu:  make PRINT=1
-# See gpu/pllog.h.  Default OFF — fewer fprintfs = faster (small).
+# See gpu/pllog.h.  Default OFF.
 CONFIG			+= $(if $(PRINT),-DPRINT=1)
 
-# Enable shared-memory long-task kernel (super-long bottleneck batches): make SHARED=1
+# Enable shared-memory long-task kernel (V100 super-long bottleneck batches): make SHARED=1
 # See gpu/plksw_shared_kernel.cuh.  Default OFF (legacy global-mem kernel).
 CONFIG			+= $(if $(SHARED),-DUSE_SHARED_LONG_KERNEL=1)
-
-ifeq ($(GPU), AMD)
-    GPUARCH    ?= $(strip $(shell rocminfo |grep -m 1 -E gfx[^0]{1} | sed -e 's/ *Name: *//'))
-else
-    GPUARCH    ?= sm_86
-endif
 
 ###################################################
 ############  	CPU Compile 	###################
@@ -25,51 +19,22 @@ OBJS			+= $(C_SRC:%.c=%.o)
 INCLUDES		+= -I gpu
 
 ###################################################
-############  	CUDA Compile 	###################
+############  	CUDA Compile (NVIDIA only) ##########
 ###################################################
 COMPUTE_ARCH    = $(GPUARCH:sm_%=compute_%)
-NVCC 			= nvcc
-CUDAFLAGS		= -rdc=true -gencode arch=$(COMPUTE_ARCH),code=$(GPUARCH) -diag-suppress=177 -diag-suppress=1650 # supress unused variable / func warning
+GPU_CC 			= nvcc
+GPU_FLAGS		= -rdc=true -gencode arch=$(COMPUTE_ARCH),code=$(GPUARCH) -diag-suppress=177 -diag-suppress=1650
 CUDANALYZEFLAG	= -Xptxas -v
 CUDATESTFLAG	= -G
-CUDADEBUGFLAG	= -maxrregcount=128 
-###################################################
-############	HIP Compile		###################
-###################################################
-HIPCC			= hipcc
-HIPFLAGS		= -DUSEHIP --offload-arch=$(GPUARCH)
-HIPANALYZEFLAG  = -Rpass-analysis=kernel-resource-usage
-HIPTESTFLAGS	= -G -ggdb
-HIPLIBS			= -L${ROCM_PATH}/lib -lroctx64 -lroctracer64
-
-###################################################
-############	DEBUG Options	###################
-###################################################
-ifeq ($(GPU), AMD)
-	GPU_CC 		= $(HIPCC)
-	GPU_FLAGS	= $(HIPFLAGS)
-	GPU_TESTFL	= $(HIPTESTFLAGS)
-	GPU_ANALYZE	= $(HIPANALYZEFLAG)
-	LIBS		+= $(HIPLIBS)
-else
-	GPU_CC 		= $(NVCC)
-	GPU_FLAGS	= $(CUDAFLAGS)
-	GPU_ANALYZE = $(CUDANALYZEFLAG)
-	GPU_TESTFL	= $(CUDATESTFLAG)
-	LIBS		+= -lnvToolsExt
-endif
+CUDADEBUGFLAG	= -maxrregcount=128
 
 ifeq ($(DEBUG),analyze)
-	GPU_FLAGS	+= $(GPU_ANALYZE)
+	GPU_FLAGS	+= $(CUDANALYZEFLAG)
 endif
 ifeq ($(DEBUG),verbose)
-	GPU_FLAGS	+= $(GPU_ANALYZE)
-	GPU_FLAGS	+= $(GPU_TESTFL)
+	GPU_FLAGS	+= $(CUDANALYZEFLAG)
+	GPU_FLAGS	+= $(CUDATESTFLAG)
 endif
-ifeq ($(GPU), NV)
-	GPU_FLAGS	+= $(CUDADEBUGFLAG)
-endif
-
 
 %.o: %.cu
 	$(GPU_CC) -c $(GPU_FLAGS) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) $(CONFIG) $< -o $@
@@ -80,17 +45,13 @@ endif
 %.as: %.o
 	cuobjdump -all $< > $@
 
-cleangpu: 
+cleangpu:
 	rm -f $(CU_OBJS) $(CU_PTX)
-
-# profile:CFLAGS += -pg -g3
-# profile:all
-# 	perf record --call-graph=dwarf -e cycles:u time ./minimap2 -a test/MT-human.fa test/MT-orang.fa > test.sam
 
 cudep: gpu/.depend
 
 gpu/.depend: $(CU_SRC)
 	rm -f gpu/.depend
-	$(GPU_CC) -c $(GPU_FLAGS) $(CFLAGS)  $(CPPFLAGS) $(INCLUDES) -MM $^ > $@
+	$(GPU_CC) -c $(GPU_FLAGS) $(CFLAGS) $(CPPFLAGS) $(INCLUDES) -MM $^ > $@
 
 include gpu/.depend

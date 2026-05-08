@@ -11,9 +11,6 @@
 #ifndef USE_SHARED_LONG_KERNEL
 #define USE_SHARED_LONG_KERNEL 0
 #endif
-// NVTX3 C API (nvtxRangePushA/nvtxRangePop) already available via cub/detail/nvtx.cuh
-
-
 #define CHECKCUDAERROR(error) \
 		do{\
 			err = error;\
@@ -388,7 +385,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     }
 #endif
 
-    nvtxRangePushA("gpu_align_batch_execute");
     cudaSetDevice(0);
     gpu_align_copy_param();
 
@@ -1433,5 +1429,4 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     // Switch arena back to chain phase for next batch
     plmem_phase_to_chain(dev_mem);
-    nvtxRangePop(); // gpu_align_batch_execute
 }

@@ -1368,6 +1368,20 @@ void plmem_initialize(size_t *max_total_n_, int *max_read_,
 void plmem_stream_initialize(size_t *max_total_n_,
                              int *max_read_, int *min_anchors_, char* gpu_config_file) {
 
+    /* Force CPU spin on GPU sync (vs the default Auto, which on A100 picks   */
+    /* BlockingSync — every cudaStreamSynchronize then becomes a syscall and  */
+    /* thread enters kernel-mode wait, accumulating huge sys time and adding  */
+    /* ~50 μs latency per sync.  In a multi-stream pipeline with 100+ batches */
+    /* per second this adds tens of seconds of wall time.  Spin wastes CPU    */
+    /* cycles but reduces sync latency to ~μs, which dominates here.          */
+    /* MUST be called before any other CUDA call (i.e. before cudaSetDevice). */
+    cudaError_t flag_err = cudaSetDeviceFlags(cudaDeviceScheduleSpin);
+    if (flag_err != cudaSuccess && flag_err != cudaErrorSetOnActiveProcess) {
+        fprintf(stderr, "[Warn] cudaSetDeviceFlags(Spin) failed: %s — keeping default sync mode.\n",
+                cudaGetErrorString(flag_err));
+        cudaGetLastError();  /* clear */
+    }
+
     cudaSetDevice(CUDA_DEVICE);
     int num_stream;
     size_t max_anchors_stream, max_range_grid, max_num_cut, long_seg_buffer_size;

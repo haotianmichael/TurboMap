@@ -705,9 +705,16 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // the while loop below (pool_cap × LATENCY_HIDE_FACTOR).
             long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
             current_batch_size    = long_batch_persistent;  // upper bound; overridden per-batch
+            /* Effective bt_p = max(arena, dedicated) — matches what the     */
+            /* dispatch and dyn_batch sizing actually use.  long_bt_p_pool_  */
+            /* bytes alone could show the smaller dedicated pool and mislead.*/
+            size_t _arena_bt = dev_mem->long_arena_bt_p_bytes;
+            size_t _dedi_bt  = (dev_mem->d_align_backtrack_p_long != nullptr)
+                               ? dev_mem->long_bt_p_pool_bytes : 0;
+            size_t _eff_bt = (_arena_bt > _dedi_bt) ? _arena_bt : _dedi_bt;
             PLOG_INFO(stderr, "[Info::%s]   Tier-1 (long): CIGAR cap=%zu  bt_p=%.2f GB  slots=%d\n",
                     stream_tag, long_batch_persistent,
-                    dev_mem->long_bt_p_pool_bytes / (1024.0*1024.0*1024.0),
+                    _eff_bt / (1024.0*1024.0*1024.0),
                     dev_mem->n_long_concurrent_slots);
         }
 
@@ -780,15 +787,21 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 size_t bt_stride0 = (size_t)(ql0 + tl0) * (size_t)nc0;
 
                 // bt_p bytes available to the long phase (set at arena transition).
-                // long_bt_p_pool_bytes holds either the dedicated cudaMalloc pool size
-                // (if one was allocated in plmem_malloc_device_mem) or the arena bt_p
-                // size (set by setup_long_align_phase when no dedicated pool exists).
-                // Fallback: n_long_concurrent_slots × TYPICAL_BT_STRIDE (safe floor).
+                // Take the LARGER of the dedicated cudaMalloc pool (if any)
+                // and the arena bt_p — must match what the launch dispatch
+                // below picks, otherwise we'd undersize the batch (causing
+                // tiny 64-task batches and many extra launches) or oversize
+                // (causing OOB).  See bt_p_total_bytes selection ~line 950.
+                // Fallback: n_long_concurrent_slots × TYPICAL_BT_STRIDE.
                 const size_t TYPICAL_BT_STRIDE_FALLBACK = (size_t)6 << 20;
-                size_t bt_p_avail = (dev_mem->long_bt_p_pool_bytes > 0)
-                                    ? dev_mem->long_bt_p_pool_bytes
-                                    : (size_t)dev_mem->n_long_concurrent_slots *
-                                      TYPICAL_BT_STRIDE_FALLBACK;
+                size_t arena_bt_p = dev_mem->long_arena_bt_p_bytes;
+                size_t dedi_bt_p  = (dev_mem->d_align_backtrack_p_long != nullptr)
+                                    ? dev_mem->long_bt_p_pool_bytes : 0;
+                size_t bt_p_avail = (arena_bt_p > dedi_bt_p) ? arena_bt_p : dedi_bt_p;
+                if (bt_p_avail == 0) {
+                    bt_p_avail = (size_t)dev_mem->n_long_concurrent_slots *
+                                 TYPICAL_BT_STRIDE_FALLBACK;
+                }
 
                 const size_t LATENCY_HIDE_FACTOR = 3;
                 size_t pool_cap0 = (bt_stride0 > 0) ? (bt_p_avail / bt_stride0) : (size_t)256;

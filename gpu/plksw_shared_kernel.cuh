@@ -403,16 +403,6 @@ __global__ void ksw_long_shared_kernel(
                     old_v_at_t  = v_arr[t];
                     old_x2_at_t = x2_arr[t];
 
-                    if (lane_id == 0) {
-                        my_x1  = batch_x1_boundary;
-                        my_v1  = batch_v1_boundary;
-                        my_x21 = batch_x21_boundary;
-                    } else {
-                        my_x1  = x_arr[t - 1];
-                        my_v1  = v_arr[t - 1];
-                        my_x21 = x2_arr[t - 1];
-                    }
-
                     my_u_prev  = u_arr[t];
                     my_y_prev  = y_arr[t];
                     my_y2_prev = y2_arr[t];
@@ -426,9 +416,23 @@ __global__ void ksw_long_shared_kernel(
                         my_score = 0;
                     }
                 } else {
-                    my_x1 = my_v1 = my_x21 = 0;
                     my_u_prev = my_y_prev = my_y2_prev = 0;
                     my_score = 0;
+                }
+
+                /* x_arr[t-1]/v_arr[t-1]/x2_arr[t-1] replaced by warp shuffle:
+                 * lane k gets old_*_at_t from lane k-1 (= arr[t-1] for that lane).
+                 * Inactive lanes contribute 0 (initialized above) — safe with full mask. */
+                int8_t shfl_x1  = (int8_t)__shfl_up_sync(0xffffffff, (int32_t)old_x_at_t,  1);
+                int8_t shfl_v1  = (int8_t)__shfl_up_sync(0xffffffff, (int32_t)old_v_at_t,  1);
+                int8_t shfl_x21 = (int8_t)__shfl_up_sync(0xffffffff, (int32_t)old_x2_at_t, 1);
+
+                if (active) {
+                    my_x1  = (lane_id == 0) ? batch_x1_boundary  : shfl_x1;
+                    my_v1  = (lane_id == 0) ? batch_v1_boundary  : shfl_v1;
+                    my_x21 = (lane_id == 0) ? batch_x21_boundary : shfl_x21;
+                } else {
+                    my_x1 = my_v1 = my_x21 = 0;
                 }
 
                 int8_t new_x = 0, new_v_out = 0, new_x2 = 0;
@@ -939,16 +943,6 @@ __global__ void ksw_long_shared3_kernel(
                     old_v_at_t  = v_arr[t];
                     old_x2_at_t = x2_arr[t];
 
-                    if (lane_id == 0) {
-                        my_x1  = batch_x1_boundary;
-                        my_v1  = batch_v1_boundary;
-                        my_x21 = batch_x21_boundary;
-                    } else {
-                        my_x1  = x_arr[t - 1];   /* shared */
-                        my_v1  = v_arr[t - 1];   /* shared */
-                        my_x21 = x2_arr[t - 1];  /* shared */
-                    }
-
                     my_u_prev  = u_arr[t];        /* global */
                     my_y_prev  = y_arr[t];        /* global */
                     my_y2_prev = y2_arr[t];       /* global */
@@ -961,9 +955,21 @@ __global__ void ksw_long_shared3_kernel(
                         my_score = 0;
                     }
                 } else {
-                    my_x1 = my_v1 = my_x21 = 0;
                     my_u_prev = my_y_prev = my_y2_prev = 0;
                     my_score = 0;
+                }
+
+                /* Use warp shuffle to get left-neighbor (t-1) values, eliminating
+                   3 int8 shared-mem bank-conflict reads per cell. */
+                int8_t shfl_x1  = (int8_t)__shfl_up_sync(0xffffffff, (int32_t)old_x_at_t,  1);
+                int8_t shfl_v1  = (int8_t)__shfl_up_sync(0xffffffff, (int32_t)old_v_at_t,  1);
+                int8_t shfl_x21 = (int8_t)__shfl_up_sync(0xffffffff, (int32_t)old_x2_at_t, 1);
+                if (active) {
+                    my_x1  = (lane_id == 0) ? batch_x1_boundary  : shfl_x1;
+                    my_v1  = (lane_id == 0) ? batch_v1_boundary  : shfl_v1;
+                    my_x21 = (lane_id == 0) ? batch_x21_boundary : shfl_x21;
+                } else {
+                    my_x1 = my_v1 = my_x21 = 0;
                 }
 
                 int8_t new_x = 0, new_v_out = 0, new_x2 = 0;

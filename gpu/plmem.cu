@@ -455,7 +455,7 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     static bool s_long_arena_logged = false;
     if (!s_long_arena_logged) {
         s_long_arena_logged = true;
-        fprintf(stderr,
+        PLOG_INFO(stderr,
             "[Info] Long-align arena: bt_p=%.2f GB  batch=%zu  slots=%zu"
             "  ksw_temp=%.0f MB  CIGAR=%.0f MB  bt_off=%.0f MB\n",
             bt_p_avail / (1024.0*1024.0*1024.0), MAX_LONG_BATCH, n_long_cap,
@@ -685,7 +685,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             dev_mem->short_task_batch_size = 4000;
             dev_mem->long_task_batch_size = 128;
             if (print_info)
-                fprintf(stderr, " [Arena] Align scaling failed, using defaults\n");
+                PLOG_INFO(stderr, " [Arena] Align scaling failed, using defaults\n");
         } else {
             align_size = scaled_align_size;
         }

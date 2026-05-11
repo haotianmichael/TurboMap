@@ -16,6 +16,11 @@
  * via pre-loaded registers). Between batches, a __syncwarp() + boundary save
  * prevents RAW hazards on the global u/v/x/y/x2/y2 arrays.
  *
+ * [OPT] Max-score tracking (H update + argmax) is now warp-parallel:
+ *       all 32 lanes cooperate on H[t]+=v_arr[t] and shuffle-reduce for
+ *       argmax, instead of the original lane-0-only sequential loop.
+ *       Tie-breaking matches CPU semantics (en0 wins ties via >= compare).
+ *
  * Per-slot temp buffer layout:
  *   H[tlen * int32]          — absolute H for max tracking only
  *   u[(tlen+1) * int8]       — Suzuki-Kasahara delta
@@ -193,12 +198,6 @@ __global__ void ksw_fused_persistent_kernel(
         uint8_t *target = (uint8_t*)(task_buf + buf_offset);
 
         // ========== Initialization (matching CPU ksw2_extd2_sse.c memset convention) ==========
-        // CPU does: memset(u,-q-e,tlen_*16); memset(v,-q-e,...); memset(x,-q-e,...); memset(y,-q-e,...);
-        //           memset(x2,-q2-e2,...); memset(y2,-q2-e2,...);
-        // When st0 decreases (band expands left), new positions entering the band for the first
-        // time read their delta values from these arrays.  Initializing to 0 instead of -(q+e)
-        // makes those boundary cells look like they came from a gap-free predecessor, inflating H,
-        // inflating ez_max, and causing false zdrop triggers.  Fix: match CPU's memset values.
         int8_t neg_qe  = (int8_t)(-(int)(q + e));
         int8_t neg_qe2 = (int8_t)(-(int)(q2 + e2));
         for (int i = lane_id; i < tlen; i += WARP_SIZE) {
@@ -256,15 +255,6 @@ __global__ void ksw_fused_persistent_kernel(
         // ========== Main DP Loop: Anti-diagonal Traversal ==========
         int last_st = -1, last_en = -1;
         for (int r = 0; r < qlen + tlen - 1; r++) {
-            // Backtrack-buffer bounds guard.
-            // The bt/off arrays are allocated with max_antidiag slots per task.
-            // If qlen+tlen > max_antidiag the remaining antidiagonals would
-            // write out-of-bounds, corrupting adjacent slots and causing the
-            // GPU kernel to run for excessive iterations (observed: 84s hang).
-            // Rather than corrupt memory, we treat this as an early termination
-            // (equivalent to a z-drop at the buffer limit).  Tasks that hit this
-            // cap are marked zdropped so the CPU result-write path handles them
-            // gracefully — exactly the same as the old max_sw_mat zdrop behaviour.
             if (r >= (int)max_antidiag) {
                 if (lane_id == 0) ez_zdropped = 1;
                 break;
@@ -287,7 +277,6 @@ __global__ void ksw_fused_persistent_kernel(
             // ========== Set Boundary Conditions (lane 0) ==========
             int8_t x1_boundary, v1_boundary, x21_boundary;
             if (lane_id == 0) {
-                // Left boundary: x[st0-1], v[st0-1], x2[st0-1] from previous anti-diag
                 if (st0 > 0) {
                     if (st0 - 1 >= last_st && st0 - 1 <= last_en) {
                         x1_boundary = x_arr[st0 - 1];
@@ -299,7 +288,6 @@ __global__ void ksw_fused_persistent_kernel(
                         v1_boundary = -q - e;
                     }
                 } else {
-                    // st0 == 0: initial boundary (matches CPU SSE exactly)
                     x1_boundary = -q - e;
                     x21_boundary = -q2 - e2;
                     if (r == 0) {
@@ -313,7 +301,6 @@ __global__ void ksw_fused_persistent_kernel(
                     }
                 }
 
-                // Right boundary: u[r], y[r], y2[r]
                 if (en0 >= r && r < tlen) {
                     y_arr[r] = -q - e;
                     y2_arr[r] = -q2 - e2;
@@ -328,7 +315,6 @@ __global__ void ksw_fused_persistent_kernel(
                     }
                 }
 
-                // Record backtrack range
                 if (with_cigar) {
                     off[r] = st0;
                     off_end[r] = en0;
@@ -344,12 +330,6 @@ __global__ void ksw_fused_persistent_kernel(
             uint8_t *pr = (with_cigar && cigar_buffer) ? (p_bt + (size_t)r * n_col) : NULL;
 
             // ========== Batched Parallel DP: Suzuki-Kasahara recurrence ==========
-            // Process cells in batches of WARP_SIZE to avoid RAW hazard:
-            // Within a batch, each lane pre-loads its left neighbor (x[t-1], v[t-1],
-            // x2[t-1]) from the PREVIOUS anti-diagonal's values BEFORE any lane
-            // writes to the arrays. Between batches, __syncwarp() ensures writes
-            // are visible, and the last cell's x/v/x2 become the next batch's
-            // left boundary.
             int band_size = en0 - st0 + 1;
             int8_t batch_x1_boundary = x1_boundary;
             int8_t batch_v1_boundary = v1_boundary;
@@ -357,51 +337,35 @@ __global__ void ksw_fused_persistent_kernel(
 
             for (int batch_start = 0; batch_start < band_size; batch_start += WARP_SIZE) {
                 int idx = batch_start + lane_id;
-                // Is this lane active in this batch?
                 bool active = (idx < band_size);
 
-                // Pre-load ALL values from previous anti-diagonal (r-1)
-                // BEFORE any writes happen in this batch.
-                // This includes:
-                //   - Left neighbor: x[t-1], v[t-1], x2[t-1] from r-1
-                //   - Vertical neighbor: u[t], y[t], y2[t] from r-1
-                //   - OLD values at position t: x[t], v[t], x2[t] from r-1
-                //     (needed for next batch's left boundary)
                 int8_t my_x1, my_v1, my_x21;
                 int8_t my_u_prev, my_y_prev, my_y2_prev;
                 int8_t my_score;
-                // OLD x/v/x2 at position t (from r-1), for next-batch boundary
                 int8_t old_x_at_t = 0, old_v_at_t = 0, old_x2_at_t = 0;
                 if (active) {
                     int t = st0 + idx;
                     int qi = r - t;
                     int qi_rev = qlen - 1 - qi;
 
-                    // Read OLD values at position t BEFORE any writes
-                    // (these are from anti-diagonal r-1)
                     old_x_at_t  = x_arr[t];
                     old_v_at_t  = v_arr[t];
                     old_x2_at_t = x2_arr[t];
 
-                    // Left neighbor: for lane 0 in batch, use batch boundary
                     if (lane_id == 0) {
                         my_x1  = batch_x1_boundary;
                         my_v1  = batch_v1_boundary;
                         my_x21 = batch_x21_boundary;
                     } else {
-                        // t-1 values are still from previous anti-diagonal
-                        // (not yet overwritten in this batch)
                         my_x1  = x_arr[t - 1];
                         my_v1  = v_arr[t - 1];
                         my_x21 = x2_arr[t - 1];
                     }
 
-                    // Vertical neighbor values (always from previous anti-diagonal)
                     my_u_prev  = u_arr[t];
                     my_y_prev  = y_arr[t];
                     my_y2_prev = y2_arr[t];
 
-                    // Match/mismatch score
                     if (qi >= 0 && qi < qlen && t >= 0 && t < tlen) {
                         my_score = dp_compute_score(qr[qi_rev], target[t], device_mat, m);
                     } else {
@@ -412,16 +376,12 @@ __global__ void ksw_fused_persistent_kernel(
                     my_u_prev = my_y_prev = my_y2_prev = 0;
                     my_score = 0;
                 }
-                // All reads from previous anti-diagonal are done.
-                // Now safe to compute and write.
 
-                // Declare output registers in wider scope for batch boundary passing
                 int8_t new_x = 0, new_v_out = 0, new_x2 = 0;
 
                 if (active) {
                     int t = st0 + idx;
 
-                    // DP recurrence — exactly matches CPU SSE ksw2_extd2_sse.c
                     int8_t z = my_score;
                     int8_t a  = my_x1 + my_v1;
                     int8_t b  = my_y_prev + my_u_prev;
@@ -432,7 +392,6 @@ __global__ void ksw_fused_persistent_kernel(
 
                     uint8_t d = 0;
 
-                    // State selection
                     if (!with_cigar) {
                         if (a > z) z = a;
                         if (b > z) z = b;
@@ -450,14 +409,11 @@ __global__ void ksw_fused_persistent_kernel(
                         if (!(z > b2)) { z = b2; d = 4; }
                     }
 
-                    // Suzuki-Kasahara clamp: delta per step <= sc_mch
                     if (z > sc_mch) z = sc_mch;
 
-                    // New deltas
                     int8_t new_u = z - my_v1;
                     new_v_out = z - ut;
 
-                    // Gap continuation
                     int tmp_val = z - q;
                     a -= tmp_val;
                     b -= tmp_val;
@@ -491,7 +447,6 @@ __global__ void ksw_fused_persistent_kernel(
                         if (!(0 > b2)) d |= 0x40;
                     }
 
-                    // Write back to global arrays
                     u_arr[t]  = new_u;
                     v_arr[t]  = new_v_out;
                     x_arr[t]  = new_x;
@@ -504,11 +459,6 @@ __global__ void ksw_fused_persistent_kernel(
                     }
                 }
 
-                // Pass OLD (r-1) values at last position as boundary for next batch.
-                // The next batch's lane 0 needs x[t-1], v[t-1], x2[t-1] from
-                // anti-diagonal r-1, NOT the newly computed r values.
-                // old_x_at_t / old_v_at_t / old_x2_at_t were pre-loaded from r-1
-                // before any writes in this batch.
                 int last_lane = min(WARP_SIZE - 1, band_size - batch_start - 1);
                 if (batch_start + WARP_SIZE < band_size) {
                     batch_x1_boundary  = __shfl_sync(0xffffffff, old_x_at_t,  last_lane);
@@ -519,38 +469,76 @@ __global__ void ksw_fused_persistent_kernel(
 
             } // End batch loop
 
-            // ========== Track Maximum Score (lane 0 only) ==========
-            if (lane_id == 0) {
-                if (!approx_max) {
-                    int32_t max_H, max_t_pos;
-                    if (r == 0) {
-                        H[0] = (int32_t)v_arr[0] - qe;
-                        max_H = H[0];
-                        max_t_pos = 0;
-                    } else {
-                        int32_t H_en0_old = (en0 > 0) ? H[en0 - 1] : H[en0];
+            // ========== Track Maximum Score ==========
+            if (!approx_max) {
+                // ---- Warp-parallel H update + argmax (replaces lane-0 sequential loop) ----
+                int32_t max_H;
+                int     max_t_pos;
 
-                        // Compute H[en0] FIRST, matching CPU ksw2_extd2_sse.c line 329:
-                        //   max_H = H[en0] = en0>0? H[en0-1]+u8[en0] : H[en0]+v8[en0]; max_t = en0;
-                        // This ensures the rightmost cell wins ties in max_t selection,
-                        // because the subsequent loop over st0..en0-1 uses strict >.
+                if (r == 0) {
+                    // Only one cell at r==0
+                    if (lane_id == 0) {
+                        H[0] = (int32_t)v_arr[0] - qe;
+                    }
+                    __syncwarp();
+                    max_H = H[0];
+                    max_t_pos = 0;
+                } else {
+                    // Step 1: Compute H[en0] first (uses u_arr, not v_arr)
+                    //   CPU semantics: max_H = H[en0] = en0>0 ? H[en0-1]+u[en0] : H[en0]+v[en0]
+                    //   en0 is the tie-break winner (initialized as max before strict > loop).
+                    if (lane_id == 0) {
                         if (en0 > 0) {
-                            H[en0] = H_en0_old + (int32_t)u_arr[en0];
+                            H[en0] = H[en0 - 1] + (int32_t)u_arr[en0];
                         } else {
                             H[en0] += (int32_t)v_arr[en0];
                         }
-                        max_H = H[en0];
-                        max_t_pos = en0;
+                    }
+                    __syncwarp();
 
-                        for (int t = st0; t < en0; ++t) {
-                            H[t] += (int32_t)v_arr[t];
-                            if (H[t] > max_H) {
-                                max_H = H[t];
-                                max_t_pos = t;
-                            }
+                    // Step 2: Warp-parallel H[t] += v_arr[t] for t in [st0, en0)
+                    //         + per-lane local argmax
+                    int32_t local_max_H = KSW_NEG_INF;
+                    int     local_max_t = -1;
+
+                    for (int t = st0 + lane_id; t < en0; t += WARP_SIZE) {
+                        H[t] += (int32_t)v_arr[t];
+                        if (H[t] > local_max_H) {
+                            local_max_H = H[t];
+                            local_max_t = t;
                         }
                     }
 
+                    // Step 3: Warp shuffle reduction for argmax
+                    //         Tie-break: strict > so that among [st0,en0), leftmost wins
+                    //         (matches CPU's left-to-right scan with strict >).
+                    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                        int32_t other_H = __shfl_down_sync(0xffffffff, local_max_H, offset);
+                        int     other_t = __shfl_down_sync(0xffffffff, local_max_t, offset);
+                        if (other_H > local_max_H ||
+                            (other_H == local_max_H && other_t < local_max_t)) {
+                            local_max_H = other_H;
+                            local_max_t = other_t;
+                        }
+                    }
+                    // lane 0 now holds the argmax over [st0, en0)
+
+                    // Step 4: Compare with H[en0] — en0 wins ties (CPU: initialized first, strict >)
+                    //         Use >= so en0 wins when equal to the band max.
+                    if (lane_id == 0) {
+                        int32_t H_en0_val = H[en0];
+                        if (H_en0_val >= local_max_H) {
+                            local_max_H = H_en0_val;
+                            local_max_t = en0;
+                        }
+                    }
+
+                    max_H     = __shfl_sync(0xffffffff, local_max_H, 0);
+                    max_t_pos = __shfl_sync(0xffffffff, local_max_t, 0);
+                }
+
+                // ---- Scalar bookkeeping (lane 0 only — cheap, not worth parallelizing) ----
+                if (lane_id == 0) {
                     int j = max_t_pos;
                     int i = r - j;
                     if (max_H > ez_max) {
@@ -579,8 +567,13 @@ __global__ void ksw_fused_persistent_kernel(
                     if (r == qlen + tlen - 2 && en0 == tlen - 1) {
                         ez_score = H[tlen - 1];
                     }
-                } else {
-                    // Approximate max tracking (from Suzuki-Kasahara deltas)
+
+                    last_st = st0;
+                    last_en = en0;
+                }
+            } else {
+                // Approximate max tracking (from Suzuki-Kasahara deltas) — lane 0 only
+                if (lane_id == 0) {
                     if (r > 0) {
                         if (last_H0_t >= st0 && last_H0_t <= en0 &&
                             last_H0_t + 1 >= st0 && last_H0_t + 1 <= en0) {
@@ -605,10 +598,10 @@ __global__ void ksw_fused_persistent_kernel(
                     if (r == qlen + tlen - 2 && en0 == tlen - 1) {
                         ez_score = H0;
                     }
-                }
 
-                last_st = st0;
-                last_en = en0;
+                    last_st = st0;
+                    last_en = en0;
+                }
             }
 
             int zdropped_flag = __shfl_sync(0xffffffff, ez_zdropped, 0);

@@ -307,17 +307,24 @@ static void sync_chain_impl(stream_ptr_t *sp) {
     plmem_async_d2h_long_memcpy(sp);
     cudaStreamSynchronize(cudastream);
 
-    // Merge long segment results into host f[]/p[]
-    seg_t *long_segs = sp->long_mem.long_segs_og_idx;
-    size_t long_seg_idx = 0, long_i = 0;
+    // Merge long segment results into host f[]/p[].
+    // Use long_segs_buf_idx[k].start_idx as the actual offset into f_long/p_long
+    // because the two atomicAdds in score_generation_short (total_n_long and
+    // long_seg_count) race between concurrent blocks, so segment index k may not
+    // correspond to a contiguous sequential range in f_long.
+    seg_t *long_segs_og_h  = sp->long_mem.long_segs_og_idx;
+    seg_t *long_segs_buf_h = sp->long_mem.long_segs_buf_idx;
+    size_t long_seg_idx = 0;
     for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) {
         if (sp->host_mems[uid].size == 0) continue;
         unsigned int long_segs_num = sp->host_mems[uid].long_segs_num[0];
         for (; long_seg_idx < long_segs_num; long_seg_idx++) {
-            for (size_t i = long_segs[long_seg_idx].start_idx;
-                 i < long_segs[long_seg_idx].end_idx; i++, long_i++) {
-                sp->host_mems[uid].f[i] = sp->long_mem.f_long[long_i];
-                sp->host_mems[uid].p[i] = sp->long_mem.p_long[long_i];
+            size_t orig_start = long_segs_og_h[long_seg_idx].start_idx;
+            size_t orig_end   = long_segs_og_h[long_seg_idx].end_idx;
+            size_t buf_start  = long_segs_buf_h[long_seg_idx].start_idx;
+            for (size_t j = 0; j < orig_end - orig_start; j++) {
+                sp->host_mems[uid].f[orig_start + j] = sp->long_mem.f_long[buf_start + j];
+                sp->host_mems[uid].p[orig_start + j] = sp->long_mem.p_long[buf_start + j];
             }
         }
     }

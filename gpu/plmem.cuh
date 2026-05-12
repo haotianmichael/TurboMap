@@ -85,7 +85,8 @@ typedef struct {
 
 typedef struct {
     // array size: number of cuts in the batch / long_seg_cut
-    seg_t *long_segs_og_idx;                   // start & end idx of long segs in the original micro batch
+    seg_t *long_segs_og_idx;   // start & end idx of long segs in the original micro batch
+    seg_t *long_segs_buf_idx;  // start & end idx of long segs in the long f/p buffer
     unsigned int *total_long_segs_num; // sum of mini batch long_segs_num
     size_t *total_long_segs_n; // number of anchors in all the long segs
     int32_t *f_long;   // score for long segs

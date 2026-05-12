@@ -91,7 +91,7 @@ inline __device__ int32_t comput_sc(const int32_t ai_x, const int32_t ai_y, cons
         float log_pen = dd >= 1 ? cuda_mg_log2((float)(dd + 1)) : 0.0f;
         float lin_pen = chn_pen_gap * (float)dd + chn_pen_skip * (float)dg;
         bool minorBonus = is_cdna && !is_same_sid && dr == 0;
-        bool majorAdjustment = (is_cdna && dg == dq) || !is_same_sid;
+        bool majorAdjustment = (is_cdna && dr > dq) || !is_same_sid;
         sc += minorBonus;
         sc -= (!minorBonus && majorAdjustment) ? (int)(lin_pen < log_pen ? lin_pen : log_pen) : 0;
         sc -= (!minorBonus && !majorAdjustment) ? (int)(lin_pen + 0.5f * log_pen) : 0;

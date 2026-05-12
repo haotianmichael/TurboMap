@@ -2345,124 +2345,154 @@ static void* drain_worker_fn(void *arg) {
     return NULL;
 }
 
-static void* gpu_batch_consumer(void *data) {
-    step_t *s = (step_t*)data;
+typedef struct { step_t *s; int tid; } cpu_worker_arg_t;
 
-    const int NUM_GPU_STREAMS = gpu_get_num_streams();
+static void *cpu_chain_align_thread(void *arg)
+{
+    cpu_worker_arg_t *a = (cpu_worker_arg_t*)arg;
+    step_t *s    = a->s;
+    mm_tbuf_t *b = s->buf[a->tid];
+    int is_sr    = !!(s->p->opt->flag & MM_F_SR);
+    int pe_ori   = s->p->opt->pe_ori;
+    chain_read_t read;
 
-    // CPU-only fallback: no GPU streams available (--gpu-chain not set)
-    if (NUM_GPU_STREAMS == 0) {
-        mm_tbuf_t *b = mm_tbuf_init();
-        chain_read_t read;
-        int is_sr  = !!(s->p->opt->flag & MM_F_SR);
-        int pe_ori = s->p->opt->pe_ori;
+    while (pop_seeded_read(g_seeded_queue, &read)) {
+        long seq_i  = read.seq.i;
+        int  seg_j  = read.seq.seg_id;
+        int  off    = s->seg_off[seq_i];
+        int  n_segs = read.n_seg;
 
-        while (pop_seeded_read(g_seeded_queue, &read)) {
-            long seq_i = read.seq.i;
-            int  seg_j = read.seq.seg_id;
-            int  off   = s->seg_off[seq_i];
-            int  n_segs = read.n_seg;
+        mm_map_chain(s->p->mi, s->p->opt, &read, b, NULL);
 
-            mm_map_chain(s->p->mi, s->p->opt, &read, b, NULL);
+        int n_regs0 = read.n_u;
+        uint32_t hash = read.seq.name[0] && !(s->p->opt->flag & MM_F_NO_HASH_NAME)
+                        ? __ac_X31_hash_string(read.seq.name) : 0;
+        hash ^= __ac_Wang_hash(read.seq.qlen_sum) + __ac_Wang_hash(s->p->opt->seed);
+        hash  = __ac_Wang_hash(hash);
 
-            int n_regs0 = read.n_u;
-            uint32_t hash = read.seq.name[0] && !(s->p->opt->flag & MM_F_NO_HASH_NAME)
-                            ? __ac_X31_hash_string(read.seq.name) : 0;
-            hash ^= __ac_Wang_hash(read.seq.qlen_sum) + __ac_Wang_hash(s->p->opt->seed);
-            hash  = __ac_Wang_hash(hash);
+        mm_reg1_t *regs0 = mm_gen_regs(b->km, hash, read.seq.qlen_sum, n_regs0,
+                                       read.u, read.a,
+                                       !!(s->p->opt->flag & MM_F_QSTRAND));
+        if (s->p->mi->n_alt) {
+            mm_mark_alt(s->p->mi, n_regs0, regs0);
+            mm_hit_sort(b->km, &n_regs0, regs0, s->p->opt->alt_drop);
+        }
 
-            mm_reg1_t *regs0 = mm_gen_regs(NULL, hash, read.seq.qlen_sum, n_regs0,
-                                           read.u, read.a,
-                                           !!(s->p->opt->flag & MM_F_QSTRAND));
-            if (s->p->mi->n_alt) {
-                mm_mark_alt(s->p->mi, n_regs0, regs0);
-                mm_hit_sort(NULL, &n_regs0, regs0, s->p->opt->alt_drop);
+        chain_post(s->p->opt, read.frag_gap, s->p->mi, b->km,
+                   read.seq.qlen_sum, n_segs, read.qlens,
+                   &n_regs0, regs0, read.a);
+        if (!is_sr && !(s->p->opt->flag & MM_F_QSTRAND)) {
+            mm_est_err(s->p->mi, read.seq.qlen_sum, n_regs0, regs0,
+                       read.a, read.n_mini_pos, read.mini_pos);
+            n_regs0 = mm_filter_strand_retained(n_regs0, regs0);
+        }
+
+        if (n_segs == 1) {
+            regs0 = align_regs(s->p->opt, s->p->mi, b->km,
+                               read.qlens[0], read.qseqs[0],
+                               &n_regs0, regs0, read.a);
+            regs0 = (mm_reg1_t*)realloc(regs0, sizeof(*regs0) * n_regs0);
+            mm_set_mapq(b->km, n_regs0, regs0, s->p->opt->min_chain_score,
+                        s->p->opt->a, read.rep_len, is_sr);
+            s->n_reg[off + seg_j] = n_regs0;
+            s->reg[off + seg_j]   = regs0;
+        } else {
+            int *tmp_n_reg      = &s->n_reg[off + seg_j];
+            mm_reg1_t **tmp_reg = &s->reg[off + seg_j];
+            mm_seg_t *seg = mm_seg_gen(b->km, hash, n_segs, read.qlens,
+                                       n_regs0, regs0, tmp_n_reg, tmp_reg, read.a);
+            free(regs0);
+            for (int j = 0; j < n_segs; ++j) {
+                mm_set_parent(b->km, s->p->opt->mask_level, s->p->opt->mask_len,
+                              tmp_n_reg[j], tmp_reg[j],
+                              s->p->opt->a * 2 + s->p->opt->b,
+                              s->p->opt->flag & MM_F_HARD_MLEVEL,
+                              s->p->opt->alt_drop);
+                tmp_reg[j] = align_regs(s->p->opt, s->p->mi, b->km,
+                                        read.qlens[j], read.qseqs[j],
+                                        &tmp_n_reg[j], tmp_reg[j], seg[j].a);
+                mm_set_mapq(b->km, tmp_n_reg[j], tmp_reg[j],
+                            s->p->opt->min_chain_score, s->p->opt->a,
+                            read.rep_len, is_sr);
             }
+            mm_seg_free(b->km, n_segs, seg);
+            if (n_segs == 2 && s->p->opt->pe_ori >= 0 && (s->p->opt->flag & MM_F_CIGAR))
+                mm_pair(b->km, read.frag_gap, s->p->opt->pe_bonus,
+                        s->p->opt->a * 2 + s->p->opt->b, s->p->opt->a,
+                        read.qlens, tmp_n_reg, tmp_reg);
+        }
 
-            chain_post(s->p->opt, read.frag_gap, s->p->mi, NULL,
-                       read.seq.qlen_sum, n_segs, read.qlens,
-                       &n_regs0, regs0, read.a);
-            if (!is_sr && !(s->p->opt->flag & MM_F_QSTRAND)) {
-                mm_est_err(s->p->mi, read.seq.qlen_sum, n_regs0, regs0,
-                           read.a, read.n_mini_pos, read.mini_pos);
-                n_regs0 = mm_filter_strand_retained(n_regs0, regs0);
-            }
+        for (int k = 0; k < n_segs; ++k) {
+            s->rep_len[off + seg_j + k]  = read.rep_len;
+            s->frag_gap[off + seg_j + k] = read.frag_gap;
+        }
 
-            if (n_segs == 1) {
-                regs0 = align_regs(s->p->opt, s->p->mi, NULL,
-                                   read.qlens[0], read.qseqs[0],
-                                   &n_regs0, regs0, read.a);
-                regs0 = (mm_reg1_t*)realloc(regs0, sizeof(*regs0) * n_regs0);
-                mm_set_mapq(NULL, n_regs0, regs0, s->p->opt->min_chain_score,
-                            s->p->opt->a, read.rep_len, is_sr);
-                s->n_reg[off + seg_j] = n_regs0;
-                s->reg[off + seg_j]   = regs0;
-            } else {
-                int *tmp_n_reg      = &s->n_reg[off + seg_j];
-                mm_reg1_t **tmp_reg = &s->reg[off + seg_j];
-                mm_seg_t *seg = mm_seg_gen(NULL, hash, n_segs, read.qlens,
-                                           n_regs0, regs0, tmp_n_reg, tmp_reg, read.a);
-                free(regs0);
-                for (int j = 0; j < n_segs; ++j) {
-                    mm_set_parent(NULL, s->p->opt->mask_level, s->p->opt->mask_len,
-                                  tmp_n_reg[j], tmp_reg[j],
-                                  s->p->opt->a * 2 + s->p->opt->b,
-                                  s->p->opt->flag & MM_F_HARD_MLEVEL,
-                                  s->p->opt->alt_drop);
-                    tmp_reg[j] = align_regs(s->p->opt, s->p->mi, NULL,
-                                            read.qlens[j], read.qseqs[j],
-                                            &tmp_n_reg[j], tmp_reg[j], seg[j].a);
-                    mm_set_mapq(NULL, tmp_n_reg[j], tmp_reg[j],
-                                s->p->opt->min_chain_score, s->p->opt->a,
-                                read.rep_len, is_sr);
+        if (s->p->opt->flag & MM_F_INDEPEND_SEG) {
+            int j = seg_j;
+            if (s->n_seg[seq_i] == 2 && ((j == 0 && (pe_ori>>1&1)) || (j == 1 && (pe_ori&1)))) {
+                mm_revcomp_bseq(&s->seq[off + j]);
+                for (int k = 0; k < s->n_reg[off + j]; ++k) {
+                    mm_reg1_t *r = &s->reg[off + j][k];
+                    int t = r->qs;
+                    r->qs = read.qlens[0] - r->qe;
+                    r->qe = read.qlens[0] - t;
+                    r->rev = !r->rev;
                 }
-                mm_seg_free(NULL, n_segs, seg);
-                if (n_segs == 2 && s->p->opt->pe_ori >= 0 && (s->p->opt->flag & MM_F_CIGAR))
-                    mm_pair(NULL, read.frag_gap, s->p->opt->pe_bonus,
-                            s->p->opt->a * 2 + s->p->opt->b, s->p->opt->a,
-                            read.qlens, tmp_n_reg, tmp_reg);
             }
-
-            for (int k = 0; k < n_segs; ++k) {
-                s->rep_len[off + seg_j + k]  = read.rep_len;
-                s->frag_gap[off + seg_j + k] = read.frag_gap;
-            }
-
-            if (s->p->opt->flag & MM_F_INDEPEND_SEG) {
-                int j = seg_j;
+        } else {
+            for (int j = 0; j < n_segs; ++j) {
                 if (s->n_seg[seq_i] == 2 && ((j == 0 && (pe_ori>>1&1)) || (j == 1 && (pe_ori&1)))) {
                     mm_revcomp_bseq(&s->seq[off + j]);
                     for (int k = 0; k < s->n_reg[off + j]; ++k) {
                         mm_reg1_t *r = &s->reg[off + j][k];
                         int t = r->qs;
-                        r->qs = read.qlens[0] - r->qe;
-                        r->qe = read.qlens[0] - t;
+                        r->qs = read.qlens[j] - r->qe;
+                        r->qe = read.qlens[j] - t;
                         r->rev = !r->rev;
                     }
                 }
-            } else {
-                for (int j = 0; j < n_segs; ++j) {
-                    if (s->n_seg[seq_i] == 2 && ((j == 0 && (pe_ori>>1&1)) || (j == 1 && (pe_ori&1)))) {
-                        mm_revcomp_bseq(&s->seq[off + j]);
-                        for (int k = 0; k < s->n_reg[off + j]; ++k) {
-                            mm_reg1_t *r = &s->reg[off + j][k];
-                            int t = r->qs;
-                            r->qs = read.qlens[j] - r->qe;
-                            r->qe = read.qlens[j] - t;
-                            r->rev = !r->rev;
-                        }
-                    }
-                }
             }
-
-            free(read.a);       read.a       = NULL;
-            free(read.u);       read.u       = NULL;
-            free(read.mini_pos); read.mini_pos = NULL;
-            free(read.qlens);   read.qlens   = NULL;
-            free(read.qseqs);   read.qseqs   = NULL;
         }
 
-        mm_tbuf_destroy(b);
+        free(read.a);        read.a        = NULL;
+        free(read.u);        read.u        = NULL;
+        free(read.mini_pos); read.mini_pos = NULL;
+        free(read.qlens);    read.qlens    = NULL;
+        free(read.qseqs);    read.qseqs    = NULL;
+
+        // Periodically reset km to avoid unbounded pool growth
+        if (b->km) {
+            km_stat_t kmst;
+            km_stat(b->km, &kmst);
+            if (kmst.largest > 1U<<28 ||
+                (s->p->opt->cap_kalloc > 0 && kmst.capacity > s->p->opt->cap_kalloc)) {
+                km_destroy(b->km);
+                b->km = km_init();
+            }
+        }
+    }
+    return NULL;
+}
+
+static void* gpu_batch_consumer(void *data) {
+    step_t *s = (step_t*)data;
+
+    const int NUM_GPU_STREAMS = gpu_get_num_streams();
+
+    // CPU-only fallback: no GPU streams, use n_threads parallel workers
+    if (NUM_GPU_STREAMS == 0) {
+        int n_cpu = s->p->n_threads;
+        cpu_worker_arg_t *args = (cpu_worker_arg_t*)malloc(n_cpu * sizeof(cpu_worker_arg_t));
+        pthread_t *tids = (pthread_t*)malloc(n_cpu * sizeof(pthread_t));
+        for (int i = 0; i < n_cpu; i++) {
+            args[i].s   = s;
+            args[i].tid = i;
+            pthread_create(&tids[i], NULL, cpu_chain_align_thread, &args[i]);
+        }
+        for (int i = 0; i < n_cpu; i++)
+            pthread_join(tids[i], NULL);
+        free(tids);
+        free(args);
         return NULL;
     }
 

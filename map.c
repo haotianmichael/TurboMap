@@ -476,9 +476,11 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
         for (int _di = 0; debug_reads[_di]; _di++)
             if (strcmp(qname, debug_reads[_di]) == 0) { is_debug_read = 1; break; }
         if (is_debug_read) {
+            FILE *dbg = fopen("/tmp/chain_debug.txt", "a");
+            if (!dbg) dbg = stderr;
             int best_sc = 0, best_cnt = 0, best_ci = 0;
             for (int _ci = 0; _ci < *n_regs0; _ci++) {
-                int sc = (int)((*u ? (*u)[_ci] : 0) >> 32);
+                int sc = (int)((*u && (*u)[_ci]) ? (*u)[_ci] >> 32 : 0);
                 if (sc > best_sc) { best_sc = sc; best_cnt = (int32_t)(*u)[_ci]; best_ci = _ci; }
             }
             uint32_t best_rid = 0xFFFFFFFF;
@@ -488,7 +490,7 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
                 best_rid = (uint32_t)((*a)[off].x << 1 >> 33);
             }
             const char *rname = (best_rid < (uint32_t)mi->n_seq) ? mi->seq[best_rid].name : "none";
-            fprintf(stderr, "CHAIN_DBG\t%s\tn_u=%d\tn_anc=%ld\tbest_sc=%d\tbest_cnt=%d\tchr=%s\n",
+            fprintf(dbg, "CHAIN_DBG\t%s\tn_u=%d\tn_anc=%ld\tbest_sc=%d\tbest_cnt=%d\tchr=%s\n",
                     qname, *n_regs0, (long)*n_a, best_sc, best_cnt, rname);
             int off = 0;
             for (int _ci = 0; _ci < *n_regs0 && _ci < 15; _ci++) {
@@ -496,10 +498,11 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
                 int cnt = (int32_t)((*u)[_ci]);
                 uint32_t rid = (uint32_t)((*a)[off].x << 1 >> 33);
                 const char *cn = (rid < (uint32_t)mi->n_seq) ? mi->seq[rid].name : "?";
-                fprintf(stderr, "  [%d] sc=%d cnt=%d %s\n", _ci, sc, cnt, cn);
+                fprintf(dbg, "  [%d] sc=%d cnt=%d %s\n", _ci, sc, cnt, cn);
                 off += cnt;
             }
-            fflush(stderr);
+            fflush(dbg);
+            if (dbg != stderr) fclose(dbg);
         }
     }
     mm128_v mv = {0, 0, 0};

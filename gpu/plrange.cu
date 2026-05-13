@@ -11,7 +11,6 @@
 /* kernels begin */
 __constant__ int d_max_dist_x;
 __constant__ int d_max_iter;
-__constant__ int d_cut_check_anchors;
 
 inline __device__ int64_t range_binary_search(const int32_t* ax, const int32_t* rev, int64_t i, int64_t st_end){
     int64_t st_high = st_end, st_low=i;
@@ -63,9 +62,8 @@ __global__ void range_selection_kernel_binary(const int32_t* ax, const int32_t* 
         st = range_binary_search(ax, rev, i, st);
         range[i] = st - i;
 
-        if (tid >= blockDim.x - d_cut_check_anchors &&
-            blockDim.x - tid + i <= end_idx) {
-            if (st == i) cut[cut_idx] = i+1;
+        if (st == i) {
+            atomicMin((unsigned long long*)(cut + cut_idx), (unsigned long long)(i + 1));
         }
         cut_idx++;
     }
@@ -111,8 +109,8 @@ __global__ void range_selection_kernel_naive(const int32_t* ax, const int32_t* r
         }
         range[i] = st - i;
 
-        if (tid >= blockDim.x - d_cut_check_anchors && blockDim.x - tid + i <= end_idx) {
-            if (st == i) cut[cut_idx] = i+1;
+        if (st == i) {
+            atomicMin((unsigned long long*)(cut + cut_idx), (unsigned long long)(i + 1));
         }
         cut_idx++;
     }
@@ -131,8 +129,6 @@ void plrange_upload_misc(Misc misc){
     cudaCheck();
     cudaMemcpyToSymbol(d_max_dist_x, &misc.max_dist_x, sizeof(int));
     cudaMemcpyToSymbol(d_max_iter, &misc.max_iter, sizeof(int));
-    cudaMemcpyToSymbol(d_cut_check_anchors,
-                       &range_kernel_config.cut_check_anchors, sizeof(int));
     cudaCheck();
 }
 

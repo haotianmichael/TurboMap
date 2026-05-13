@@ -4,7 +4,6 @@
 /* Range Kernel configuaration */
 typedef struct range_kernel_config_t {
     int blockdim;           // number of threads in each block
-    int cut_check_anchors;  // number of anchors to check around each cut
     int anchor_per_block;   // number of anchors assgined to one block = max_it * blockdim
 } range_kernel_config_t;
 

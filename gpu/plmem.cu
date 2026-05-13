@@ -1191,8 +1191,6 @@ int get_json_int(cJSON *json, const char name[]) {
 void plmem_config_kernels(cJSON *json) {
     cJSON *range_config_json = cJSON_GetObjectItem(json, "range_kernel");
     range_kernel_config.blockdim = get_json_int(range_config_json, "blockdim");
-    range_kernel_config.cut_check_anchors =
-        get_json_int(range_config_json, "cut_check_anchors");
     range_kernel_config.anchor_per_block =
         get_json_int(range_config_json, "anchor_per_block");
 

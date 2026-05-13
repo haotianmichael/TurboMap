@@ -346,6 +346,88 @@ static void sync_chain_impl(stream_ptr_t *sp) {
             }
         }
     }
+
+    /* [SYNC_DBG] After long-seg merge: scan chr14 anchor f[] values for diagnosis */
+    {
+        static FILE *_sf = NULL;
+        static int _call = 0;
+        if (!_sf) { _sf = fopen("/tmp/sync_debug.txt", "w"); if(_sf) setbuf(_sf, NULL); }
+        _call++;
+        if (_sf) {
+            /* Per-uid: check chr14 anchor f[] distribution */
+            for (int uid = 0; uid < score_kernel_config.micro_batch; uid++) {
+                hostMemPtr *hm = &sp->host_mems[uid];
+                if (hm->size == 0) continue;
+                size_t n = hm->total_n;
+                int n_chr14 = 0;
+                int32_t max_f_chr14 = INT32_MIN, min_f_chr14 = INT32_MAX;
+                int n_chr14_ge40 = 0, n_chr14_eq_qspan = 0, n_chr14_16_39 = 0;
+                int32_t max_f_all = INT32_MIN;
+                int q_span_val = -1;
+                size_t chr14_first = SIZE_MAX, chr14_last = 0;
+                for (size_t i = 0; i < n; i++) {
+                    int32_t xrev = hm->xrev[i];
+                    int32_t rid = xrev & 0x7FFFFFFF;
+                    int32_t fval = hm->f[i];
+                    if (fval > max_f_all) max_f_all = fval;
+                    if (rid == 13) {
+                        n_chr14++;
+                        if (fval > max_f_chr14) max_f_chr14 = fval;
+                        if (fval < min_f_chr14) min_f_chr14 = fval;
+                        if (fval >= 40) n_chr14_ge40++;
+                        else if (fval < 16) { n_chr14_eq_qspan++; if (q_span_val<0) q_span_val=fval; }
+                        else n_chr14_16_39++;
+                        if (i < chr14_first) chr14_first = i;
+                        if (i > chr14_last) chr14_last = i;
+                    }
+                }
+                if (n_chr14 > 0) {
+                    fprintf(_sf, "[SYNC_DBG] call=%d uid=%d total_n=%zu n_chr14=%d "
+                            "max_f=%d min_f=%d ge40=%d 16-39=%d le15=%d(qspan=%d) "
+                            "max_f_all=%d chr14_range=[%zu,%zu]\n",
+                            _call, uid, n, n_chr14,
+                            max_f_chr14, min_f_chr14, n_chr14_ge40,
+                            n_chr14_16_39, n_chr14_eq_qspan, q_span_val,
+                            max_f_all, chr14_first, chr14_last);
+                }
+            }
+
+            /* Check f_long: scan long segs for chr14 involvement */
+            unsigned int num_long = sp->long_mem.total_long_segs_num[0];
+            for (unsigned k = 0; k < num_long && k < 50000; k++) {
+                size_t ob = long_segs_og_h[k].start_idx;
+                size_t oe = long_segs_og_h[k].end_idx;
+                size_t bb = long_segs_buf_h[k].start_idx;
+                /* scan a few anchors of this segment to detect chr14 */
+                /* we need hm context; find which uid owns this segment */
+                size_t cumul = 0;
+                int seg_uid = -1;
+                for (int uid2 = 0; uid2 < score_kernel_config.micro_batch; uid2++) {
+                    if (sp->host_mems[uid2].size == 0) continue;
+                    unsigned int lnum = sp->host_mems[uid2].long_segs_num[0];
+                    if (k < lnum) { seg_uid = uid2; break; }
+                    (void)cumul;
+                }
+                if (seg_uid < 0) continue;
+                hostMemPtr *hm2 = &sp->host_mems[seg_uid];
+                if (ob >= hm2->total_n) continue;
+                int32_t first_xrev = hm2->xrev[ob];
+                int32_t first_rid = first_xrev & 0x7FFFFFFF;
+                if (first_rid != 13) continue;
+                /* found a chr14 long seg */
+                size_t seg_len = oe - ob;
+                int32_t max_fl = INT32_MIN, n_fl_ge40 = 0;
+                for (size_t j = 0; j < seg_len; j++) {
+                    int32_t fv = sp->long_mem.f_long[bb + j];
+                    if (fv > max_fl) max_fl = fv;
+                    if (fv >= 40) n_fl_ge40++;
+                }
+                fprintf(_sf, "[SYNC_LONG_DBG] call=%d seg=%u uid=%d "
+                        "orig=[%zu,%zu] buf=[%zu,+%zu] max_f_long=%d n_ge40=%d\n",
+                        _call, k, seg_uid, ob, oe, bb, seg_len, max_fl, n_fl_ge40);
+            }
+        }
+    }
 }
 
 /**

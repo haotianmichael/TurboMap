@@ -436,19 +436,39 @@ static void sync_chain_impl(stream_ptr_t *sp) {
                     if (range_sample[j] > max_range) max_range = range_sample[j];
                 }
 
-                /* Sample ay (query pos) values from hm2 for first few orig anchors */
-                int32_t ay0 = (ob < hm2->total_n) ? hm2->ay[ob] : -1;
-                int32_t ay1 = ((ob+1) < hm2->total_n) ? hm2->ay[ob+1] : -1;
-                int32_t ax0 = (ob < hm2->total_n) ? hm2->ax[ob] : -1;
-                int32_t ax1 = ((ob+1) < hm2->total_n) ? hm2->ax[ob+1] : -1;
-
+                /* Sample first 16 (ax, ay, rid) and f_long values */
+                int nsamp = (int)(seg_len < 16 ? seg_len : 16);
                 fprintf(_sf, "[SYNC_LONG_DBG] call=%d seg=%u uid=%d "
                         "orig=[%zu,%zu] buf=[%zu,+%zu] max_f_long=%d n_ge40=%d "
-                        "range_sample(first%zu): n0=%d npos=%d maxR=%d "
-                        "ax[0]=%d ax[1]=%d ay[0]=%d ay[1]=%d dq=%d dr=%d\n",
+                        "range_sample(first%zu): n0=%d npos=%d maxR=%d\n",
                         _call, k, seg_uid, ob, oe, bb, seg_len, max_fl, n_fl_ge40,
-                        n_sample, n_range0, n_range_pos, max_range,
-                        ax0, ax1, ay0, ay1, ay1-ay0, ax1-ax0);
+                        n_sample, n_range0, n_range_pos, max_range);
+                /* print first nsamp (ax,ay,rid,f_long) tuples */
+                for (int _s = 0; _s < nsamp && (ob+(size_t)_s) < hm2->total_n; _s++) {
+                    int32_t _ax  = hm2->ax [ob+_s];
+                    int32_t _ay  = hm2->ay [ob+_s];
+                    int32_t _xr  = hm2->xrev[ob+_s];
+                    int32_t _rid = _xr & 0x7FFFFFFF;
+                    int32_t _fl  = sp->long_mem.f_long[bb+_s];
+                    fprintf(_sf, "  [%d] ax=%d ay=%d rid=%d fl=%d\n",
+                            _s, _ax, _ay, _rid, _fl);
+                }
+                /* count valid consecutive pairs in first 512 anchors */
+                int n_valid_pairs = 0;
+                int n_check = (int)(seg_len < 512 ? seg_len : 512);
+                for (int _s = 0; _s+1 < n_check && (ob+(size_t)_s+1) < hm2->total_n; _s++) {
+                    int32_t ax_i = hm2->ax[ob+_s],   ax_j = hm2->ax[ob+_s+1];
+                    int32_t ay_i = hm2->ay[ob+_s],   ay_j = hm2->ay[ob+_s+1];
+                    int32_t xr_i = hm2->xrev[ob+_s], xr_j = hm2->xrev[ob+_s+1];
+                    int32_t dr = ax_j - ax_i, dq = ay_j - ay_i;
+                    int32_t dd = dr > dq ? dr - dq : dq - dr;
+                    int32_t max_dx = 5000, max_dy = 5000, bw_val = 500;
+                    if (xr_i == xr_j && dr > 0 && dq > 0 &&
+                        dr <= max_dx && dq <= max_dy && dd <= bw_val)
+                        n_valid_pairs++;
+                }
+                fprintf(_sf, "  valid_consec_pairs(first%d)=%d\n",
+                        n_check, n_valid_pairs);
             }
         }
     }

@@ -938,15 +938,19 @@ void plmem_reorg_input_arr(chain_read_t *reads, int n_read,
         host_mem->read_end_idx[griddim] = idx + n;
         host_mem->cut_start_idx[griddim] = cut_num;
         for (int j = 1; j < block_num; j++) {
-            cut_num += (config.anchor_per_block / config.blockdim);
+            /* +1: range kernel uses one extra cut slot (RB slot) per block */
+            cut_num += (config.anchor_per_block / config.blockdim) + 1;
             host_mem->start_idx[griddim + j] = end_idx;
             end_idx =
                 host_mem->start_idx[griddim + j] + config.anchor_per_block;
             host_mem->read_end_idx[griddim + j] = idx + n;
             host_mem->cut_start_idx[griddim + j] = cut_num;
         }
-        cut_num += (n - (block_num - 1) * config.anchor_per_block - 1) /
-                       config.blockdim;
+        /* ceiling division: ensure small reads (n <= blockdim) get ≥1 slot,
+         * plus 1 for the read-boundary cut slot; prevents cut_start_idx sharing
+         * between consecutive reads that would race and lose RB cuts. */
+        int n_last = n - (block_num - 1) * config.anchor_per_block;
+        cut_num += (n_last + config.blockdim - 1) / config.blockdim + 1;
         end_idx = idx + n;
 
         griddim += block_num;
@@ -1225,7 +1229,12 @@ void plmem_config_stream(size_t *max_range_grid_, size_t *max_num_cut_, size_t m
     size_t max_range_grid, max_num_cut;
     max_range_grid =
         (max_total_n - 1) / range_kernel_config.anchor_per_block + 1 + max_read;
-    max_num_cut = (max_total_n - 1) / range_kernel_config.blockdim + 1 + max_read;
+    /* ceiling division + 2 extra slots per read (RB slot + one overflow guard)
+     * matches the corrected plmem_reorg_input_arr allocation */
+    max_num_cut = (max_total_n + range_kernel_config.blockdim - 1) /
+                      range_kernel_config.blockdim +
+                  3 * max_read +
+                  (max_total_n / range_kernel_config.anchor_per_block + 1);
     *max_range_grid_ = max_range_grid;
     *max_num_cut_ = max_num_cut;
 

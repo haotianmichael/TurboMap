@@ -32,7 +32,7 @@ typedef struct {
 
 typedef struct {
     int max_iter, max_dist_x, max_dist_y, max_skip, bw, min_cnt, min_score,
-        is_cdna, n_seg;
+        is_cdna, n_seg, q_span;
     float chn_pen_gap, chn_pen_skip;
 } Misc;
 

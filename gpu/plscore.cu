@@ -33,8 +33,8 @@ __device__ int32_t original_comput_sc(const int32_t ai_x, const int32_t ai_y, co
                                 const int8_t sidi,  const int8_t sidj,
                                 int32_t max_dist_x, int32_t max_dist_y,
                                 int32_t bw, float chn_pen_gap,
-                                float chn_pen_skip, int is_cdna, int n_seg) {
-    int32_t dq = ai_y - aj_y, dr, dd, dg, q_span, sc;
+                                float chn_pen_skip, int is_cdna, int n_seg, int32_t q_span) {
+    int32_t dq = ai_y - aj_y, dr, dd, dg, sc;
     if (dq <= 0 || dq > max_dist_x) return INT32_MIN;
     dr = ai_x - aj_x;
     if (sidi == sidj && (dr == 0 || dq > max_dist_y)) return INT32_MIN;
@@ -43,7 +43,6 @@ __device__ int32_t original_comput_sc(const int32_t ai_x, const int32_t ai_y, co
     if (n_seg > 1 && !is_cdna && sidi == sidj && dr > max_dist_y)
         return INT32_MIN;  // nseg = 1 by default
     dg = dr < dq ? dr : dq;
-    q_span = MM_QSPAN;
     sc = q_span < dg ? q_span : dg;
     if (dd || dg > q_span) {
         float lin_pen, log_pen;
@@ -71,22 +70,23 @@ inline __device__ int32_t comput_sc(const int32_t ai_x, const int32_t ai_y, cons
                                 const int32_t sidi,  const int32_t sidj,
                                 const int32_t max_dist_x, const int32_t max_dist_y,
                                 const int32_t bw, const float chn_pen_gap,
-                                const float chn_pen_skip, const int is_cdna, const int n_seg) {
+                                const float chn_pen_skip, const int is_cdna, const int n_seg,
+                                const int32_t q_span) {
     const bool is_same_sid = sidi == sidj;
     const int32_t dq = ai_y - aj_y, dr = ai_x - aj_x;
     const int32_t dd = __sad(dr, dq, 0);
 
     if (dq <= 0 || dq > max_dist_x ||
-        (is_same_sid && (dr == 0 || 
-                        dq > max_dist_y || 
-                        dd > bw || 
+        (is_same_sid && (dr == 0 ||
+                        dq > max_dist_y ||
+                        dd > bw ||
                         (n_seg > 1 && !is_cdna && dr > max_dist_y))))
         return INT32_MIN;
 
     const int32_t dg = dr < dq ? dr : dq;
-    int32_t sc = MM_QSPAN < dg ? MM_QSPAN : dg;
-    
-    if (dd || dg > MM_QSPAN) {
+    int32_t sc = q_span < dg ? q_span : dg;
+
+    if (dd || dg > q_span) {
         // Use float throughout to match CPU comput_sc precision
         float log_pen = dd >= 1 ? cuda_mg_log2((float)(dd + 1)) : 0.0f;
         float lin_pen = chn_pen_gap * (float)dd + chn_pen_skip * (float)dg;
@@ -102,18 +102,19 @@ inline __device__ int32_t comput_sc(const int32_t ai_x, const int32_t ai_y, cons
 
 /* arithmetic functions end */
 
-inline __device__ void compute_sc_seg_one_wf(const int32_t* anchors_x, const int32_t* anchors_y, const int8_t* sid, const int32_t* range, 
+inline __device__ void compute_sc_seg_one_wf(const int32_t* anchors_x, const int32_t* anchors_y, const int8_t* sid, const int32_t* range,
                     const size_t start_idx, const size_t end_idx,
                     int32_t* f, uint16_t* p
 ){
     const Misc blk_misc = misc;
+    const int32_t q_span = blk_misc.q_span;
     int tid = threadIdx.x;
     // init f and p
     for (size_t i=start_idx+tid; i < end_idx; i += blockDim.x) {
-        f[i] = MM_QSPAN;
+        f[i] = q_span;
         p[i] = 0;
     }
-        __syncwarp();
+    __syncwarp();
     for (size_t i=start_idx; i < end_idx; i++) {
         int32_t range_i = range[i];
         for (int32_t j = tid; j < range_i; j += blockDim.x) {
@@ -125,31 +126,29 @@ inline __device__ void compute_sc_seg_one_wf(const int32_t* anchors_x, const int
                                 sid [i+j+1],
                                 sid [i],
                                 blk_misc.max_dist_x, blk_misc.max_dist_y, blk_misc.bw, blk_misc.chn_pen_gap,
-                                blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg);
+                                blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg, q_span);
             if (sc == INT32_MIN) continue;
             sc += f[i];
-            if (sc >= f[i+j+1] && sc != MM_QSPAN) {
+            if (sc >= f[i+j+1] && sc != q_span) {
                 f[i+j+1] = sc;
                 p[i+j+1] = j+1;
-
             }
         }
         __syncwarp();
     }
-    
 }
 
 
-inline __device__ void compute_sc_seg_multi_wf(const int32_t* anchors_x, const int32_t* anchors_y, const int8_t* sid, const int32_t* range, 
+inline __device__ void compute_sc_seg_multi_wf(const int32_t* anchors_x, const int32_t* anchors_y, const int8_t* sid, const int32_t* range,
                     const size_t start_idx, const size_t end_idx,
                     int32_t* f, uint16_t* p
 ){
     const Misc blk_misc = misc;
+    const int32_t q_span = blk_misc.q_span;
     int tid = threadIdx.x;
-    int bid = blockIdx.x;
     // init f and p
     for (size_t i=start_idx+tid; i < end_idx; i += blockDim.x) {
-        f[i] = MM_QSPAN;
+        f[i] = q_span;
         p[i] = 0;
     }
     __syncthreads();
@@ -157,25 +156,23 @@ inline __device__ void compute_sc_seg_multi_wf(const int32_t* anchors_x, const i
         int32_t range_i = range[i];
         for (int32_t j = tid; j < range_i; j += blockDim.x) {
             int32_t sc = comput_sc(
-                                anchors_x[i+j+1], 
-                                anchors_y[i+j+1], 
-                                anchors_x[i], 
+                                anchors_x[i+j+1],
+                                anchors_y[i+j+1],
+                                anchors_x[i],
                                 anchors_y[i],
                                 sid [i+j+1],
                                 sid [i],
-                                blk_misc.max_dist_x, blk_misc.max_dist_y, blk_misc.bw, blk_misc.chn_pen_gap, 
-                                blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg);
+                                blk_misc.max_dist_x, blk_misc.max_dist_y, blk_misc.bw, blk_misc.chn_pen_gap,
+                                blk_misc.chn_pen_skip, blk_misc.is_cdna, blk_misc.n_seg, q_span);
             if (sc == INT32_MIN) continue;
             sc += f[i];
-            if (sc >= f[i+j+1] && sc != MM_QSPAN) {
+            if (sc >= f[i+j+1] && sc != q_span) {
                 f[i+j+1] = sc;
                 p[i+j+1] = j+1;
-
             }
         }
         __syncthreads();
     }
-    
 }
 
 /* kernels begin */

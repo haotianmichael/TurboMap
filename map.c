@@ -440,6 +440,7 @@ Misc build_misc(const mm_idx_t *mi, const mm_mapopt_t *opt, const int64_t qlen_s
     misc.min_score = opt->min_chain_score;
     misc.is_cdna = is_splice;
     misc.n_seg = n_seg;
+    misc.q_span = mi->k;
 
     misc.chn_pen_gap = chn_pen_gap;
     misc.chn_pen_skip = chn_pen_skip;

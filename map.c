@@ -647,6 +647,45 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
 			kfree(km, mv.a);
 		}
     }
+    /* Chain debug AFTER bw_long rescue — compare with [GPU] BEFORE block above */
+    {
+        static const char *dbg_reads2[] = {
+            "08c178a9-9054-40c4-87fa-0c636d52df41",
+            "299e4b51-a23d-444d-a888-f08804a03cf4",
+            "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+            "3262e09f-9576-411f-b49c-4343f2822652",
+            NULL
+        };
+        int _is_dbg2 = 0;
+        for (int _di = 0; dbg_reads2[_di]; _di++)
+            if (strcmp(qname, dbg_reads2[_di]) == 0) { _is_dbg2 = 1; break; }
+        if (_is_dbg2 && *u && *a && *n_regs0 > 0) {
+            FILE *dbg = fopen("/tmp/chain_debug.txt", "a");
+            if (!dbg) dbg = stderr;
+            int best_sc = 0, best_cnt = 0, best_ci = 0;
+            for (int _ci = 0; _ci < *n_regs0; _ci++) {
+                int sc = (int)((*u)[_ci] >> 32);
+                if (sc > best_sc) { best_sc = sc; best_cnt = (int32_t)(*u)[_ci]; best_ci = _ci; }
+            }
+            uint32_t best_rid = 0xFFFFFFFF;
+            if (*n_regs0 > 0) {
+                int _off = 0;
+                for (int _ci = 0; _ci < best_ci; _ci++) _off += (int32_t)((*u)[_ci]);
+                best_rid = (uint32_t)((*a)[_off].x << 1 >> 33);
+            }
+            const char *rname = (best_rid < (uint32_t)mi->n_seq) ? mi->seq[best_rid].name : "none";
+            /* count chr14 anchors in compacted array */
+            int n_chr14 = 0;
+            for (int _ai = 0; _ai < *n_a; _ai++) {
+                uint32_t rid = (uint32_t)((*a)[_ai].x << 1 >> 33);
+                if (rid == 13) n_chr14++;  /* rid=13 = chr14 (0-indexed) */
+            }
+            fprintf(dbg, "[GPU_POST] CHAIN_DBG\t%s\tn_u=%d\tn_anc=%ld\tbest_sc=%d\tbest_cnt=%d\tchr=%s\tn_chr14_anc=%d\n",
+                    qname, *n_regs0, (long)*n_a, best_sc, best_cnt, rname, n_chr14);
+            fflush(dbg);
+            if (dbg != stderr) fclose(dbg);
+        }
+    }
     *frag_gap = misc.max_dist_x;
 }
 

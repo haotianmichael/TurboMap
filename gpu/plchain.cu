@@ -230,6 +230,24 @@ static int launch_chain_impl(chain_read_t *reads, int n_read,
         size_t cut_num = 0;
         int griddim = 0;
         for (read_end = read_start; read_end < n_read; read_end++) {
+            /* Debug: log input anchor count for target reads */
+            {
+                static const char *_dbgn[] = {
+                    "08c178a9-9054-40c4-87fa-0c636d52df41",
+                    "299e4b51-a23d-444d-a888-f08804a03cf4",
+                    "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+                    "3262e09f-9576-411f-b49c-4343f2822652", NULL };
+                for (int _di = 0; _dbgn[_di]; _di++)
+                    if (strcmp(reads[read_end].seq.name, _dbgn[_di]) == 0) {
+                        FILE *_f = fopen("/tmp/chain_debug.txt","a");
+                        if (!_f) _f = stderr;
+                        fprintf(_f, "[GPU_INPUT] %s  n_anchors=%ld  uid=%d  batch_n_so_far=%zu  max=%zu\n",
+                                reads[read_end].seq.name, (long)reads[read_end].n,
+                                uid, batch_n, stream_setup.max_anchors_stream);
+                        fflush(_f); if (_f != stderr) fclose(_f);
+                        break;
+                    }
+            }
             if (batch_n + reads[read_end].n > stream_setup.max_anchors_stream) break;
             batch_n += reads[read_end].n;
             int an_p_block = range_kernel_config.anchor_per_block;

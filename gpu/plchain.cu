@@ -422,9 +422,33 @@ static void sync_chain_impl(stream_ptr_t *sp) {
                     if (fv > max_fl) max_fl = fv;
                     if (fv >= 40) n_fl_ge40++;
                 }
+
+                /* Direct D2H readback of d_range_long for first 128 anchors */
+                int32_t range_sample[128];
+                size_t n_sample = seg_len < 128 ? seg_len : 128;
+                cudaMemcpy(range_sample, sp->dev_mem.d_range_long + bb,
+                           n_sample * sizeof(int32_t), cudaMemcpyDeviceToHost);
+                int n_range0 = 0, n_range_pos = 0;
+                int32_t max_range = 0;
+                for (size_t j = 0; j < n_sample; j++) {
+                    if (range_sample[j] == 0) n_range0++;
+                    else n_range_pos++;
+                    if (range_sample[j] > max_range) max_range = range_sample[j];
+                }
+
+                /* Sample ay (query pos) values from hm2 for first few orig anchors */
+                int32_t ay0 = (ob < hm2->total_n) ? hm2->ay[ob] : -1;
+                int32_t ay1 = ((ob+1) < hm2->total_n) ? hm2->ay[ob+1] : -1;
+                int32_t ax0 = (ob < hm2->total_n) ? hm2->ax[ob] : -1;
+                int32_t ax1 = ((ob+1) < hm2->total_n) ? hm2->ax[ob+1] : -1;
+
                 fprintf(_sf, "[SYNC_LONG_DBG] call=%d seg=%u uid=%d "
-                        "orig=[%zu,%zu] buf=[%zu,+%zu] max_f_long=%d n_ge40=%d\n",
-                        _call, k, seg_uid, ob, oe, bb, seg_len, max_fl, n_fl_ge40);
+                        "orig=[%zu,%zu] buf=[%zu,+%zu] max_f_long=%d n_ge40=%d "
+                        "range_sample(first%zu): n0=%d npos=%d maxR=%d "
+                        "ax[0]=%d ax[1]=%d ay[0]=%d ay[1]=%d dq=%d dr=%d\n",
+                        _call, k, seg_uid, ob, oe, bb, seg_len, max_fl, n_fl_ge40,
+                        n_sample, n_range0, n_range_pos, max_range,
+                        ax0, ax1, ay0, ay1, ay1-ay0, ax1-ax0);
             }
         }
     }

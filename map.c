@@ -463,9 +463,7 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
 
     int i;
 
-#ifdef DEBUG_GPU_CHAINS
-    /* Print chain debug info for selected reads to help diagnose wrong-chromosome issues.
-     * Enable with: make EXTRA_FLAGS=-DDEBUG_GPU_CHAINS */
+    /* Chain debug for wrong-chromosome investigation — remove after diagnosis */
     {
         static const char *debug_reads[] = {
             "08c178a9-9054-40c4-87fa-0c636d52df41",
@@ -477,35 +475,33 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
         int is_debug_read = 0;
         for (int _di = 0; debug_reads[_di]; _di++)
             if (strcmp(qname, debug_reads[_di]) == 0) { is_debug_read = 1; break; }
-        if (is_debug_read && *n_regs0 > 0 && *u && *a) {
+        if (is_debug_read) {
             int best_sc = 0, best_cnt = 0, best_ci = 0;
             for (int _ci = 0; _ci < *n_regs0; _ci++) {
-                int sc = (int)((*u)[_ci] >> 32);
+                int sc = (int)((*u ? (*u)[_ci] : 0) >> 32);
                 if (sc > best_sc) { best_sc = sc; best_cnt = (int32_t)(*u)[_ci]; best_ci = _ci; }
             }
-            /* find rid of first anchor in best chain */
+            uint32_t best_rid = 0xFFFFFFFF;
+            if (*n_regs0 > 0 && *u && *a) {
+                int off = 0;
+                for (int _ci = 0; _ci < best_ci; _ci++) off += (int32_t)((*u)[_ci]);
+                best_rid = (uint32_t)((*a)[off].x << 1 >> 33);
+            }
+            const char *rname = (best_rid < (uint32_t)mi->n_seq) ? mi->seq[best_rid].name : "none";
+            fprintf(stderr, "CHAIN_DBG\t%s\tn_u=%d\tn_anc=%ld\tbest_sc=%d\tbest_cnt=%d\tchr=%s\n",
+                    qname, *n_regs0, (long)*n_a, best_sc, best_cnt, rname);
             int off = 0;
-            for (int _ci = 0; _ci < best_ci; _ci++) off += (int32_t)((*u)[_ci]);
-            uint32_t best_rid = (uint32_t)((*a)[off].x << 1 >> 33);
-            const char *rname = best_rid < (uint32_t)mi->n_seq ? mi->seq[best_rid].name : "?";
-            fprintf(stderr, "GPU_CHAIN_DEBUG\t%s\tn_u=%d\tn_anchors=%ld"
-                    "\tbest_sc=%d\tbest_cnt=%d\tbest_rid=%u(%s)\n",
-                    qname, *n_regs0, (long)*n_a,
-                    best_sc, best_cnt, best_rid, rname);
-            /* print top-10 chains */
-            off = 0;
-            for (int _ci = 0; _ci < *n_regs0 && _ci < 10; _ci++) {
+            for (int _ci = 0; _ci < *n_regs0 && _ci < 15; _ci++) {
                 int sc = (int)((*u)[_ci] >> 32);
                 int cnt = (int32_t)((*u)[_ci]);
                 uint32_t rid = (uint32_t)((*a)[off].x << 1 >> 33);
-                const char *cn = rid < (uint32_t)mi->n_seq ? mi->seq[rid].name : "?";
-                fprintf(stderr, "  chain[%d] sc=%d cnt=%d rid=%u(%s)\n",
-                        _ci, sc, cnt, rid, cn);
+                const char *cn = (rid < (uint32_t)mi->n_seq) ? mi->seq[rid].name : "?";
+                fprintf(stderr, "  [%d] sc=%d cnt=%d %s\n", _ci, sc, cnt, cn);
                 off += cnt;
             }
+            fflush(stderr);
         }
     }
-#endif /* DEBUG_GPU_CHAINS */
     mm128_v mv = {0, 0, 0};
 
 #ifdef DEBUG_CHAIN_COMPARE

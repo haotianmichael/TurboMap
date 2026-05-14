@@ -765,6 +765,34 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
         }
         *frag_gap = max_chain_gap_ref;
         gpu_rechained = 1;
+        // Debug: print rechain result for known wrong-position reads
+        {
+            static const char *_wrpx[] = {
+                "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+                "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+                "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
+                "05e5edac-25af-42c2-9a2f-43712ca32c35",
+                "0bd5ad43-1fe4-4d97-8bcb-dae57f05608f",
+                NULL
+            };
+            int _isx = 0;
+            for (int _di = 0; _wrpx[_di]; _di++)
+                if (strcmp(qname, _wrpx[_di]) == 0) { _isx = 1; break; }
+            if (_isx) {
+                int32_t best_qpos = -1;
+                if (*n_regs0 > 0 && *u && *a) {
+                    int _off = 0, _bsc = 0, _bi = 0;
+                    for (int _ci = 0; _ci < *n_regs0; _ci++) {
+                        int _sc = (int)((*u)[_ci] >> 32);
+                        if (_sc > _bsc) { _bsc = _sc; _bi = _off; }
+                        _off += (int32_t)((*u)[_ci]);
+                    }
+                    best_qpos = (int32_t)(*a)[_bi].y;
+                }
+                fprintf(stderr, "[POST_RECHAIN] %s n_regs0=%d a=%p u=%p best_first_qpos=%d\n",
+                        qname, *n_regs0, (void*)*a, (void*)*u, best_qpos);
+            }
+        }
     } else {
     // Long-read rescue: if the best chain leaves a large query portion
     // uncovered, redo the chain with bw_long using a second mg_lchain_dp
@@ -2208,6 +2236,30 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
     n_a = mm_squeeze_a(km, skele_n_regs, regs0, a);
 
+    // Debug: for known wrong-position reads, print first anchor coords after squeeze
+    {
+        static const char *_dbg_reads[] = {
+            "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+            "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+            "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
+            "05e5edac-25af-42c2-9a2f-43712ca32c35",
+            "0bd5ad43-1fe4-4d97-8bcb-dae57f05608f",
+            NULL
+        };
+        int _is_dbg = 0;
+        for (int _di = 0; _dbg_reads[_di]; _di++)
+            if (strcmp(qname, _dbg_reads[_di]) == 0) { _is_dbg = 1; break; }
+        if (_is_dbg && skele_n_regs > 0 && n_a > 0) {
+            uint32_t rid0 = (uint32_t)(a[regs0[0].as].x << 1 >> 33);
+            int32_t  qpos = (int32_t)a[regs0[0].as].y;
+            int32_t  rpos = (int32_t)a[regs0[0].as].x;
+            const char *chr = (rid0 < (uint32_t)mi->n_seq) ? mi->seq[rid0].name : "?";
+            fprintf(stderr, "[PRE_ALIGN_GPU] %s n_regs=%d n_a=%d "
+                    "reg0.as=%d first_anc_qpos=%d first_anc_rpos=%d chr=%s\n",
+                    qname, skele_n_regs, n_a, regs0[0].as, qpos, rpos, chr);
+        }
+    }
+
     // Set up read context for GPU processing
     read_align_ctx_t *ctx = &gpu_batch->read_ctxs[read_idx];
     ctx->regs0 = regs0;
@@ -2300,6 +2352,25 @@ static void cpu_align_rechained_read(const mm_idx_t *mi, const mm_mapopt_t *opt,
     int n_regs0   = read_->n_u;
     uint64_t *u   = read_->u;
     mm128_t  *a   = read_->a;
+
+    // Debug: print what CPU alignment sees for known wrong-position reads
+    {
+        static const char *_dbg2[] = {
+            "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+            "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+            "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
+            "05e5edac-25af-42c2-9a2f-43712ca32c35",
+            "0bd5ad43-1fe4-4d97-8bcb-dae57f05608f",
+            NULL
+        };
+        const char *_qn = read_->seq.name;
+        int _is_dbg2 = 0;
+        for (int _di = 0; _dbg2[_di]; _di++)
+            if (_qn && strcmp(_qn, _dbg2[_di]) == 0) { _is_dbg2 = 1; break; }
+        if (_is_dbg2)
+            fprintf(stderr, "[CPU_ALIGN] %s n_regs0=%d u=%p a=%p\n",
+                    _qn, n_regs0, (void*)u, (void*)a);
+    }
 
     if (n_regs0 == 0 || u == NULL || a == NULL) {
         ctx->regs0  = NULL;

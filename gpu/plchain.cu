@@ -236,7 +236,13 @@ static int launch_chain_impl(chain_read_t *reads, int n_read,
                     "08c178a9-9054-40c4-87fa-0c636d52df41",
                     "299e4b51-a23d-444d-a888-f08804a03cf4",
                     "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
-                    "3262e09f-9576-411f-b49c-4343f2822652", NULL };
+                    "3262e09f-9576-411f-b49c-4343f2822652",
+                    "0d2cacd8-ebbe-454a-bcd7-d2dfcda7a3b0",
+                    "18364462-1d40-4ce7-9b69-0b91b60fac31",
+                    "1be1f2c5-3ab8-4914-a214-57ffcfd7ac6e",
+                    "2f0f3d7a-c819-4e04-8561-1fee5940cfbc",
+                    "30464c0a-df43-44c9-9640-d44ca7ce66e1",
+                    NULL };
                 for (int _di = 0; _dbgn[_di]; _di++)
                     if (strcmp(reads[read_end].seq.name, _dbgn[_di]) == 0) {
                         FILE *_f = fopen("/tmp/chain_debug.txt","a");

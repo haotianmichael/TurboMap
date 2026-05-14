@@ -651,6 +651,11 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
         read->a_full = NULL;
         read->n_full = 0;
 
+        // Sort anchors by (target, query) position before chaining.
+        // The CPU path sorts once before mm_map_chain; a_full should already
+        // be sorted, but re-sort defensively in case GPU pipeline reorders.
+        radix_sort_128x(*a, (*a) + *n_a);
+
         // First pass: narrow bandwidth — mirrors mm_map_chain line 1.
         *a = mg_lchain_dp(max_chain_gap_ref, max_chain_gap_qry, opt->bw,
                           opt->max_chain_skip, opt->max_chain_iter,
@@ -717,6 +722,45 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
                                   opt->min_cnt, opt->min_chain_score,
                                   misc.chn_pen_gap, misc.chn_pen_skip,
                                   misc.is_cdna, n_segs, *n_a, *a, n_regs0, u, km);
+                // Debug: log second-pass result
+                {
+                    static const char *_wrp3[] = {
+                        "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+                        "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+                        "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
+                        "0d2cacd8-ebbe-454a-bcd7-d2dfcda7a3b0",
+                        "18364462-1d40-4ce7-9b69-0b91b60fac31",
+                        "1be1f2c5-3ab8-4914-a214-57ffcfd7ac6e",
+                        "2f0f3d7a-c819-4e04-8561-1fee5940cfbc",
+                        "30464c0a-df43-44c9-9640-d44ca7ce66e1",
+                        NULL
+                    };
+                    int _iswrp3 = 0;
+                    for (int _di = 0; _wrp3[_di]; _di++)
+                        if (strcmp(qname, _wrp3[_di]) == 0) { _iswrp3 = 1; break; }
+                    if (_iswrp3) {
+                        FILE *_f3 = fopen("/tmp/rechain_debug.txt", "a");
+                        if (!_f3) _f3 = stderr;
+                        uint32_t best_rid = 0xFFFFFFFF;
+                        int best_sc = 0;
+                        if (*n_regs0 > 0 && *u && *a) {
+                            for (int _ci = 0; _ci < *n_regs0; _ci++) {
+                                int sc = (int)((*u)[_ci] >> 32);
+                                if (sc > best_sc) {
+                                    best_sc = sc;
+                                    int off = 0;
+                                    for (int _k = 0; _k < _ci; _k++) off += (int32_t)((*u)[_k]);
+                                    best_rid = (uint32_t)((*a)[off].x << 1 >> 33);
+                                }
+                            }
+                        }
+                        const char *rname2 = (best_rid < (uint32_t)mi->n_seq) ? mi->seq[best_rid].name : "?";
+                        fprintf(_f3, "[RECHAIN_P2] %s n_regs0=%d best_sc=%d chr=%s bw_long=%d\n",
+                                qname, *n_regs0, best_sc, rname2, opt->bw_long);
+                        fflush(_f3);
+                        if (_f3 != stderr) fclose(_f3);
+                    }
+                }
             }
         }
         *frag_gap = max_chain_gap_ref;
@@ -790,6 +834,8 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
             "1be1f2c5-3ab8-4914-a214-57ffcfd7ac6e",
             "2f0f3d7a-c819-4e04-8561-1fee5940cfbc",
             "30464c0a-df43-44c9-9640-d44ca7ce66e1",
+            "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+            "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
             NULL
         };
         int _is_dbg2 = 0;
@@ -913,6 +959,8 @@ void mm_map_chain(const mm_idx_t *mi, const mm_mapopt_t *opt,
             "1be1f2c5-3ab8-4914-a214-57ffcfd7ac6e",
             "2f0f3d7a-c819-4e04-8561-1fee5940cfbc",
             "30464c0a-df43-44c9-9640-d44ca7ce66e1",
+            "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+            "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
             NULL
         };
         int _is_dbg = 0;

@@ -765,7 +765,6 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
         }
         *frag_gap = max_chain_gap_ref;
         gpu_rechained = 1;
-        read->use_cpu_align = 1;  // GPU KSW uses narrow bw; use CPU KSW for accuracy
     } else {
     // Long-read rescue: if the best chain leaves a large query portion
     // uncovered, redo the chain with bw_long using a second mg_lchain_dp

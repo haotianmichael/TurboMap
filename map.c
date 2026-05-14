@@ -597,6 +597,25 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
     // two-pass algorithm as mm_map_chain (mg_lchain_dp(bw) then optionally
     // mg_lchain_dp(bw_long)).  This produces results identical to the CPU
     // reference regardless of what the GPU DP produced.
+    {
+        static const char *_wrp[] = {
+            "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+            "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+            "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
+            NULL
+        };
+        int _iswrp = 0;
+        for (int _di = 0; _wrp[_di]; _di++)
+            if (strcmp(qname, _wrp[_di]) == 0) { _iswrp = 1; break; }
+        if (_iswrp) {
+            FILE *_f = fopen("/tmp/rechain_debug.txt", "a");
+            if (!_f) _f = stderr;
+            fprintf(_f, "[RECHAIN] %s a_full=%p n_full=%ld n_a=%ld n_regs0=%d\n",
+                    qname, (void*)read->a_full, (long)read->n_full, (long)*n_a, *n_regs0);
+            fflush(_f);
+            if (_f != stderr) fclose(_f);
+        }
+    }
     if (read->a_full != NULL) {
         int max_chain_gap_qry, max_chain_gap_ref;
         int is_sr = !!(opt->flag & MM_F_SR);
@@ -626,6 +645,41 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
                           opt->min_cnt, opt->min_chain_score,
                           misc.chn_pen_gap, misc.chn_pen_skip,
                           misc.is_cdna, n_segs, *n_a, *a, n_regs0, u, km);
+
+        // Debug: log first-pass result for wrong-position reads
+        {
+            static const char *_wrp2[] = {
+                "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+                "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+                "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
+                NULL
+            };
+            int _iswrp2 = 0;
+            for (int _di = 0; _wrp2[_di]; _di++)
+                if (strcmp(qname, _wrp2[_di]) == 0) { _iswrp2 = 1; break; }
+            if (_iswrp2) {
+                FILE *_f2 = fopen("/tmp/rechain_debug.txt", "a");
+                if (!_f2) _f2 = stderr;
+                uint32_t best_rid = 0xFFFFFFFF;
+                int best_sc = 0;
+                if (*n_regs0 > 0 && *u && *a) {
+                    for (int _ci = 0; _ci < *n_regs0; _ci++) {
+                        int sc = (int)((*u)[_ci] >> 32);
+                        if (sc > best_sc) {
+                            best_sc = sc;
+                            int off = 0;
+                            for (int _k = 0; _k < _ci; _k++) off += (int32_t)((*u)[_k]);
+                            best_rid = (uint32_t)((*a)[off].x << 1 >> 33);
+                        }
+                    }
+                }
+                const char *rname = (best_rid < (uint32_t)mi->n_seq) ? mi->seq[best_rid].name : "?";
+                fprintf(_f2, "[RECHAIN_P1] %s n_regs0=%d best_sc=%d chr=%s bw=%d bw_long=%d\n",
+                        qname, *n_regs0, best_sc, rname, opt->bw, opt->bw_long);
+                fflush(_f2);
+                if (_f2 != stderr) fclose(_f2);
+            }
+        }
 
         // Second pass: wider bandwidth when first chain leaves large uncovered
         // query region — mirrors mm_map_chain bw_long rescue.

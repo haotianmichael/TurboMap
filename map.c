@@ -462,6 +462,7 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
     mm128_t **a = &read->a;
 
     int i;
+    int gpu_rechained = 0;
 
     /* Chain debug for wrong-chromosome investigation — remove after diagnosis */
     {
@@ -592,33 +593,64 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
     return;
 #endif /* DEBUG_CHAIN_COMPARE */
 
-    // GPU-specific rescue: when GPU backtracking discarded many anchors (e.g.
-    // short sub-segments all below min_score), rerun lchain_dp on the full
-    // original anchor array with bw_long so that the correct chromosome can
-    // still be found. Triggered when GPU kept fewer than half the original
-    // anchors (n_full >= 2 * n_a). This runs regardless of n_regs0 so it
-    // also fires when GPU produced only one surviving chain.
-    if (read->a_full != NULL &&
-        read->n_full >= 2 * *n_a &&
-        opt->bw_long > opt->bw &&
-        (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
-        n_segs == 1) {
+    // GPU reads: unconditionally redo chaining on CPU using the exact same
+    // two-pass algorithm as mm_map_chain (mg_lchain_dp(bw) then optionally
+    // mg_lchain_dp(bw_long)).  This produces results identical to the CPU
+    // reference regardless of what the GPU DP produced.
+    if (read->a_full != NULL) {
+        int max_chain_gap_qry, max_chain_gap_ref;
+        int is_sr = !!(opt->flag & MM_F_SR);
+        if (is_sr)
+            max_chain_gap_qry = *qlen_sum > opt->max_gap ? *qlen_sum : opt->max_gap;
+        else
+            max_chain_gap_qry = opt->max_gap;
+        if (opt->max_gap_ref > 0)
+            max_chain_gap_ref = opt->max_gap_ref;
+        else if (opt->max_frag_len > 0) {
+            max_chain_gap_ref = opt->max_frag_len - *qlen_sum;
+            if (max_chain_gap_ref < opt->max_gap) max_chain_gap_ref = opt->max_gap;
+        } else
+            max_chain_gap_ref = opt->max_gap;
+
+        // Discard GPU chain results and restore full original anchor array.
         if (*u) { kfree(km, *u); *u = NULL; }
         if (*a) { kfree(km, *a); }
-        *a = read->a_full;
-        *n_a = read->n_full;
+        *a    = read->a_full;
+        *n_a  = read->n_full;
         read->a_full = NULL;
         read->n_full = 0;
-        radix_sort_128x(*a, (*a) + *n_a);
-        *a = mg_lchain_dp(misc.max_dist_x, misc.max_dist_y,
-                          opt->bw_long, opt->max_chain_skip,
-                          opt->max_chain_iter, opt->min_cnt,
-                          opt->min_chain_score,
-                          misc.chn_pen_gap, misc.chn_pen_skip,
-                          misc.is_cdna, n_segs, *n_a, *a,
-                          n_regs0, u, km);
-    }
 
+        // First pass: narrow bandwidth — mirrors mm_map_chain line 1.
+        *a = mg_lchain_dp(max_chain_gap_ref, max_chain_gap_qry, opt->bw,
+                          opt->max_chain_skip, opt->max_chain_iter,
+                          opt->min_cnt, opt->min_chain_score,
+                          misc.chn_pen_gap, misc.chn_pen_skip,
+                          misc.is_cdna, n_segs, *n_a, *a, n_regs0, u, km);
+
+        // Second pass: wider bandwidth when first chain leaves large uncovered
+        // query region — mirrors mm_map_chain bw_long rescue.
+        if (opt->bw_long > opt->bw &&
+            (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
+            n_segs == 1 && *n_regs0 > 1 && *u != NULL && *a != NULL) {
+            int32_t st = (int32_t)(*a)[0].y;
+            int32_t en = (int32_t)(*a)[(int32_t)(*u)[0] - 1].y;
+            if (*qlen_sum - (en - st) > opt->rmq_rescue_size ||
+                en - st > *qlen_sum * opt->rmq_rescue_ratio) {
+                int32_t ii;
+                for (ii = 0, *n_a = 0; ii < *n_regs0; ++ii)
+                    *n_a += (int32_t)(*u)[ii];
+                kfree(km, *u); *u = NULL;
+                radix_sort_128x(*a, (*a) + *n_a);
+                *a = mg_lchain_dp(max_chain_gap_ref, max_chain_gap_qry, opt->bw_long,
+                                  opt->max_chain_skip, opt->max_chain_iter,
+                                  opt->min_cnt, opt->min_chain_score,
+                                  misc.chn_pen_gap, misc.chn_pen_skip,
+                                  misc.is_cdna, n_segs, *n_a, *a, n_regs0, u, km);
+            }
+        }
+        *frag_gap = max_chain_gap_ref;
+        gpu_rechained = 1;
+    } else {
     // Long-read rescue: if the best chain leaves a large query portion
     // uncovered, redo the chain with bw_long using a second mg_lchain_dp
     // call (mirrors CPU mm_map_chain's post-rmq rescue, but swaps
@@ -674,6 +706,7 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
 			kfree(km, mv.a);
 		}
     }
+    } // end else (read->a_full == NULL — CPU path)
     /* Chain debug AFTER bw_long rescue — compare with [GPU] BEFORE block above */
     {
         static const char *dbg_reads2[] = {
@@ -713,7 +746,7 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
             if (dbg != stderr) fclose(dbg);
         }
     }
-    *frag_gap = misc.max_dist_x;
+    if (!gpu_rechained) *frag_gap = misc.max_dist_x;
 }
 
 void mm_map_chain(const mm_idx_t *mi, const mm_mapopt_t *opt,

@@ -58,8 +58,12 @@ typedef struct {
     int n_mini_pos;
 
     // seeding output, updated in chaining
-    mm128_t *a;  // array of anchors
+    mm128_t *a;  // array of anchors (compacted after GPU backtracking)
     int64_t n;   // number of anchors = n_a
+
+    // full pre-backtrack anchor array saved for rescue in post_chaining_helper
+    mm128_t *a_full;  // original full anchor array before GPU backtracking compaction
+    int64_t  n_full;  // count of anchors in a_full
 
     // chaining outputs
     uint64_t *u;      // scores for chains
@@ -240,6 +244,7 @@ static inline void free_read(chain_read_t *in, void* km) {
     if (in->qlens) kfree(km, in->qlens);
     in->qseqs = 0, in->qlens = 0;
     in->a = 0, in->u = 0;
+    if (in->a_full) { kfree(km, in->a_full); in->a_full = 0; }
 }
 
 static inline void free_meta_struct(input_meta_t *meta, void *km) {

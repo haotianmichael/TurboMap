@@ -592,6 +592,33 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
     return;
 #endif /* DEBUG_CHAIN_COMPARE */
 
+    // GPU-specific rescue: when GPU backtracking discarded many anchors (e.g.
+    // short sub-segments all below min_score), rerun lchain_dp on the full
+    // original anchor array with bw_long so that the correct chromosome can
+    // still be found. Triggered when GPU kept fewer than half the original
+    // anchors (n_full >= 2 * n_a). This runs regardless of n_regs0 so it
+    // also fires when GPU produced only one surviving chain.
+    if (read->a_full != NULL &&
+        read->n_full >= 2 * *n_a &&
+        opt->bw_long > opt->bw &&
+        (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
+        n_segs == 1) {
+        if (*u) { kfree(km, *u); *u = NULL; }
+        if (*a) { kfree(km, *a); }
+        *a = read->a_full;
+        *n_a = read->n_full;
+        read->a_full = NULL;
+        read->n_full = 0;
+        radix_sort_128x(*a, (*a) + *n_a);
+        *a = mg_lchain_dp(misc.max_dist_x, misc.max_dist_y,
+                          opt->bw_long, opt->max_chain_skip,
+                          opt->max_chain_iter, opt->min_cnt,
+                          opt->min_chain_score,
+                          misc.chn_pen_gap, misc.chn_pen_skip,
+                          misc.is_cdna, n_segs, *n_a, *a,
+                          n_regs0, u, km);
+    }
+
     // Long-read rescue: if the best chain leaves a large query portion
     // uncovered, redo the chain with bw_long using a second mg_lchain_dp
     // call (mirrors CPU mm_map_chain's post-rmq rescue, but swaps
@@ -2315,9 +2342,11 @@ static void deep_copy_read_to_batch(mm_batch_trbuf_t *dst, const chain_read_t *s
     r->a = (mm128_t*)kmalloc(dst->km, src->n * sizeof(mm128_t));
     memcpy(r->a, src->a, src->n * sizeof(mm128_t));
 
-    // u/n_u are chaining outputs – not yet available on these fallback reads
-    r->u    = NULL;
-    r->n_u  = 0;
+    // u/n_u and a_full are chaining outputs – not yet available on these fallback reads
+    r->u      = NULL;
+    r->n_u    = 0;
+    r->a_full = NULL;
+    r->n_full = 0;
 
     dst->count++;
     dst->total_n += src->n;

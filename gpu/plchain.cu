@@ -578,7 +578,10 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
                     new_a[j].x = ((uint64_t)h_xrev[ofs + j] << 32) | (uint32_t)h_ax[ofs + j];
                     new_a[j].y = ((uint64_t)h_yrev[ofs + j] << 32) | (uint32_t)h_ay[ofs + j];
                 }
-                kfree(km, reads[i].a);
+                // Save full original array for rescue in post_chaining_helper.
+                // n_full was already set in plbacktrack.cu before reads[i].n was
+                // overwritten with the compacted count.
+                reads[i].a_full = reads[i].a;
                 reads[i].a = new_a;
             }
 
@@ -594,6 +597,12 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
      * happens inside post_chaining_helper). */
     for (int i = 0; i < n_read; i++)
         post_chaining_helper(mi, opt, &reads[i], misc, km);
+
+    // Free full anchor arrays saved for rescue (post_chaining_helper NULLs
+    // a_full if it consumed the array; free any that were not used).
+    for (int i = 0; i < n_read; i++) {
+        if (reads[i].a_full) { kfree(km, reads[i].a_full); reads[i].a_full = NULL; }
+    }
 
     sp->busy = false;
 }

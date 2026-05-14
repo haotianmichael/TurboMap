@@ -449,15 +449,20 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
             int new_n = 0;
             for (int j = 0; j < h_n_u[i]; j++)
                 new_n += (int32_t)reads[i].u[j];
+            // Save original anchor count before overwriting with compacted count.
+            // a_full pointer is set later in finish_backtrack_impl once D2H is done.
+            reads[i].n_full = reads[i].n;
             reads[i].n = new_n;
             // reads[i].a is stale (old anchors) — will be rebuilt by
             // plbacktrack_d2h_read() after voting decides which reads need it.
         } else {
             reads[i].u = NULL;
             reads[i].n = 0;
-            // Free stale a[] — no compacted anchors for this read
+            // No surviving chains: free stale a[] and clear rescue fields.
             kfree(km, reads[i].a);
             reads[i].a = NULL;
+            reads[i].a_full = NULL;
+            reads[i].n_full = 0;
         }
     }
 

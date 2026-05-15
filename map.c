@@ -1970,6 +1970,22 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                 r = &ctx->regs0[current_reg];
                             }
                         }
+                        // Fix: mm_split_reg calls mm_reg_set_coor which overwrites r->rs/re/qs/qe
+                        // with anchor-based coordinates.  We must restore the alignment-derived
+                        // coordinates here, because is_last_task will never fire for the
+                        // remaining skipped tasks (dropped=1 short-circuits the loop).
+                        r->rs = rs1;
+                        r->re = re1;
+                        {
+                            int rev_zd = task->task_ctx.rev;
+                            if (!rev_zd || (opt->flag & MM_F_QSTRAND)) {
+                                r->qs = qs1;
+                                r->qe = qe1;
+                            } else {
+                                r->qs = qlen - qe1;
+                                r->qe = qlen - qs1;
+                            }
+                        }
                     }
 				} else if (!has_valid_alignment) {
                     // 任务失败：需要在CIGAR中添加操作来表示整个gap
@@ -2385,6 +2401,33 @@ static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 		kfree(km, mini_pos);
 		return;
 	}
+
+    // CPU fallback alignment for z-drop remainder regions (p==NULL after GPU batch).
+    // When GPU z-drop splits a region, the remainder (r2) has anchor-based coordinates
+    // from mm_split_reg but no CIGAR.  Mirror the CPU mm_align_skeleton behavior:
+    // re-align each such region with mm_align1 so it gets a correct CIGAR and position.
+    // New regions produced by this step (further z-drops) are inserted and also processed.
+    if (!is_sr && ctx->qseq0[0] && ctx->a) {
+        ksw_extz_t ez;
+        memset(&ez, 0, sizeof(ez));
+        int ireg = 0;
+        while (ireg < ctx->n_regs) {
+            mm_reg1_t *rp = &ctx->regs0[ireg];
+            if (rp->p == NULL && rp->cnt > 0) {
+                mm_reg1_t r2_cpu;
+                memset(&r2_cpu, 0, sizeof(mm_reg1_t));
+                mm_align1(km, opt, mi, qlens[0], ctx->qseq0, rp, &r2_cpu,
+                          ctx->n_a, ctx->a, &ez, opt->flag);
+                if (r2_cpu.cnt > 0) {
+                    ctx->regs0 = mm_insert_reg(&r2_cpu, ireg, &ctx->n_regs, ctx->regs0);
+                    ireg++;  // skip newly inserted r2_cpu; process it in next iteration
+                }
+            }
+            ireg++;
+        }
+        n_regs_after_align = &ctx->n_regs;
+        regs_after_align = ctx->regs0;
+    }
 
 	mm_filter_regs(opt, qlens[0], n_regs_after_align, regs_after_align);
 	if (!(opt->flag&MM_F_SR) && !opt->split_prefix && qlens[0] >= opt->rank_min_len) {

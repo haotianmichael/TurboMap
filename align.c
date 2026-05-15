@@ -1192,6 +1192,13 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     }
     if (cnt1 <= 0) return;
 
+    // Debug: print for reads with very large chain (likely problematic reads)
+    if (reg_idx == 0 && r->cnt > 2000) {
+        fprintf(stderr, "[ALIGN1B] read=%d reg=0 as=%d cnt=%d as1=%d cnt1=%d "
+                "qs=%d rs=%d qe=%d re=%d n_a=%d\n",
+                read_idx, r->as, r->cnt, as1, cnt1, qs, rs, qe, re, n_a);
+    }
+
     if (is_splice) {
         if (opt->flag & MM_F_SPLICE_FOR) extra_flag |= rev? KSW_EZ_SPLICE_REV : KSW_EZ_SPLICE_FOR;
         if (opt->flag & MM_F_SPLICE_REV) extra_flag |= rev? KSW_EZ_SPLICE_FOR : KSW_EZ_SPLICE_REV;
@@ -1251,6 +1258,11 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         
         re0 = (int32_t)a[r->as + r->cnt - 1].x + 1;
         qe0 = (int32_t)a[r->as + r->cnt - 1].y + 1;
+        // Debug: print extension params for large chains
+        if (reg_idx == 0 && r->cnt > 2000) {
+            fprintf(stderr, "[ALIGN1B_EXT] read=%d qs0=%d rs0=%d qs=%d rs=%d qe=%d re=%d qe0=%d re0=%d\n",
+                    read_idx, qs0, rs0, qs, rs, qe, re, qe0, re0);
+        }
         re1 = mi->seq[rid].len, qe1 = qlen;
         for (i = r->as + r->cnt, l = 0; i < n_a && a[i].x>>32 == a[r->as].x>>32; ++i) {
             int32_t x = (int32_t)a[i].x + 1;

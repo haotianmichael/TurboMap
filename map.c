@@ -1873,7 +1873,46 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
         
         // 根据任务类型更新边界
         switch (task->task_type) {
-            case GPU_TASK_LEFT_EXT:
+            case GPU_TASK_LEFT_EXT: {
+                // Debug: print LEFT_EXT GPU result for problematic reads
+                {
+                    const char *rname = (current_read >= 0 && current_read < gpu_batch->n_reads
+                                         && gpu_batch->read_ctxs[current_read].name)
+                                         ? gpu_batch->read_ctxs[current_read].name : NULL;
+                    static const char *_lext_dbg[] = {
+                        "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+                        "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+                        "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
+                        "05e5edac-25af-42c2-9a2f-43712ca32c35",
+                        "0bd5ad43-1fe4-4d97-8bcb-dae57f05608f",
+                        NULL
+                    };
+                    int _is_lext_dbg = 0;
+                    if (rname) for (int _di = 0; _lext_dbg[_di]; _di++)
+                        if (strncmp(rname, _lext_dbg[_di], 8) == 0) { _is_lext_dbg = 1; break; }
+                    if (_is_lext_dbg) {
+                        fprintf(stderr, "[LEFT_EXT_GPU] %.8s read=%d n_cigar=%d max_q=%d max_t=%d "
+                                "reach_end=%d mqe_t=%d zdropped=%d qlen=%d tlen=%d "
+                                "ref_qs=%d ref_rs=%d qs0=%d rs0=%d\n",
+                                rname, current_read, task->n_cigar, task->max_q, task->max_t,
+                                task->reach_end, task->mqe_t, task->zdropped,
+                                task->qlen, task->tlen,
+                                task->task_ctx.ref_qs, task->task_ctx.ref_rs,
+                                task->task_ctx.qs0, task->task_ctx.rs0);
+                        // Print first few CIGAR ops
+                        if (task->n_cigar > 0) {
+                            uint32_t *cigar = gpu_batch->cigar_buffer + task->cigar_offset;
+                            fprintf(stderr, "[LEFT_EXT_CIGAR] %.8s first_ops:", rname);
+                            for (int ci = 0; ci < task->n_cigar && ci < 5; ci++) {
+                                static const char op_chars[] = "MIDNSHP=X";
+                                int op = cigar[ci] & 0xf;
+                                int len = cigar[ci] >> 4;
+                                fprintf(stderr, " %d%c", len, op < 9 ? op_chars[op] : '?');
+                            }
+                            fprintf(stderr, " (n_cigar=%d)\n", task->n_cigar);
+                        }
+                    }
+                }
                 // 左扩展：向前（向起点方向）扩展，更新rs1/qs1
                // 只有在有有效对齐结果时才更新坐标
                 if (has_valid_alignment) {
@@ -1894,6 +1933,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 }
                 // re1/qe1保持为seed的起点位置（不变）
                 break;
+            }
                 
             case GPU_TASK_GAP_FILL:
                 // Gap填充：更新re1/qe1到gap的终点
@@ -2025,6 +2065,29 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                           (gpu_batch->tasks[i+1].reg_idx != current_reg);
 
         if (is_last_task) {
+            // Debug: print final coords for problematic reads
+            {
+                const char *rname2 = (current_read >= 0 && current_read < gpu_batch->n_reads
+                                     && gpu_batch->read_ctxs[current_read].name)
+                                     ? gpu_batch->read_ctxs[current_read].name : NULL;
+                static const char *_fin_dbg[] = {
+                    "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
+                    "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
+                    "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
+                    "05e5edac-25af-42c2-9a2f-43712ca32c35",
+                    "0bd5ad43-1fe4-4d97-8bcb-dae57f05608f",
+                    NULL
+                };
+                int _is_fin_dbg = 0;
+                if (rname2) for (int _di = 0; _fin_dbg[_di]; _di++)
+                    if (strncmp(rname2, _fin_dbg[_di], 8) == 0) { _is_fin_dbg = 1; break; }
+                if (_is_fin_dbg && current_reg == 0) {
+                    fprintf(stderr, "[FINAL_COORDS] %.8s read=%d reg=%d rs1=%d re1=%d qs1=%d qe1=%d "
+                            "dropped=%d n_cigar=%d\n",
+                            rname2, current_read, current_reg, rs1, re1, qs1, qe1,
+                            dropped, r->p ? (int)r->p->n_cigar : -1);
+                }
+            }
             // Set final boundaries (even for dropped regions — they still need
             // valid coordinates for the truncated alignment, matching CPU logic)
             r->rs = rs1;
@@ -2101,8 +2164,24 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                         }
                         uint8_t *tseq = (uint8_t*)kmalloc(km, re1 - rs1);
                         mm_idx_getseq(mi, task->task_ctx.rid, rs1, re1, tseq);
+                        int32_t rs_before = r->rs, qs_before = r->qs;
                         mm_update_extra(r, qseq, tseq, mat, opt->q, opt->e,
                                        opt->flag & MM_F_EQX, !(opt->flag & MM_F_SR));
+                        // Debug: print if mm_fix_cigar shifted r->rs for problematic reads
+                        if (r->rs != rs_before || r->qs != qs_before) {
+                            const char *rn3 = (current_read >= 0 && current_read < gpu_batch->n_reads
+                                               && gpu_batch->read_ctxs[current_read].name)
+                                               ? gpu_batch->read_ctxs[current_read].name : "?";
+                            static const char *_ue_dbg[] = {
+                                "07d825c2", "045ac112", "072c8650", "05e5edac", "0bd5ad43", NULL
+                            };
+                            int _is_ue = 0;
+                            for (int _di = 0; _ue_dbg[_di]; _di++)
+                                if (strncmp(rn3, _ue_dbg[_di], 8) == 0) { _is_ue = 1; break; }
+                            if (_is_ue)
+                                fprintf(stderr, "[UE_SHIFT] %.8s rs: %d→%d (shift=%d) qs: %d→%d\n",
+                                        rn3, rs_before, r->rs, r->rs - rs_before, qs_before, r->qs);
+                        }
                         if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
                         kfree(km, tseq);
                         skip_update_extra:;

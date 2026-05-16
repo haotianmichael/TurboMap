@@ -223,6 +223,7 @@ static void setup_chain_phase(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     dev_mem->d_ay_long      = (int32_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int32_t));
     dev_mem->d_sid_long     = (int8_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int8_t));
     dev_mem->d_range_long   = (int32_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int32_t));
+    dev_mem->d_xrev_long    = (int32_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int32_t));
     dev_mem->d_total_n_long = (size_t*)arena_alloc(a, sizeof(size_t));
     dev_mem->d_f_long       = (int32_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(int32_t));
     dev_mem->d_p_long       = (uint16_t*)arena_alloc(a, dev_mem->buffer_size_long * sizeof(uint16_t));

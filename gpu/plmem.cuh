@@ -136,6 +136,7 @@ typedef struct {
     int32_t *d_ax_long, *d_ay_long;
     int8_t *d_sid_long;
     int32_t *d_range_long;
+    int32_t *d_xrev_long;
     size_t *d_total_n_long;
     size_t buffer_size_long;
     int32_t *d_f_long;  // score, size: buffer_size_long * sizeof(int32_t)

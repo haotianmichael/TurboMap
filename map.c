@@ -13,6 +13,10 @@
 #include "gpu/plalign.cuh"
 #include "ksw2.h"
 
+// Exposed from align.c (made non-static) for post-GPU APPROX_MAX z-drop check
+int mm_test_zdrop(void *km, const mm_mapopt_t *opt, const uint8_t *qseq, const uint8_t *tseq,
+                  uint32_t n_cigar, uint32_t *cigar, const int8_t *mat);
+
 /* -----------------------------------------------------------------------
  * DEBUG_CHAIN_COMPARE: compile-time flag to compare GPU-DP-chain output
  * with CPU-RMQ-chain on the same (compacted) anchors, then skip KSW.
@@ -1821,6 +1825,37 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
         if (has_valid_alignment && task->n_cigar > 0) {
             uint32_t *cigar = gpu_batch->cigar_buffer + task->cigar_offset;
 
+            // For APPROX_MAX GAP_FILL: run mm_test_zdrop on GPU CIGAR before accepting it.
+            // CPU first-pass (APPROX_MAX) suppresses z-drop in the DP kernel, then uses
+            // mm_test_zdrop to detect real z-drops.  GPU must do the same: without this
+            // check, GPU accepts the full CIGAR even when a real z-drop exists (e.g.
+            // structural variants), producing alignments that are 2-5x too long.
+            // When a real z-drop is found, discard GPU work and fall back to CPU mm_align1.
+            if (task->task_type == GPU_TASK_GAP_FILL && (task->flag & KSW_EZ_APPROX_MAX)
+                    && !task->zdropped && !(opt->flag & MM_F_QSTRAND)) {
+                int ref_qs  = task->task_ctx.ref_qs;
+                int ref_rs  = task->task_ctx.ref_rs;
+                int ref_re  = task->task_ctx.ref_re;
+                int rev     = task->task_ctx.rev;
+                int tlen_gap = ref_re - ref_rs;
+                if (tlen_gap > 0 && ctx->qseq0[rev]) {
+                    uint8_t *tseq_gap = (uint8_t*)kmalloc(km, tlen_gap);
+                    mm_idx_getseq(mi, r->rid, (uint32_t)ref_rs, (uint32_t)ref_re, tseq_gap);
+                    uint8_t *qseq_gap = ctx->qseq0[rev] + ref_qs;
+                    int zdrop_code = mm_test_zdrop(km, opt, qseq_gap, tseq_gap,
+                                                   task->n_cigar, cigar, mat);
+                    kfree(km, tseq_gap);
+                    if (zdrop_code != 0) {
+                        // Real z-drop: discard partial GPU work for this region.
+                        // Free r->p so the CPU fallback loop (after gpu_batch_submit_and_process)
+                        // detects p==NULL and calls mm_align1 to redo the whole alignment.
+                        free(r->p);
+                        r->p = NULL;
+                        dropped = 1;
+                        continue;
+                    }
+                }
+            }
 
             // KSW_EZ_REV_CIGAR flag (used by LEFT_EXT) makes the kernel
             // skip its internal CIGAR reversal, so the CIGAR is already

@@ -687,55 +687,6 @@ void mm_map_chain(const mm_idx_t *mi, const mm_mapopt_t *opt,
 			kfree(km, mv.a);
 		}
 	}
-    /* Chain debug for wrong-chromosome investigation — remove after diagnosis */
-    {
-        static const char *dbg_reads[] = {
-            "08c178a9-9054-40c4-87fa-0c636d52df41",
-            "299e4b51-a23d-444d-a888-f08804a03cf4",
-            "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
-            "3262e09f-9576-411f-b49c-4343f2822652",
-            "0d2cacd8-ebbe-454a-bcd7-d2dfcda7a3b0",
-            "18364462-1d40-4ce7-9b69-0b91b60fac31",
-            "1be1f2c5-3ab8-4914-a214-57ffcfd7ac6e",
-            "2f0f3d7a-c819-4e04-8561-1fee5940cfbc",
-            "30464c0a-df43-44c9-9640-d44ca7ce66e1",
-            "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
-            "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
-            NULL
-        };
-        int _is_dbg = 0;
-        for (int _di = 0; dbg_reads[_di]; _di++)
-            if (strcmp(qname, dbg_reads[_di]) == 0) { _is_dbg = 1; break; }
-        if (_is_dbg) {
-            FILE *dbg = fopen("/tmp/chain_debug.txt", "a");
-            if (!dbg) dbg = stderr;
-            int best_sc = 0, best_cnt = 0, best_ci = 0;
-            for (int _ci = 0; _ci < *n_regs0; _ci++) {
-                int sc = (int)((*u)[_ci] >> 32);
-                if (sc > best_sc) { best_sc = sc; best_cnt = (int32_t)(*u)[_ci]; best_ci = _ci; }
-            }
-            uint32_t best_rid = 0xFFFFFFFF;
-            if (*n_regs0 > 0 && *u && *a) {
-                int _off = 0;
-                for (int _ci = 0; _ci < best_ci; _ci++) _off += (int32_t)((*u)[_ci]);
-                best_rid = (uint32_t)((*a)[_off].x << 1 >> 33);
-            }
-            const char *rname = (best_rid < (uint32_t)mi->n_seq) ? mi->seq[best_rid].name : "none";
-            fprintf(dbg, "[CPU] CHAIN_DBG\t%s\tn_u=%d\tn_anc=%ld\tbest_sc=%d\tbest_cnt=%d\tchr=%s\n",
-                    qname, *n_regs0, (long)*n_a, best_sc, best_cnt, rname);
-            int _off = 0;
-            for (int _ci = 0; _ci < *n_regs0 && _ci < 15; _ci++) {
-                int sc = (int)((*u)[_ci] >> 32);
-                int cnt = (int32_t)((*u)[_ci]);
-                uint32_t rid = (uint32_t)((*a)[_off].x << 1 >> 33);
-                const char *cn = (rid < (uint32_t)mi->n_seq) ? mi->seq[rid].name : "?";
-                fprintf(dbg, "  [%d] sc=%d cnt=%d %s\n", _ci, sc, cnt, cn);
-                _off += cnt;
-            }
-            fflush(dbg);
-            if (dbg != stderr) fclose(dbg);
-        }
-    }
 	*frag_gap = max_chain_gap_ref;
 }
 

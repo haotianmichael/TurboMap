@@ -2082,26 +2082,6 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 // Dropped region (z-drop truncated): run mm_update_extra on
                 // the truncated CIGAR so blen/mlen/dp_max are set correctly.
                 if (r->p && r->p->n_cigar > 0 && re1 > rs1 && qs1 >= 0 && qs1 < qlen) {
-                    // DEBUG: validate CIGAR for dropped region
-                    {
-                        // use global g_drop_nm_count
-                        int cigar_qlen = 0, cigar_tlen = 0;
-                        for (int ci = 0; ci < (int)r->p->n_cigar; ci++) {
-                            uint32_t op = r->p->cigar[ci] & 0xf;
-                            int len = r->p->cigar[ci] >> 4;
-                            if (op == 0) { cigar_qlen += len; cigar_tlen += len; }
-                            else if (op == 1) { cigar_qlen += len; }
-                            else if (op == 2 || op == 3) { cigar_tlen += len; }
-                        }
-                        int exp_qlen = qe1 - qs1;
-                        int exp_tlen = re1 - rs1;
-                        if (cigar_qlen != exp_qlen || cigar_tlen != exp_tlen) {
-                            ++g_drop_nm_count;
-                            fprintf(stderr, "[DEBUG] DROPPED mismatch #%d: cq=%d ct=%d eq=%d et=%d task[%d]\n",
-                                    g_drop_nm_count, cigar_qlen, cigar_tlen, exp_qlen, exp_tlen, i);
-                            goto skip_dropped_update;
-                        }
-                    }
                     uint8_t *qseq;
                     if (!rev || (opt->flag & MM_F_QSTRAND))
                         qseq = ctx->qseq0[0] + qs1;
@@ -2113,7 +2093,6 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                    opt->flag & MM_F_EQX, !(opt->flag & MM_F_SR));
                     if (rev && r->p->trans_strand) r->p->trans_strand ^= 3;
                     kfree(km, tseq);
-                    skip_dropped_update:;
                 }
             }
         }
@@ -2205,30 +2184,6 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
     }
 
     n_a = mm_squeeze_a(km, skele_n_regs, regs0, a);
-
-    // Debug: for known wrong-position reads, print first anchor coords after squeeze
-    {
-        static const char *_dbg_reads[] = {
-            "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
-            "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
-            "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
-            "05e5edac-25af-42c2-9a2f-43712ca32c35",
-            "0bd5ad43-1fe4-4d97-8bcb-dae57f05608f",
-            NULL
-        };
-        int _is_dbg = 0;
-        for (int _di = 0; _dbg_reads[_di]; _di++)
-            if (strcmp(qname, _dbg_reads[_di]) == 0) { _is_dbg = 1; break; }
-        if (_is_dbg && skele_n_regs > 0 && n_a > 0) {
-            uint32_t rid0 = (uint32_t)(a[regs0[0].as].x << 1 >> 33);
-            int32_t  qpos = (int32_t)a[regs0[0].as].y;
-            int32_t  rpos = (int32_t)a[regs0[0].as].x;
-            const char *chr = (rid0 < (uint32_t)mi->n_seq) ? mi->seq[rid0].name : "?";
-            fprintf(stderr, "[PRE_ALIGN_GPU] %s n_regs=%d n_a=%d "
-                    "reg0.as=%d first_anc_qpos=%d first_anc_rpos=%d chr=%s\n",
-                    qname, skele_n_regs, n_a, regs0[0].as, qpos, rpos, chr);
-        }
-    }
 
     // Set up read context for GPU processing
     read_align_ctx_t *ctx = &gpu_batch->read_ctxs[read_idx];
@@ -2349,25 +2304,6 @@ static void cpu_align_rechained_read(const mm_idx_t *mi, const mm_mapopt_t *opt,
     int n_regs0   = read_->n_u;
     uint64_t *u   = read_->u;
     mm128_t  *a   = read_->a;
-
-    // Debug: print what CPU alignment sees for known wrong-position reads
-    {
-        static const char *_dbg2[] = {
-            "07d825c2-74a5-45e1-b8b6-e4e60ee7c6f1",
-            "045ac112-c3a4-4d5b-86c3-56ee0e04ad6d",
-            "072c8650-02d4-4d6a-86c4-ca1ce42bf92e",
-            "05e5edac-25af-42c2-9a2f-43712ca32c35",
-            "0bd5ad43-1fe4-4d97-8bcb-dae57f05608f",
-            NULL
-        };
-        const char *_qn = read_->seq.name;
-        int _is_dbg2 = 0;
-        for (int _di = 0; _dbg2[_di]; _di++)
-            if (_qn && strcmp(_qn, _dbg2[_di]) == 0) { _is_dbg2 = 1; break; }
-        if (_is_dbg2)
-            fprintf(stderr, "[CPU_ALIGN] %s n_regs0=%d u=%p a=%p\n",
-                    _qn, n_regs0, (void*)u, (void*)a);
-    }
 
     if (n_regs0 == 0 || u == NULL || a == NULL) {
         ctx->regs0  = NULL;

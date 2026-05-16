@@ -119,7 +119,9 @@ inline __device__ void compute_sc_seg_one_wf(const int32_t* anchors_x, const int
     }
     __syncwarp();
     for (size_t i=start_idx; i < end_idx; i++) {
-        int32_t range_i = range[i];
+        // Cap at segment boundary to prevent writes beyond end_idx (data race with adjacent segments).
+        int32_t max_j = (int32_t)(end_idx - i - 1);
+        int32_t range_i = range[i] < max_j ? range[i] : max_j;
         for (int32_t j = tid; j < range_i; j += blockDim.x) {
             int32_t sc = comput_sc(
                                 anchors_x[i+j+1],
@@ -159,7 +161,9 @@ inline __device__ void compute_sc_seg_multi_wf(const int32_t* anchors_x, const i
     }
     __syncthreads();
     for (size_t i=start_idx; i < end_idx; i++) {
-        int32_t range_i = range[i];
+        // Cap at segment boundary to prevent writes beyond end_idx (data race with adjacent segments).
+        int32_t max_j = (int32_t)(end_idx - i - 1);
+        int32_t range_i = range[i] < max_j ? range[i] : max_j;
         for (int32_t j = tid; j < range_i; j += blockDim.x) {
             int32_t sc = comput_sc(
                                 anchors_x[i+j+1],

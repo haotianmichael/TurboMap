@@ -11,6 +11,14 @@
 #ifndef USE_SHARED_LONG_KERNEL
 #define USE_SHARED_LONG_KERNEL 0
 #endif
+
+static double s_ksw_kernel_total_ms = 0.0;
+struct KswTimingPrinter {
+    ~KswTimingPrinter() {
+        if (s_ksw_kernel_total_ms > 0.0)
+            fprintf(stderr, "[KSW timing] total kernel time: %.3f ms\n", s_ksw_kernel_total_ms);
+    }
+} s_ksw_timing_printer;
 #define CHECKCUDAERROR(error) \
 		do{\
 			err = error;\
@@ -557,8 +565,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t  *h_scores          = dev_mem->h_align_scores;
 
     // KSW kernel timing
-    static double s_ksw_kernel_total_ms = 0.0;
-    double ksw_kernel_call_ms = 0.0;
     cudaEvent_t ksw_ev_start, ksw_ev_stop;
     cudaEventCreate(&ksw_ev_start);
     cudaEventCreate(&ksw_ev_stop);
@@ -1236,7 +1242,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             {
                 float elapsed_ms = 0.0f;
                 cudaEventElapsedTime(&elapsed_ms, ksw_ev_start, ksw_ev_stop);
-                ksw_kernel_call_ms += elapsed_ms;
                 s_ksw_kernel_total_ms += elapsed_ms;
             }
             kernel_err = cudaGetLastError();
@@ -1436,9 +1441,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     PLOG_INFO(stderr, "[Info::%s] Alignment complete: %d tasks in %d batches\n",
             stream_tag, n_tasks, batch_num);
-
-    fprintf(stderr, "[KSW timing] this_call=%.3f ms  total=%.3f ms\n",
-            ksw_kernel_call_ms, s_ksw_kernel_total_ms);
 
     cudaEventDestroy(ksw_ev_start);
     cudaEventDestroy(ksw_ev_stop);

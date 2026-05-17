@@ -555,6 +555,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t  *h_dp_max          = dev_mem->h_align_dp_max;
     int32_t  *h_gpu_stats_valid = dev_mem->h_align_gpu_stats_valid;
     int32_t  *h_scores          = dev_mem->h_align_scores;
+
+    // KSW kernel timing
+    static double s_ksw_kernel_total_ms = 0.0;
+    double ksw_kernel_call_ms = 0.0;
+    cudaEvent_t ksw_ev_start, ksw_ev_stop;
+    cudaEventCreate(&ksw_ev_start);
+    cudaEventCreate(&ksw_ev_stop);
     int32_t  *h_query_ends      = dev_mem->h_align_query_ends;
     int32_t  *h_target_ends     = dev_mem->h_align_target_ends;
     int32_t  *h_mqe             = dev_mem->h_align_mqe;
@@ -1039,6 +1046,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
+            cudaEventRecord(ksw_ev_start, align_stream);
             {
                 int parallel_threads = 32;   // one warp per block
 
@@ -1167,6 +1175,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
             }
 
+            cudaEventRecord(ksw_ev_stop, align_stream);
+
             cudaError_t kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel launch failed: %s\n",
@@ -1223,6 +1233,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             // Sync 1: wait for small arrays (D2H above) to arrive on host
             cudaStreamSynchronize(align_stream);
+            {
+                float elapsed_ms = 0.0f;
+                cudaEventElapsedTime(&elapsed_ms, ksw_ev_start, ksw_ev_stop);
+                ksw_kernel_call_ms += elapsed_ms;
+                s_ksw_kernel_total_ms += elapsed_ms;
+            }
             kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel execution failed: %s\n",
@@ -1420,6 +1436,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     PLOG_INFO(stderr, "[Info::%s] Alignment complete: %d tasks in %d batches\n",
             stream_tag, n_tasks, batch_num);
+
+    fprintf(stderr, "[KSW timing] this_call=%.3f ms  total=%.3f ms\n",
+            ksw_kernel_call_ms, s_ksw_kernel_total_ms);
+
+    cudaEventDestroy(ksw_ev_start);
+    cudaEventDestroy(ksw_ev_stop);
 
     // Cleanup phase-specific arrays
     free(task_indices_short);

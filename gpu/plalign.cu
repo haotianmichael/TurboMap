@@ -1181,8 +1181,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
             }
 
-            cudaEventRecord(ksw_ev_stop, align_stream);
-
             cudaError_t kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel launch failed: %s\n",
@@ -1214,6 +1212,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     batch_size
                 );
             }
+
+            cudaEventRecord(ksw_ev_stop, align_stream);
 
             // D2H Sync 1: small arrays — CIGAR lengths, scores, endpoints, GPU stats
             // The compact CIGAR bulk D2H happens after we know total_cigar_ops (see Sync 2 below).

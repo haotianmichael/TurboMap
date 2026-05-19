@@ -5,6 +5,8 @@
     "//min_n": "queries with less anchors will be handled on cpu",
     "long_cigar_batch": 1024,
     "//long_cigar_batch": "Long-task CIGAR buffer cap. 0=auto (formula), e.g. 1024 shrinks CIGAR to give more bt_p for super-long task concurrency.",
+    "max_align_task_len": 50000,
+    "//max_align_task_len": "Max sequence length per alignment task (query or target). All KSW buffers scale linearly with this value. Reduce to e.g. 10000 if gap-fills/extensions are short to increase concurrent slots.",
     "range_kernel": {
         "blockdim": 512,
         "cut_check_anchors": 10,

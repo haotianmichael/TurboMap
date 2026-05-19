@@ -185,7 +185,7 @@ typedef struct {
     // ========== Alignment Buffers (unified allocation) ==========
     size_t max_align_tasks;       // max number of alignment tasks
     size_t max_align_seq_bytes;   // max sequence bytes
-    size_t max_align_query_len;   // max query length
+    size_t max_align_task_len;   // max query length
 
     // Two-tier batch processing configuration
     size_t short_task_batch_size; // batch size for short tasks (max(qlen,tlen) <= 1000bp)
@@ -214,9 +214,9 @@ typedef struct {
     int *d_align_backtrack_off;
     int *d_align_backtrack_off_end;
     int *d_align_backtrack_n_col;
-    // Long-task specific backtrack_off buffers (stride = max_antidiag_long = 2*max_align_query_len)
+    // Long-task specific backtrack_off buffers (stride = max_antidiag_long = 2*max_align_task_len)
     // The short-task off buffers use stride = max_antidiag_short = 2*short_task_max_len (2000),
-    // which is too small for long tasks whose antidiag can reach 2*max_align_query_len (100000).
+    // which is too small for long tasks whose antidiag can reach 2*max_align_task_len (100000).
     int *d_align_backtrack_off_long;
     int *d_align_backtrack_off_end_long;
     int n_long_concurrent_slots;  // max concurrent slots for the long-task tier (bt_off_long cap)
@@ -347,7 +347,7 @@ typedef struct {
     // Pinned sequence staging buffers for H2D (cudaMallocHost).
     // Pre-allocated once; reused every batch to avoid per-batch calloc/free
     // and to enable truly async cudaMemcpyAsync (non-pinned falls back to sync).
-    // Sized for max(short_batch × short_max_len, long_batch × max_align_query_len).
+    // Sized for max(short_batch × short_max_len, long_batch × max_align_task_len).
     uint8_t *h_align_unpacked_query;    // pinned, max_seq_staging_bytes
     uint8_t *h_align_unpacked_target;   // pinned, max_seq_staging_bytes
     size_t   h_align_seq_staging_bytes; // capacity of each staging buffer

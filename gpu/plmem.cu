@@ -130,6 +130,12 @@ static size_t g_vram_global_reserve = (size_t)512 * 1024 * 1024;  // default 512
 // for small tasks.  Set via JSON key "long_cigar_batch" in gpu_config.json.
 static size_t g_long_cigar_batch_override = 0;
 
+// Max sequence length per alignment task (query or target side).
+// Controls ksw_temp, bt_off_long, and seq/CIGAR buffer sizes — all linear in this value.
+// Reduce to e.g. 10000 for data where gap-fills/extensions are short → more concurrent slots.
+// Set via JSON key "max_align_task_len" in gpu_config.json.
+static size_t g_max_align_task_len = 50000;  // default 50,000 bp
+
 // ── compute_long_batch_size ─────────────────────────────────────────────────────
 // Derives the maximum long-task batch size (CIGAR-buffer bound) from the arena
 // size and resource costs.  The derivation targets pool_cap ≈ n_long_cap, where
@@ -318,8 +324,8 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     // so pool_cap ≈ n_long_cap ≈ MAX_LONG_BATCH / 3.  The per-batch kernel launch in
     // plalign.cu further constrains actual batch_size dynamically (see comment there).
     size_t MAX_LONG_BATCH = long_batch_size(a->total_size,
-                                            dev_mem->max_align_query_len);
-    size_t max_len        = dev_mem->max_align_query_len; // 50,000
+                                            dev_mem->max_align_task_len);
+    size_t max_len        = dev_mem->max_align_task_len; // 50,000
     size_t long_cigar     = 2 * max_len;                  // 100,000
     size_t max_antidiag_long = 2 * max_len;               // 100,000 (bt_off stride)
 
@@ -493,13 +499,13 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_bw              = (int32_t*)arena_alloc(a, metadata_size);
 
     // ---- Global DP buffer ----
-    size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_query_len * 4;
+    size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_task_len * 4;
     size_t global_buffer_bytes = global_buffer_size * sizeof(short2);
     dev_mem->d_align_global_buffer = arena_alloc(a, global_buffer_bytes);
 
     // ---- KSW temp buffer (slot-indexed by blockIdx.x) ----
     // Layout: H[tlen]*int32 (max tracking) + u/v/x/y/x2/y2[(tlen+1)]*int8 + qr + target (uint8)
-    size_t max_len = dev_mem->max_align_query_len;
+    size_t max_len = dev_mem->max_align_task_len;
     size_t h_array_size = max_len * sizeof(int32_t);                 // H for max tracking
     size_t sk_arrays_size = (max_len + 1) * 6 * sizeof(int8_t);     // u,v,x,y,x2,y2
     size_t seq_size = max_len * 2 * sizeof(uint8_t);                 // qr + target
@@ -526,12 +532,12 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
 
     // ---- Long-task backtrack_off buffers ----
     // Short-task off buffers use stride = max_antidiag_short (2000), which is far too small for
-    // long tasks (antidiag up to 2*max_align_query_len = 100000).  We allocate a separate pair
+    // long tasks (antidiag up to 2*max_align_task_len = 100000).  We allocate a separate pair
     // with the full long-task antidiag stride.  The number of concurrent long-task slots is
     // bounded by both the bt_p pool capacity and this allocation.
     // n_long_concurrent_slots = 512: caps the bt_off_long allocation while the actual
     // concurrency is dynamically determined by the dedicated long bt_p pool size in plalign.cu.
-    size_t max_antidiag_long = 2 * dev_mem->max_align_query_len;  // 100,000
+    size_t max_antidiag_long = 2 * dev_mem->max_align_task_len;  // 100,000
     dev_mem->n_long_concurrent_slots = 512;
     size_t bt_off_long_bytes = (size_t)dev_mem->n_long_concurrent_slots *
                                max_antidiag_long * sizeof(int);
@@ -606,7 +612,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     // Pre-compute alignment config values (needed for arena sizing)
     dev_mem->max_align_tasks     = 120000;
     dev_mem->max_align_seq_bytes = (size_t)1*1024*1024*1024;  // 1 GB
-    dev_mem->max_align_query_len = 50000;
+    dev_mem->max_align_task_len = g_max_align_task_len;
     dev_mem->short_task_batch_size = 4000;
     dev_mem->long_task_batch_size  = 128;
     dev_mem->short_task_max_len    = 1000;
@@ -752,14 +758,14 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
 
     // Compute long_batch_max here (outside the pinned-buffer block) so it is visible
     // to the print_info log below as well as the cudaMallocHost calls that follow.
-    size_t long_batch_max = long_batch_size(arena_size, dev_mem->max_align_query_len);
+    size_t long_batch_max = long_batch_size(arena_size, dev_mem->max_align_task_len);
 
     if (print_info) {
         double GB = 1024.0*1024.0*1024.0;
         double bt_p_gb = (double)dev_mem->n_align_concurrent_blocks *
                          dev_mem->max_align_backtrack_size / GB;
         double bt_off_long_gb = (double)dev_mem->n_long_concurrent_slots *
-                                2 * dev_mem->max_align_query_len * sizeof(int) / GB;
+                                2 * dev_mem->max_align_task_len * sizeof(int) / GB;
         double long_pool_gb = dev_mem->long_bt_p_pool_bytes / GB;
         PLOG_INFO(stderr, "[Info] GPU arena: %.2f GB total, %.2f GB free  (%d stream%s, %.2f GB each)\n",
                 total_mem / GB, free_mem / GB,
@@ -796,7 +802,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         // Short phase: max_align_tasks × short_cigar_len (2000)
         // Long phase:  long_batch_max × long_cigar_len (100000)
         size_t short_cigar_total = dev_mem->max_align_tasks * dev_mem->max_align_cigar_len;
-        size_t long_cigar_total  = long_batch_max * 2 * dev_mem->max_align_query_len;
+        size_t long_cigar_total  = long_batch_max * 2 * dev_mem->max_align_task_len;
         size_t cigar_buf_sz = (long_cigar_total > short_cigar_total) ? long_cigar_total : short_cigar_total;
         dev_mem->h_align_max_batch = mbs;
 
@@ -831,7 +837,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             size_t short_seq = (size_t)dev_mem->short_task_batch_size *
                                (((size_t)dev_mem->short_task_max_len + 7) & ~(size_t)7);
             size_t long_seq  = long_batch_max *
-                               (size_t)dev_mem->max_align_query_len;
+                               (size_t)dev_mem->max_align_task_len;
             size_t seq_staging = (short_seq > long_seq) ? short_seq : long_seq;
             dev_mem->h_align_seq_staging_bytes = seq_staging;
             cudaMallocHost(&dev_mem->h_align_unpacked_query,  seq_staging);
@@ -1283,6 +1289,10 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     g_long_cigar_batch_override = cigar_batch_json
         ? (size_t)cigar_batch_json->valueint
         : 0;
+
+    cJSON *task_len_json = cJSON_GetObjectItem(json, "max_align_task_len");
+    if (task_len_json && task_len_json->valueint > 0)
+        g_max_align_task_len = (size_t)task_len_json->valueint;
 
     size_t usable = (gpu_free_mem > global_reserve) ? (gpu_free_mem - global_reserve) : gpu_free_mem;
     size_t avail_mem_per_stream = usable / (*num_stream_);

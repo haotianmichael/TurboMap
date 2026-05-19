@@ -371,7 +371,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int n_long_tasks  = 0;
 
     // Hard limits derived from GPU buffer allocation. Exceeding causes OOB or wrong results.
-    const size_t gpu_max_one = (size_t)dev_mem->max_align_query_len;
+    const size_t gpu_max_one = (size_t)dev_mem->max_align_task_len;
     const size_t gpu_max_sum = 2 * gpu_max_one - 2;  // CIGAR buffer guard
 
     for (int i = 0; i < n_tasks; i++) {
@@ -436,7 +436,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     uint32_t *d_cigar_buffer    = dev_mem->d_align_cigar_buffer;
     int      *d_cigar_lengths   = dev_mem->d_align_cigar_lengths;
     size_t    max_cigar_len     = dev_mem->max_align_cigar_len;
-    size_t    max_query_len_limit = dev_mem->max_align_query_len;
+    size_t    max_query_len_limit = dev_mem->max_align_task_len;
     int8_t   *d_mat             = dev_mem->d_align_mat;
     void     *device_res        = dev_mem->d_align_device_res;
     int32_t  *d_scores          = dev_mem->d_align_scores;
@@ -522,7 +522,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         size_t current_max_backtrack_size = current_max_antidiag * current_max_n_col;
         size_t current_max_cigar_len     = (phase == 0)
             ? (2 * short_task_max_len)
-            : (2 * dev_mem->max_align_query_len);
+            : (2 * dev_mem->max_align_task_len);
 
         if (n_tasks_in_phase == 0) continue;
 
@@ -769,11 +769,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     if (ql > diag_actual_max_qlen) diag_actual_max_qlen = ql;
                     if (tl > diag_actual_max_tlen) diag_actual_max_tlen = tl;
                     if (tl > batch_max_tlen)       batch_max_tlen       = tl;
-                    if (ql > (int)dev_mem->max_align_query_len ||
-                        tl > (int)dev_mem->max_align_query_len)
+                    if (ql > (int)dev_mem->max_align_task_len ||
+                        tl > (int)dev_mem->max_align_task_len)
                         diag_n_exceed++;
                 }
-                size_t max_antidiag_long = 2 * (size_t)dev_mem->max_align_query_len;
+                size_t max_antidiag_long = 2 * (size_t)dev_mem->max_align_task_len;
                 if (actual_max_antidiag > max_antidiag_long)
                     actual_max_antidiag = max_antidiag_long;
 

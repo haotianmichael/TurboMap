@@ -12,14 +12,11 @@
 #define USE_SHARED_LONG_KERNEL 0
 #endif
 
-static double s_ksw_kernel_total_ms = 0.0;
-static double s_ksw_wall_total_sec  = 0.0;
+static double s_ksw_wall_total_sec = 0.0;
 struct KswTimingPrinter {
     ~KswTimingPrinter() {
         if (s_ksw_wall_total_sec > 0.0)
             fprintf(stderr, "[KSW timing] total wall time: %.6f s\n", s_ksw_wall_total_sec);
-        if (s_ksw_kernel_total_ms > 0.0)
-            fprintf(stderr, "[KSW timing] total kernel time: %.3f ms\n", s_ksw_kernel_total_ms);
     }
 } s_ksw_timing_printer;
 
@@ -509,10 +506,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                               d_mqe, d_mqe_t, d_mte, d_mte_q, d_zdropped);
     CHECKCUDAERROR(cudaGetLastError());
 
-    cudaEvent_t ksw_ev_start, ksw_ev_stop;
-    cudaEventCreate(&ksw_ev_start);
-    cudaEventCreate(&ksw_ev_stop);
-
     int batch_num = 0;
     int total_tasks_processed = 0;
 
@@ -833,7 +826,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             auto t_start = std::chrono::steady_clock::now();
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
-            cudaEventRecord(ksw_ev_start, align_stream);
             {
                 int parallel_threads = 32;
 
@@ -974,8 +966,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 );
             }
 
-            cudaEventRecord(ksw_ev_stop, align_stream);
-
             cudaStreamSynchronize(align_stream);
             auto t_end = std::chrono::steady_clock::now();
             double wall_sec = std::chrono::duration<double>(t_end - t_start).count();
@@ -1001,11 +991,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemcpyAsync(h_zdropped, d_zdropped, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
 
             cudaStreamSynchronize(align_stream);
-            {
-                float elapsed_ms = 0.0f;
-                cudaEventElapsedTime(&elapsed_ms, ksw_ev_start, ksw_ev_stop);
-                s_ksw_kernel_total_ms += elapsed_ms;
-            }
             kernel_err = cudaGetLastError();
             if (kernel_err != cudaSuccess) {
                 fprintf(stderr, "[ERROR] KSW fused persistent kernel execution failed: %s\n",
@@ -1145,9 +1130,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     PLOG_INFO(stderr, "[Info::%s] Alignment complete: %d tasks in %d batches\n",
             stream_tag, n_tasks, batch_num);
-
-    cudaEventDestroy(ksw_ev_start);
-    cudaEventDestroy(ksw_ev_stop);
 
     free(task_indices_short);
     free(task_indices_long);

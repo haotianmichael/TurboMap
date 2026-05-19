@@ -136,6 +136,16 @@ static size_t g_long_cigar_batch_override = 0;
 // Set via JSON key "max_align_task_len" in gpu_config.json.
 static size_t g_max_align_task_len = 50000;  // default 50,000 bp
 
+// Estimated bt_p memory per long-task concurrent slot.
+// Used to size n_long_cap (slot count) and MAX_LONG_BATCH.
+// Formula: bt_p_per_slot ≈ (qlen + tlen) × min(bw+1, min(qlen,tlen)) bytes.
+// For 10000bp tasks at bw=500:  ~10 MB; at bw=1000: ~20 MB; at bw=2000: ~40 MB.
+// If set too low: n_long_cap is overestimated (wastes bt_off_long/ksw_temp allocation).
+// If set too high: n_long_cap is underestimated (fewer concurrent slots allocated).
+// Runtime pool_cap0 uses actual bt_stride, so this only affects static slot count.
+// Set via JSON key "bt_stride_mb" in gpu_config.json.
+static size_t g_typical_bt_stride_bytes = (size_t)6 << 20;  // default 6 MB
+
 // ── compute_long_batch_size ─────────────────────────────────────────────────────
 // Derives the maximum long-task batch size (CIGAR-buffer bound) from the arena
 // size and resource costs.  The derivation targets pool_cap ≈ n_long_cap, where
@@ -150,7 +160,7 @@ static size_t g_max_align_task_len = 50000;  // default 50,000 bp
 // Called from setup_long_align_phase() and plmem_malloc_device_mem().
 static size_t compute_long_batch_size(size_t arena_bytes, size_t max_len) {
     const size_t L = 3;                                    // latency-hide factor
-    const size_t TYPICAL_BT_STRIDE = (size_t)6 << 20;     // 6 MB per slot (typical)
+    const size_t TYPICAL_BT_STRIDE = g_typical_bt_stride_bytes;
     const size_t MAX_CAP = 8192;
     const size_t MIN_CAP = 64;
 
@@ -411,7 +421,7 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     // long tasks: antidiag ≈ 10 000, n_col ≈ 615 → S ≈ 6 MB).  Adjust this constant
     // if your data has systematically larger or smaller alignment bandwidth.
     //
-    const size_t TYPICAL_BT_STRIDE = (size_t)6 * 1024 * 1024;  // ~6 MB typical slot cost
+    const size_t TYPICAL_BT_STRIDE = g_typical_bt_stride_bytes;
     const size_t MAX_LONG_SLOTS    = 4096;                        // hard cap on slot count
 
     size_t per_slot_var = dev_mem->align_ksw_temp_per_task + 2 * max_antidiag_long * sizeof(int);
@@ -1293,6 +1303,10 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     cJSON *task_len_json = cJSON_GetObjectItem(json, "max_align_task_len");
     if (task_len_json && task_len_json->valueint > 0)
         g_max_align_task_len = (size_t)task_len_json->valueint;
+
+    cJSON *bt_stride_json = cJSON_GetObjectItem(json, "bt_stride_mb");
+    if (bt_stride_json && bt_stride_json->valueint > 0)
+        g_typical_bt_stride_bytes = (size_t)bt_stride_json->valueint * 1024 * 1024;
 
     size_t usable = (gpu_free_mem > global_reserve) ? (gpu_free_mem - global_reserve) : gpu_free_mem;
     size_t avail_mem_per_stream = usable / (*num_stream_);

@@ -2,11 +2,10 @@
 #include <chrono>
 #include "plalign.cuh"
 #include "gasal_kernels.h"
-#include "plmem.cuh"  // For deviceMemPtr
+#include "plmem.cuh"
 #include "plksw_kernel.cuh"
-#include "plksw_shared_kernel.cuh"  // shared-memory long kernel (compile-time gated by USE_SHARED_LONG_KERNEL)
-#include "pllog.h"                  // PLOG_INFO macro (gated by PRINT)
-// plksw2_kernel.cuh (CUDASW4-style column-parallel) no longer used; unified anti-diagonal kernel
+#include "plksw_shared_kernel.cuh"
+#include "pllog.h"
 #include <cub/device/device_scan.cuh>
 
 #ifndef USE_SHARED_LONG_KERNEL
@@ -23,14 +22,15 @@ struct KswTimingPrinter {
             fprintf(stderr, "[KSW timing] total kernel time: %.3f ms\n", s_ksw_kernel_total_ms);
     }
 } s_ksw_timing_printer;
+
 #define CHECKCUDAERROR(error) \
-		do{\
-			err = error;\
-			if (cudaSuccess != err ) { \
-				fprintf(stderr, "[GASAL CUDA ERROR:] %s(CUDA error no.=%d). Line no. %d in file %s\n", cudaGetErrorString(err), err,  __LINE__, __FILE__); \
-				exit(EXIT_FAILURE);\
-			}\
-		}while(0)\
+        do{\
+            err = error;\
+            if (cudaSuccess != err ) { \
+                fprintf(stderr, "[GASAL CUDA ERROR:] %s(CUDA error no.=%d). Line no. %d in file %s\n", cudaGetErrorString(err), err,  __LINE__, __FILE__); \
+                exit(EXIT_FAILURE);\
+            }\
+        }while(0)\
 
 static align_config_t g_config = {
     .blocks = 28,
@@ -50,41 +50,36 @@ static bool g_subst_scores_uploaded = false;
 
 static void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi)
 {
-	int i, j;
-	a = a < 0? -a : a;
-	b = b > 0? -b : b;
-	sc_ambi = sc_ambi > 0? -sc_ambi : sc_ambi;
-	for (i = 0; i < m - 1; ++i) {
-		for (j = 0; j < m - 1; ++j)
-			mat[i * m + j] = i == j? a : b;
-		mat[i * m + m - 1] = sc_ambi;
-	}
-	for (j = 0; j < m; ++j)
-		mat[(m - 1) * m + j] = sc_ambi;
+    int i, j;
+    a = a < 0? -a : a;
+    b = b > 0? -b : b;
+    sc_ambi = sc_ambi > 0? -sc_ambi : sc_ambi;
+    for (i = 0; i < m - 1; ++i) {
+        for (j = 0; j < m - 1; ++j)
+            mat[i * m + j] = i == j? a : b;
+        mat[i * m + m - 1] = sc_ambi;
+    }
+    for (j = 0; j < m; ++j)
+        mat[(m - 1) * m + j] = sc_ambi;
 }
 
 void gasal_copy_subst_scores(gasal_subst_scores *subst){
-
-	cudaError_t err;
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapO, &(subst->gap_open), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapExtend, &(subst->gap_extend), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapOL, &(subst->gap_open_long), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapExtendL, &(subst->gap_extend_long), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
-	int32_t gapoe = (subst->gap_open + subst->gap_extend);
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapOE, &(gapoe), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaMatchScore, &(subst->match), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaMismatchScore, &(subst->mismatch), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
-	// For AGAThA
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaSliceWidth, &(subst->slice_width), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaZThreshold, &(subst->z_threshold), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
-	CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaBandWidth, &(subst->band_width), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
-	return;
+    cudaError_t err;
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapO, &(subst->gap_open), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapExtend, &(subst->gap_extend), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapOL, &(subst->gap_open_long), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapExtendL, &(subst->gap_extend_long), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+    int32_t gapoe = (subst->gap_open + subst->gap_extend);
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaGapOE, &(gapoe), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaMatchScore, &(subst->match), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaMismatchScore, &(subst->mismatch), sizeof(int8_t), 0, cudaMemcpyHostToDevice));
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaSliceWidth, &(subst->slice_width), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaZThreshold, &(subst->z_threshold), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
+    CHECKCUDAERROR(cudaMemcpyToSymbol(_cudaBandWidth, &(subst->band_width), sizeof(int32_t), 0, cudaMemcpyHostToDevice));
+    return;
 }
 
-// Set the device memory pointer for alignment operations
 void gpu_align_copy_param() {
-
-    // Upload substitution scores on first call
     if (!g_subst_scores_uploaded) {
         gasal_subst_scores subst;
         subst.match = g_config.match_score;
@@ -101,8 +96,6 @@ void gpu_align_copy_param() {
     }
 }
 
-// Kernel to initialize gasal_res_t structure on device
-// This avoids cudaMemcpy host-to-device structure alignment issues
 __global__ void init_gasal_res(gasal_res_t *res,
                                 int32_t *aln_score, int32_t *query_batch_end, int32_t *target_batch_end,
                                 int32_t *mqe, int32_t *mqe_t, int32_t *mte, int32_t *mte_q,
@@ -122,18 +115,13 @@ __global__ void init_gasal_res(gasal_res_t *res,
         res->n_cigar_ops = NULL;
     }
 }
-// ============================================================
-// P1: Compact CIGAR kernel
-// Copies stride-layout CIGAR (d_cigar_buffer[task * max_len + i])
-// into compact layout (d_compact_cigar[offsets[task] + i]).
-// Launch: <<<batch_size, 256, 0, stream>>>
-// ============================================================
+
 __global__ void compact_cigar_kernel(
-    const uint32_t * __restrict__ src,     // stride layout (task * max_len)
-    uint32_t       * __restrict__ dst,     // compact layout (offsets[task])
-    const uint32_t * __restrict__ offsets, // exclusive prefix-sum of lengths
-    const int      * __restrict__ lengths, // n_cigar per task
-    int              max_len               // stride width
+    const uint32_t * __restrict__ src,
+    uint32_t       * __restrict__ dst,
+    const uint32_t * __restrict__ offsets,
+    const int      * __restrict__ lengths,
+    int              max_len
 ) {
     int task_id = blockIdx.x;
     int n = lengths[task_id];
@@ -144,24 +132,13 @@ __global__ void compact_cigar_kernel(
         dst[dst_base + i] = src[src_base + i];
 }
 
-// ============================================================
-// P3/P2: gpu_fix_cigar device function (called by thread 0 only)
-//
-// Performs:
-//   Pass 1 – left-align indels (shift indel earlier if sequence allows)
-//   Pass 2 – consolidate runs like 5I6D7I → single I + single D
-//   Pass 3a – squeeze zero-length ops + merge adjacent same-op
-//   Pass 3b – SKIPPED (leading I/D removal adjusts coordinates; handled by CPU)
-//
-// Returns true if a leading I or D still exists (signals CPU fallback needed).
-//
-// Precision note: identical logic to CPU mm_fix_cigar; no precision difference.
-// ============================================================
 #define GPU_CIGAR_MATCH  0u
 #define GPU_CIGAR_INS    1u
 #define GPU_CIGAR_DEL    2u
 #define GPU_CIGAR_N_SKIP 3u
 
+// Performs left-align, I+D consolidation, and zero-squeeze passes on CIGAR in-place.
+// Returns true if a leading I or D remains (CPU must handle coordinate adjustment).
 __device__ static bool gpu_fix_cigar(
     uint32_t *cigar, int32_t *n_cigar_p,
     const uint8_t *qseq, const uint8_t *tseq
@@ -226,62 +203,48 @@ __device__ static bool gpu_fix_cigar(
             if (s1 > 0 && s2 > 0 && l - k > 2) {
                 cigar[k]   = (s1 << 4) | GPU_CIGAR_INS;
                 cigar[k+1] = (s2 << 4) | GPU_CIGAR_DEL;
-                for (int m = k + 2; m < l; ++m) cigar[m] &= 0xfu; // zero lengths
+                for (int m = k + 2; m < l; ++m) cigar[m] &= 0xfu;
                 to_shrink = 1;
             }
-            k = l - 1; // outer loop will ++k → skip to l
+            k = l - 1;
         }
     }
 
     // Pass 3a: squeeze zero-length ops + merge adjacent same-op
     if (to_shrink) {
-        // Squeeze zeros
         int32_t l = 0;
         for (int k = 0; k < nc; ++k)
             if (cigar[k] >> 4 != 0u) cigar[l++] = cigar[k];
         nc = l;
-        // Merge adjacent same-op
         l = 0;
         for (int k = 0; k < nc; ++k) {
             if (k == nc - 1 || (cigar[k] & 0xfu) != (cigar[k+1] & 0xfu))
                 cigar[l++] = cigar[k];
             else
-                cigar[k+1] += cigar[k] >> 4 << 4; // accumulate length into next
+                cigar[k+1] += cigar[k] >> 4 << 4;
         }
         nc = l;
     }
 
     *n_cigar_p = nc;
-    // Pass 3b skipped: return whether leading I/D remains (CPU must handle it)
+    // Pass 3b (leading I/D coordinate adjustment) is skipped; signal CPU fallback if needed.
     return nc > 0 && ((cigar[0] & 0xfu) == GPU_CIGAR_INS || (cigar[0] & 0xfu) == GPU_CIGAR_DEL);
 }
 
-// ============================================================
-// P2/P3: gpu_fix_cigar_and_stats kernel
-//
-// One block per task (blockIdx.x = batch slot / align_id).
-// Thread 0 runs gpu_fix_cigar() then computes alignment stats.
-// Other threads are unused (1 thread per block launch for simplicity).
-//
-// Writes: updated cigar_lengths, blen, mlen, n_ambi, dp_max, gpu_stats_valid.
-//
-// Precision notes vs CPU mm_update_extra:
-//   - dp_max: uses integer log2 (31-__clz(1+len)) vs CPU float mg_log2 → ±1 in dp_max
-//   - EQX mode: not handled here; caller checks gpu_stats_valid before using stats
-//   - Leading I/D (pass 3b): sets gpu_stats_valid=0, CPU mm_update_extra handles it
-// ============================================================
+// dp_max uses integer log2 (31-__clz(1+len)) vs CPU float mg_log2 — may differ by ±1.
+// Sets gpu_stats_valid=0 for tasks with leading I/D (CPU mm_update_extra handles those).
 __global__ void gpu_fix_cigar_and_stats(
-    uint32_t       *compact_cigar,         // in/out: compact CIGAR (writable)
-    const uint32_t * __restrict__ offsets, // per-task start in compact_cigar
-    int32_t        *cigar_lengths,         // in/out: n_cigar (updated by fix)
-    const uint8_t  * __restrict__ d_query, // unpacked query sequences
-    const uint8_t  * __restrict__ d_target,// unpacked target sequences
-    const uint32_t * __restrict__ d_query_offsets,  // byte offsets into d_query
-    const uint32_t * __restrict__ d_target_offsets, // byte offsets into d_target
-    const int8_t   * __restrict__ d_mat,   // 5×5 scoring matrix
-    int32_t         q_open,                // gap open penalty
-    int32_t         e_ext,                 // gap extend penalty
-    int             log_gap,               // 1 = use log-gap scoring
+    uint32_t       *compact_cigar,
+    const uint32_t * __restrict__ offsets,
+    int32_t        *cigar_lengths,
+    const uint8_t  * __restrict__ d_query,
+    const uint8_t  * __restrict__ d_target,
+    const uint32_t * __restrict__ d_query_offsets,
+    const uint32_t * __restrict__ d_target_offsets,
+    const int8_t   * __restrict__ d_mat,
+    int32_t         q_open,
+    int32_t         e_ext,
+    int             log_gap,
     int32_t        *d_blen,
     int32_t        *d_mlen,
     int32_t        *d_n_ambi,
@@ -291,8 +254,6 @@ __global__ void gpu_fix_cigar_and_stats(
 ) {
     int task_id = blockIdx.x;
     if (task_id >= batch_size) return;
-
-    // Only thread 0 does work (single-threaded sequential logic per task)
     if (threadIdx.x != 0) return;
 
     int32_t nc = cigar_lengths[task_id];
@@ -305,22 +266,19 @@ __global__ void gpu_fix_cigar_and_stats(
         return;
     }
 
-    uint32_t cigar_base         = offsets[task_id];
-    uint32_t *cigar             = compact_cigar + cigar_base;
-    const uint8_t *qseq         = d_query  + d_query_offsets[task_id];
-    const uint8_t *tseq         = d_target + d_target_offsets[task_id];
+    uint32_t cigar_base  = offsets[task_id];
+    uint32_t *cigar      = compact_cigar + cigar_base;
+    const uint8_t *qseq  = d_query  + d_query_offsets[task_id];
+    const uint8_t *tseq  = d_target + d_target_offsets[task_id];
 
-    // Pass 1/2/3a: fix CIGAR in-place
     bool has_leading_indel = gpu_fix_cigar(cigar, &nc, qseq, tseq);
     cigar_lengths[task_id] = nc;
 
     if (has_leading_indel) {
-        // Pass 3b would adjust coordinates — CPU must handle this task
         d_gpu_stats_valid[task_id] = 0;
         return;
     }
 
-    // Compute blen, mlen, n_ambi, dp_max via sequential scan
     int8_t mat[25];
     for (int i = 0; i < 25; i++) mat[i] = d_mat[i];
 
@@ -340,7 +298,7 @@ __global__ void gpu_fix_cigar_and_stats(
                 if (ct > 3 || cq > 3) { na++; }
                 else if (ct != cq)    { nd++; }
                 s += (double)mat[ct * 5 + cq];
-                if (s < 0.0)      s = 0.0;
+                if (s < 0.0)        s = 0.0;
                 else if (s > max_s) max_s = s;
             }
             blen   += (int)len - na;
@@ -354,9 +312,7 @@ __global__ void gpu_fix_cigar_and_stats(
                 if (qseq[qoff + l] > 3) na++;
             blen   += (int)len - na;
             n_ambi += na;
-            // log_gap: penalty = q + e * floor(log2(1+len))
-            // Integer approximation: 31 - __clz(1u + len) = floor(log2(1+len))
-            // Precision note: differs from CPU float mg_log2 at most by ±1 in integer part
+            // Integer floor(log2(1+len)) via __clz; may differ from CPU float mg_log2 by ±1.
             if (log_gap) s -= (double)q_open + (double)e_ext * (double)(31 - __clz(1u + len));
             else         s -= (double)q_open + (double)e_ext;
             if (s < 0.0) s = 0.0;
@@ -400,48 +356,26 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     cudaSetDevice(0);
     gpu_align_copy_param();
 
-    // Resolve per-stream device memory and CUDA stream (thread-safe, no globals)
     deviceMemPtr *dev_mem = gpu_get_dev_mem(stream_id);
     if (!dev_mem) {
         fprintf(stderr, "[ERROR] Invalid stream_id %d for alignment.\n", stream_id);
         return;
     }
 
-    // Switch arena from chain phase to align phase
     plmem_phase_to_align(dev_mem);
 
-    // ========== Three-Tier Batched Processing Setup ==========
-    // Tasks are split into two runtime phases based on max sequence length:
-    //   Tier 0 (short): max(qlen,tlen) ≤ short_task_max_len (1000 bp)
-    //     - Fixed bt_p stride = max_antidiag_short × max_n_col_short (2MB/slot)
-    //     - Up to n_concurrent_blocks concurrent slots
-    //   Tier 1 (long): max(qlen,tlen) > short_task_max_len
-    //     - Per-batch dynamic bt_p stride = actual_max_antidiag × actual_max_n_col
-    //       so extra-long reads with large bandwidth (e.g. bw_long=7501) get
-    //       a correctly-sized buffer with fewer concurrent slots
-    //     - Separate bt_off buffer (max_antidiag_long stride) prevents the
-    //       short-tier off arrays (stride 2000) from being overwritten
-    //     - Concurrent slots = min(n_long_concurrent_slots,
-    //                              bt_p_total / batch_max_backtrack_size)
-
     int kernel_blocks = 28;
-    size_t short_task_max_len = dev_mem->short_task_max_len;      // 1000bp
-    size_t short_batch_size = dev_mem->short_task_batch_size;      // 10,000
+    size_t short_task_max_len = dev_mem->short_task_max_len;
+    size_t short_batch_size   = dev_mem->short_task_batch_size;
 
-    // Classify tasks into short (tier-0) / long (tier-1) by max sequence length
     int *task_indices_short = (int*)malloc(n_tasks * sizeof(int));
-    int *task_indices_long = (int*)malloc(n_tasks * sizeof(int));
+    int *task_indices_long  = (int*)malloc(n_tasks * sizeof(int));
     int n_short_tasks = 0;
-    int n_long_tasks = 0;
+    int n_long_tasks  = 0;
 
-    // Hard limits derived from GPU buffer allocation in setup_long_align_phase():
-    //   ksw_temp_per_task  = f(max_align_query_len)   → max(qlen,tlen) must be ≤ limit
-    //   bt_p antidiag buf  = 2 × max_align_query_len  → qlen+tlen must be ≤ 2×limit
-    //   CIGAR buffer       = 2 × max_align_query_len  → qlen+tlen ≤ 2×limit-2 (guard)
-    // Exceeding any of these causes silent memory corruption or wrong results.
-    // Fatal-exit here so the problem is caught before any GPU work starts.
-    const size_t gpu_max_one  = (size_t)dev_mem->max_align_query_len;        // 50000
-    const size_t gpu_max_sum  = 2 * gpu_max_one - 2;  // 99998: tightest (CIGAR guard)
+    // Hard limits derived from GPU buffer allocation. Exceeding causes OOB or wrong results.
+    const size_t gpu_max_one = (size_t)dev_mem->max_align_query_len;
+    const size_t gpu_max_sum = 2 * gpu_max_one - 2;  // CIGAR buffer guard
 
     for (int i = 0; i < n_tasks; i++) {
         int ql = tasks[i].qlen;
@@ -460,33 +394,26 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         }
 
         size_t max_seq_len = max_one;
-        if (max_seq_len <= short_task_max_len) {
+        if (max_seq_len <= short_task_max_len)
             task_indices_short[n_short_tasks++] = i;
-        } else {
+        else
             task_indices_long[n_long_tasks++] = i;
-        }
     }
 
-    // Sort long tasks by DESCENDING estimated bt_stride = (qlen+tlen) × min(min(qlen,tlen), w+1).
-    // Largest bt_stride first → first batch has the hardest tasks.
-    // With dynamic per-batch batch_size = pool_cap × LATENCY_HIDE_FACTOR, the kernel is given
-    // exactly as many tasks as it can process concurrently (× latency hide), so:
-    //   - Large-bt_stride batches: small pool_cap → small batch (few tasks, runs fast)
-    //   - Small-bt_stride batches: large pool_cap → large batch (many tasks, high utilisation)
-    // Without this ordering, ONE large-bt_stride task would dominate ALL 5000+ tasks in the
-    // same batch, collapsing pool_cap for everyone.
+    // Sort long tasks descending by estimated bt_stride = (qlen+tlen) × n_col.
+    // Largest bt_stride first so per-batch dynamic sizing gives smallest batches to hardest tasks,
+    // preventing one oversized task from collapsing pool_cap for an entire large batch.
     std::sort(task_indices_long, task_indices_long + n_long_tasks,
         [&tasks](int a, int b) {
             int qa = tasks[a].qlen, ta = tasks[a].tlen, wa = tasks[a].w;
             int qb = tasks[b].qlen, tb = tasks[b].tlen, wb = tasks[b].w;
             int nca = (qa < ta) ? qa : ta;  if (wa >= 0 && wa + 1 < nca) nca = wa + 1;
             int ncb = (qb < tb) ? qb : tb;  if (wb >= 0 && wb + 1 < ncb) ncb = wb + 1;
-            size_t sa = (size_t)(qa + ta) * (size_t)nca;  // estimated bt_stride (bytes / sizeof)
+            size_t sa = (size_t)(qa + ta) * (size_t)nca;
             size_t sb = (size_t)(qb + tb) * (size_t)ncb;
-            return sa > sb;  // DESCENDING: largest bt_stride first
+            return sa > sb;
         });
 
-    // Convenience tag used for all per-stream log lines in this function
     char stream_tag[32];
     snprintf(stream_tag, sizeof(stream_tag), "stream_%d", stream_id);
 
@@ -494,40 +421,38 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             stream_tag, n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
 
     int kernel_threads = 256;
-    uint8_t *d_unpacked_query = dev_mem->d_align_unpacked_query;
-    uint8_t *d_unpacked_target = dev_mem->d_align_unpacked_target;
-    uint32_t *d_packed_query = dev_mem->d_align_packed_query;
-    uint32_t *d_packed_target = dev_mem->d_align_packed_target;
-    uint32_t *d_query_offsets = dev_mem->d_align_query_offsets;
-    uint32_t *d_target_offsets = dev_mem->d_align_target_offsets;
-    uint32_t *d_query_lens = dev_mem->d_align_query_lens;
-    uint32_t *d_target_lens = dev_mem->d_align_target_lens;
-    int32_t *d_flag = dev_mem->d_align_flag;
-    int32_t *d_bw   = dev_mem->d_align_bw;
-    void *d_ksw_temp_buffer = dev_mem->d_align_ksw_temp_buffer;
-    size_t ksw_temp_per_task = dev_mem->align_ksw_temp_per_task;
-    uint8_t *d_backtrack_p = dev_mem->d_align_backtrack_p;
-    int *d_backtrack_off = dev_mem->d_align_backtrack_off;
-    int *d_backtrack_off_end = dev_mem->d_align_backtrack_off_end;
-    uint32_t *d_cigar_buffer = dev_mem->d_align_cigar_buffer;
-    int *d_cigar_lengths = dev_mem->d_align_cigar_lengths;
-    size_t max_backtrack_size = dev_mem->max_align_backtrack_size;
-    size_t max_cigar_len = dev_mem->max_align_cigar_len;
-    size_t max_query_len_limit = dev_mem->max_align_query_len;
-    int8_t *d_mat = dev_mem->d_align_mat;
-    void *device_res = dev_mem->d_align_device_res;
-    int32_t *d_scores = dev_mem->d_align_scores;
-    int32_t *d_query_ends = dev_mem->d_align_query_ends;
-    int32_t *d_target_ends = dev_mem->d_align_target_ends;
-    int32_t *d_mqe = dev_mem->d_align_mqe;
-    int32_t *d_mqe_t = dev_mem->d_align_mqe_t;
-    int32_t *d_mte = dev_mem->d_align_mte;
-    int32_t *d_mte_q = dev_mem->d_align_mte_q;
-    int32_t *d_zdropped = dev_mem->d_align_zdropped;
-    int  *d_task_counter = dev_mem->d_align_task_counter;
-    int   n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
-    cudaStream_t align_stream = gpu_get_cudastream(stream_id);
-    // P1/P2/P3 device buffers
+    uint8_t  *d_unpacked_query  = dev_mem->d_align_unpacked_query;
+    uint8_t  *d_unpacked_target = dev_mem->d_align_unpacked_target;
+    uint32_t *d_packed_query    = dev_mem->d_align_packed_query;
+    uint32_t *d_packed_target   = dev_mem->d_align_packed_target;
+    uint32_t *d_query_offsets   = dev_mem->d_align_query_offsets;
+    uint32_t *d_target_offsets  = dev_mem->d_align_target_offsets;
+    uint32_t *d_query_lens      = dev_mem->d_align_query_lens;
+    uint32_t *d_target_lens     = dev_mem->d_align_target_lens;
+    int32_t  *d_flag            = dev_mem->d_align_flag;
+    int32_t  *d_bw              = dev_mem->d_align_bw;
+    void     *d_ksw_temp_buffer = dev_mem->d_align_ksw_temp_buffer;
+    size_t    ksw_temp_per_task = dev_mem->align_ksw_temp_per_task;
+    uint8_t  *d_backtrack_p     = dev_mem->d_align_backtrack_p;
+    int      *d_backtrack_off   = dev_mem->d_align_backtrack_off;
+    int      *d_backtrack_off_end = dev_mem->d_align_backtrack_off_end;
+    uint32_t *d_cigar_buffer    = dev_mem->d_align_cigar_buffer;
+    int      *d_cigar_lengths   = dev_mem->d_align_cigar_lengths;
+    size_t    max_cigar_len     = dev_mem->max_align_cigar_len;
+    size_t    max_query_len_limit = dev_mem->max_align_query_len;
+    int8_t   *d_mat             = dev_mem->d_align_mat;
+    void     *device_res        = dev_mem->d_align_device_res;
+    int32_t  *d_scores          = dev_mem->d_align_scores;
+    int32_t  *d_query_ends      = dev_mem->d_align_query_ends;
+    int32_t  *d_target_ends     = dev_mem->d_align_target_ends;
+    int32_t  *d_mqe             = dev_mem->d_align_mqe;
+    int32_t  *d_mqe_t           = dev_mem->d_align_mqe_t;
+    int32_t  *d_mte             = dev_mem->d_align_mte;
+    int32_t  *d_mte_q           = dev_mem->d_align_mte_q;
+    int32_t  *d_zdropped        = dev_mem->d_align_zdropped;
+    int      *d_task_counter    = dev_mem->d_align_task_counter;
+    int       n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
+    cudaStream_t align_stream   = gpu_get_cudastream(stream_id);
     uint32_t *d_compact_cigar   = dev_mem->d_align_compact_cigar;
     uint32_t *d_compact_offsets = dev_mem->d_align_compact_offsets;
     void     *d_cub_tmp         = dev_mem->d_align_cub_tmp;
@@ -538,26 +463,19 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t  *d_dp_max          = dev_mem->d_align_dp_max;
     int32_t  *d_gpu_stats_valid = dev_mem->d_align_gpu_stats_valid;
 
-    // Batch sizing
-    size_t long_cigar_len = 2 * max_query_len_limit;  // 100000 for long tasks (50000bp)
+    size_t long_cigar_len       = 2 * max_query_len_limit;
     size_t short_batch_persistent = (size_t)dev_mem->max_align_tasks;
-    size_t cigar_buf_total_tasks   = (size_t)dev_mem->max_align_tasks;
-    size_t long_batch_persistent   = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;
+    size_t cigar_buf_total_tasks  = (size_t)dev_mem->max_align_tasks;
+    size_t long_batch_persistent  = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;
 
-    int total_batches_short = n_short_tasks > 0 ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
+    int total_batches_short = n_short_tasks > 0
+        ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
     PLOG_INFO(stderr, "[Info::%s]   Tier-0 (short): %d batch(es) × up to %zu tasks  [fixed bt stride: %zu×%zu bytes]\n",
             stream_tag, total_batches_short, short_batch_persistent,
             2 * short_task_max_len, short_task_max_len + 1);
-    // Tier-1 (long): batch count is determined dynamically per-batch (bt_stride-sorted tasks,
-    // batch_size = pool_cap × LATENCY_HIDE_FACTOR).  Do not print an estimate here; the actual
-    // count is shown at the end ("Alignment complete: X tasks in Y batches").
     PLOG_INFO(stderr, "[Info::%s]   Tier-1 (long):  %d tasks  [bt_stride-sorted; batch count determined dynamically]\n",
             stream_tag, n_long_tasks);
 
-    size_t max_batch_size = (short_batch_persistent > long_batch_persistent) ?
-                             short_batch_persistent : long_batch_persistent;
-
-    // Use pre-allocated pinned host buffers from dev_mem (allocated once during init)
     uint32_t *h_compact_cigar   = dev_mem->h_align_compact_cigar;
     uint32_t *h_compact_offsets = dev_mem->h_align_compact_offsets;
     int      *h_cigar_lengths   = dev_mem->h_align_cigar_lengths;
@@ -567,11 +485,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int32_t  *h_dp_max          = dev_mem->h_align_dp_max;
     int32_t  *h_gpu_stats_valid = dev_mem->h_align_gpu_stats_valid;
     int32_t  *h_scores          = dev_mem->h_align_scores;
-
-    // KSW kernel timing
-    cudaEvent_t ksw_ev_start, ksw_ev_stop;
-    cudaEventCreate(&ksw_ev_start);
-    cudaEventCreate(&ksw_ev_stop);
     int32_t  *h_query_ends      = dev_mem->h_align_query_ends;
     int32_t  *h_target_ends     = dev_mem->h_align_target_ends;
     int32_t  *h_mqe             = dev_mem->h_align_mqe;
@@ -585,7 +498,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     uint32_t *h_target_lens     = dev_mem->h_align_target_lens;
     int32_t  *h_flag            = dev_mem->h_align_flag;
     int32_t  *h_bw              = dev_mem->h_align_bw;
-    // h_task_to_align_id was always identity (i→i) — use i directly instead.
 
     int8_t h_scoring_matrix[25];
     ksw_gen_simple_mat(5, h_scoring_matrix, opt->a, opt->b, opt->sc_ambi);
@@ -593,51 +505,39 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     CHECKCUDAERROR(cudaMemcpyAsync(d_mat, h_scoring_matrix, 25 * sizeof(int8_t),
                                    cudaMemcpyHostToDevice, align_stream));
 
-    // Initialize device result structure directly on device
-    // Using a kernel avoids host-device structure alignment issues with cudaMemcpy
-    // Performance impact: ~5-10 microseconds (negligible compared to alignment kernel runtime)
     init_gasal_res<<<1, 1, 0, align_stream>>>((gasal_res_t*)device_res, d_scores, d_query_ends, d_target_ends,
                               d_mqe, d_mqe_t, d_mte, d_mte_q, d_zdropped);
     CHECKCUDAERROR(cudaGetLastError());
 
-    // ========== THREE-TIER BATCHED PROCESSING LOOP ==========
-    // Phase 0 = short tasks (tier-0), phase 1 = long tasks (tier-1)
-    // Tier-1 further adapts bt buffer size per batch (dynamic tier within the loop)
+    cudaEvent_t ksw_ev_start, ksw_ev_stop;
+    cudaEventCreate(&ksw_ev_start);
+    cudaEventCreate(&ksw_ev_stop);
 
     int batch_num = 0;
     int total_tasks_processed = 0;
 
     for (int phase = 0; phase < 2; phase++) {
-        // Select phase-specific parameters
-        int *current_task_indices = (phase == 0) ? task_indices_short : task_indices_long;
-        int n_tasks_in_phase = (phase == 0) ? n_short_tasks : n_long_tasks;
-        // Use persistent-kernel batch sizes (CIGAR-buffer limited, not backtrack-limited)
-        size_t current_batch_size = (phase == 0) ? short_batch_persistent : long_batch_persistent;
-        const char *phase_name = (phase == 0) ? "Tier-0 Short" : "Tier-1 Long";
+        int  *current_task_indices  = (phase == 0) ? task_indices_short : task_indices_long;
+        int   n_tasks_in_phase      = (phase == 0) ? n_short_tasks : n_long_tasks;
+        size_t current_batch_size   = (phase == 0) ? short_batch_persistent : long_batch_persistent;
+        const char *phase_name      = (phase == 0) ? "Tier-0 Short" : "Tier-1 Long";
 
-        // Dynamic backtrack buffer sizing based on phase
-        // Short phase stride caps n_col at (short_task_max_len + 1) to match plmem alloc, allowing
-        // any per-task bandwidth (n_col = min(qlen, tlen, w+1) is bounded by short_task_max_len).
-        // Long phase: n_col and antidiag are computed PER BATCH below to handle varying bandwidths.
-        size_t current_max_antidiag = 2 * short_task_max_len;          // used only for phase 0
-        size_t current_max_n_col    = short_task_max_len + 1;          // used only for phase 0
-        size_t current_max_backtrack_size = current_max_antidiag * current_max_n_col;  // phase 0
-        size_t current_max_cigar_len = (phase == 0) ? (2 * short_task_max_len) : (2 * dev_mem->max_align_query_len);
+        // Short phase: n_col bounded by short_task_max_len regardless of per-task bandwidth.
+        // Long phase: n_col and antidiag are computed per-batch below.
+        size_t current_max_antidiag      = 2 * short_task_max_len;
+        size_t current_max_n_col         = short_task_max_len + 1;
+        size_t current_max_backtrack_size = current_max_antidiag * current_max_n_col;
+        size_t current_max_cigar_len     = (phase == 0)
+            ? (2 * short_task_max_len)
+            : (2 * dev_mem->max_align_query_len);
 
-        if (n_tasks_in_phase == 0) continue;  // Skip empty phase
+        if (n_tasks_in_phase == 0) continue;
 
-        // ── Long-align arena transition ────────────────────────────────────────
-        // When we enter phase 1 (long tasks), the short-align arena layout
-        // wastes ~10 GB on large CIGAR/seq buffers we no longer need.
-        // Transition to long-align layout: same 15 GB physical block, reset and
-        // re-allocated so bt_p gets ~13 GB instead of ~5 GB.
-        // We sync the stream first to ensure all short-phase work is flushed.
         if (phase == 1) {
             cudaStreamSynchronize(align_stream);
-
             plmem_phase_to_long_align(dev_mem);
 
-            // ── Refresh all local GPU pointers from dev_mem ──────────────────
+            // Refresh all local GPU pointers after arena transition
             d_unpacked_query  = dev_mem->d_align_unpacked_query;
             d_unpacked_target = dev_mem->d_align_unpacked_target;
             d_packed_query    = dev_mem->d_align_packed_query;
@@ -650,13 +550,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             d_bw              = dev_mem->d_align_bw;
             d_ksw_temp_buffer = dev_mem->d_align_ksw_temp_buffer;
             ksw_temp_per_task = dev_mem->align_ksw_temp_per_task;
-            d_backtrack_p     = dev_mem->d_align_backtrack_p;  // now ~13 GB pool
-            // d_backtrack_off / d_backtrack_off_end: stubs, not used for long tasks
+            d_backtrack_p     = dev_mem->d_align_backtrack_p;
             d_backtrack_off     = dev_mem->d_align_backtrack_off;
             d_backtrack_off_end = dev_mem->d_align_backtrack_off_end;
             d_cigar_buffer    = dev_mem->d_align_cigar_buffer;
             d_cigar_lengths   = dev_mem->d_align_cigar_lengths;
-            max_cigar_len     = dev_mem->max_align_cigar_len;  // now 100,000
+            max_cigar_len     = dev_mem->max_align_cigar_len;
             d_mat             = dev_mem->d_align_mat;
             device_res        = dev_mem->d_align_device_res;
             d_scores          = dev_mem->d_align_scores;
@@ -668,7 +567,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             d_mte_q           = dev_mem->d_align_mte_q;
             d_zdropped        = dev_mem->d_align_zdropped;
             d_task_counter    = dev_mem->d_align_task_counter;
-            n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;  // now n_long_cap (dynamic)
+            n_concurrent_blocks = dev_mem->n_align_concurrent_blocks;
             d_compact_cigar   = dev_mem->d_align_compact_cigar;
             d_compact_offsets = dev_mem->d_align_compact_offsets;
             d_cub_tmp         = dev_mem->d_align_cub_tmp;
@@ -679,27 +578,19 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             d_dp_max          = dev_mem->d_align_dp_max;
             d_gpu_stats_valid = dev_mem->d_align_gpu_stats_valid;
 
-            // Re-upload scoring matrix (d_align_mat is at a new arena address)
+            // Re-upload scoring matrix and gasal_res (now at new arena addresses)
             int8_t h_scoring_matrix2[25];
             ksw_gen_simple_mat(5, h_scoring_matrix2, opt->a, opt->b, opt->sc_ambi);
             cudaMemcpyAsync(d_mat, h_scoring_matrix2, 25 * sizeof(int8_t),
                             cudaMemcpyHostToDevice, align_stream);
-
-            // Re-init gasal_res (d_align_device_res is at a new arena address)
             init_gasal_res<<<1, 1, 0, align_stream>>>(
                 (gasal_res_t*)device_res,
                 d_scores, d_query_ends, d_target_ends,
                 d_mqe, d_mqe_t, d_mte, d_mte_q, d_zdropped);
 
-            // long_task_batch_size is set by setup_long_align_phase() via
-            // compute_long_batch_size(): it is the CIGAR-buffer hard cap on batch size.
-            // Actual per-batch batch_size is further constrained dynamically inside
-            // the while loop below (pool_cap × LATENCY_HIDE_FACTOR).
             long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
-            current_batch_size    = long_batch_persistent;  // upper bound; overridden per-batch
-            /* Effective bt_p = max(arena, dedicated) — matches what the     */
-            /* dispatch and dyn_batch sizing actually use.  long_bt_p_pool_  */
-            /* bytes alone could show the smaller dedicated pool and mislead.*/
+            current_batch_size    = long_batch_persistent;
+
             size_t _arena_bt = dev_mem->long_arena_bt_p_bytes;
             size_t _dedi_bt  = (dev_mem->d_align_backtrack_p_long != nullptr)
                                ? dev_mem->long_bt_p_pool_bytes : 0;
@@ -712,123 +603,62 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
         PLOG_INFO(stderr, "[Info::%s] === %s: %d tasks ===\n", stream_tag, phase_name, n_tasks_in_phase);
 
-        // Problem: result buffers are 120,000 elements but we only clear phase_batch_size
-        // This causes long phase to read stale data from short phase!
-        // Solution: Clear ENTIRE physical buffer allocation at phase start
-
-        // Clear ksw_temp_buffer (allocated for short_batch_size tasks)
-        size_t ksw_temp_buffer_size = short_batch_size * ksw_temp_per_task;
-        //cudaMemset(d_ksw_temp_buffer, 0, ksw_temp_buffer_size);
-
-        // Both short (10000×2000) and long (200×100000) phases use same 15GB buffer with different strides
-        // Must clear entire 15GB to prevent cross-phase contamination
-        size_t full_backtrack_p_size = short_batch_size * (2 * short_task_max_len) * 752;  // Always 15GB
-        size_t full_backtrack_off_size = short_batch_size * (2 * short_task_max_len) * sizeof(int);
-        /*cudaMemset(d_backtrack_p, 0, full_backtrack_p_size);
-        cudaMemset(d_backtrack_off, 0, full_backtrack_off_size);
-        cudaMemset(d_backtrack_off_end, 0, full_backtrack_off_size);
-        cudaMemset(d_backtrack_n_col, 0, short_batch_size * sizeof(int));
-        cudaMemset(d_cigar_buffer, 0, short_batch_size * (2 * short_task_max_len) * sizeof(uint32_t));
-        cudaMemset(d_cigar_lengths, 0, short_batch_size * sizeof(int));
-        cudaMemset(d_ez_array, 0, short_batch_size * sizeof(ksw_extz_t));*.
-
-        // These are shared across all phases and must be completely cleared
-        size_t max_align_tasks = 120000;  // From plmem.cu
-        /*cudaMemset(d_scores, 0, max_align_tasks * sizeof(int32_t));
-        cudaMemset(d_query_ends, 0, max_align_tasks * sizeof(int32_t));
-        cudaMemset(d_target_ends, 0, max_align_tasks * sizeof(int32_t));
-        cudaMemset(d_mqe, 0, max_align_tasks * sizeof(int32_t));
-        cudaMemset(d_mqe_t, 0, max_align_tasks * sizeof(int32_t));
-        cudaMemset(d_mte, 0, max_align_tasks * sizeof(int32_t));
-        cudaMemset(d_mte_q, 0, max_align_tasks * sizeof(int32_t));*/
-
         int tasks_processed_in_phase = 0;
         int phase_batch_num = 0;
-        int total_phase_batches = (n_tasks_in_phase > 0) ?
-            (int)((n_tasks_in_phase + (int)current_batch_size - 1) / (int)current_batch_size) : 0;
+        int total_phase_batches = (n_tasks_in_phase > 0)
+            ? (int)((n_tasks_in_phase + (int)current_batch_size - 1) / (int)current_batch_size) : 0;
 
         // Repeat-suppression state for long-phase batch logging.
-        // When consecutive batches have identical (bt_stride, slots, batch_size),
-        // we print the first, accumulate the rest, and flush with "×N" when params change.
         size_t rep_bt_stride  = 0;
         int    rep_slots      = 0;
         int    rep_batch_size = 0;
-        int    rep_count      = 0;   // number of suppressed identical batches after the first
-        int    rep_done_start = 0;   // tasks_processed_in_phase when the group started
+        int    rep_count      = 0;
+        int    rep_done_start = 0;
 
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
 
-            // ── Dynamic batch sizing for long-task phase ─────────────────────────────
-            // Tasks are sorted DESCENDING by estimated bt_stride = (qlen+tlen)×n_col.
-            // The first task in this batch has the largest bt_stride → lowest pool_cap.
-            // We want batch_size = pool_cap × LATENCY_HIDE_FACTOR so the GPU has
-            // enough concurrent warps to hide global-memory latency without wasting
-            // CIGAR buffer on tasks that won't improve concurrency further.
-            //
-            // pool_cap = bt_p_total / bt_stride_of_first_task (floor)
-            // LATENCY_HIDE_FACTOR = 3: empirical — 3× physical occupancy is sufficient
-            //   for L2-bandwidth-bound KSW bt_p accesses on A100 (tested range: 2–4×).
+            // Dynamic batch sizing for long phase:
+            // Tasks sorted descending by bt_stride; first task has largest bt_stride → lowest pool_cap.
+            // batch_size = pool_cap × LATENCY_HIDE_FACTOR (3) keeps GPU busy without wasting CIGAR buffer.
             if (phase == 1) {
-                int tidx0  = current_task_indices[batch_start];
-                int ql0    = tasks[tidx0].qlen;
-                int tl0    = tasks[tidx0].tlen;
-                int w0     = tasks[tidx0].w;
-                int nc0    = (ql0 < tl0) ? ql0 : tl0;
+                int tidx0 = current_task_indices[batch_start];
+                int ql0   = tasks[tidx0].qlen;
+                int tl0   = tasks[tidx0].tlen;
+                int w0    = tasks[tidx0].w;
+                int nc0   = (ql0 < tl0) ? ql0 : tl0;
                 if (w0 >= 0 && w0 + 1 < nc0) nc0 = w0 + 1;
                 size_t bt_stride0 = (size_t)(ql0 + tl0) * (size_t)nc0;
 
-                // bt_p bytes available to the long phase (set at arena transition).
-                // Take the LARGER of the dedicated cudaMalloc pool (if any)
-                // and the arena bt_p — must match what the launch dispatch
-                // below picks, otherwise we'd undersize the batch (causing
-                // tiny 64-task batches and many extra launches) or oversize
-                // (causing OOB).  See bt_p_total_bytes selection ~line 950.
-                // Fallback: n_long_concurrent_slots × TYPICAL_BT_STRIDE.
+                // Use the LARGER of arena and dedicated bt_p pool to match the actual dispatch pointer.
                 const size_t TYPICAL_BT_STRIDE_FALLBACK = (size_t)6 << 20;
                 size_t arena_bt_p = dev_mem->long_arena_bt_p_bytes;
                 size_t dedi_bt_p  = (dev_mem->d_align_backtrack_p_long != nullptr)
                                     ? dev_mem->long_bt_p_pool_bytes : 0;
                 size_t bt_p_avail = (arena_bt_p > dedi_bt_p) ? arena_bt_p : dedi_bt_p;
-                if (bt_p_avail == 0) {
-                    bt_p_avail = (size_t)dev_mem->n_long_concurrent_slots *
-                                 TYPICAL_BT_STRIDE_FALLBACK;
-                }
+                if (bt_p_avail == 0)
+                    bt_p_avail = (size_t)dev_mem->n_long_concurrent_slots * TYPICAL_BT_STRIDE_FALLBACK;
 
                 const size_t LATENCY_HIDE_FACTOR = 3;
                 size_t pool_cap0 = (bt_stride0 > 0) ? (bt_p_avail / bt_stride0) : (size_t)256;
                 if (pool_cap0 < 1) pool_cap0 = 1;
 
                 size_t dyn_batch = pool_cap0 * LATENCY_HIDE_FACTOR;
-                if (dyn_batch < 64)                          dyn_batch = 64;  // floor
-                if (dyn_batch > (size_t)long_batch_persistent) dyn_batch = (size_t)long_batch_persistent;  // CIGAR cap
+                if (dyn_batch < 64)                             dyn_batch = 64;
+                if (dyn_batch > (size_t)long_batch_persistent) dyn_batch = (size_t)long_batch_persistent;
 
                 current_batch_size = dyn_batch;
             }
 
-            int batch_size = (tasks_processed_in_phase + (int)current_batch_size <= n_tasks_in_phase) ?
-                             (int)current_batch_size : (n_tasks_in_phase - tasks_processed_in_phase);
+            int batch_size = (tasks_processed_in_phase + (int)current_batch_size <= n_tasks_in_phase)
+                             ? (int)current_batch_size
+                             : (n_tasks_in_phase - tasks_processed_in_phase);
             batch_num++;
             phase_batch_num++;
 
-            // Clear ONLY result buffers before each batch to prevent reading stale data
-            // If a task fails (zdropped etc), kernel may not write to result buffers
-            // Without clearing, we'd read previous batch's stale results
-            // Note: backtrack buffers don't need clearing as they're fully written by kernel
-            /*cudaMemset(d_scores, 0, batch_size * sizeof(int32_t));
-            cudaMemset(d_query_ends, 0, batch_size * sizeof(int32_t));
-            cudaMemset(d_target_ends, 0, batch_size * sizeof(int32_t));
-            cudaMemset(d_mqe, 0, batch_size * sizeof(int32_t));
-            cudaMemset(d_mqe_t, 0, batch_size * sizeof(int32_t));
-            cudaMemset(d_mte, 0, batch_size * sizeof(int32_t));
-            cudaMemset(d_mte_q, 0, batch_size * sizeof(int32_t));
-            cudaMemset(d_cigar_lengths, 0, batch_size * sizeof(int));*/
-
-            // Pinned staging buffers pre-allocated once in plmem.cu — no per-batch calloc.
             uint8_t *h_unpacked_query  = dev_mem->h_align_unpacked_query;
             uint8_t *h_unpacked_target = dev_mem->h_align_unpacked_target;
 
-            // Single pass: compute offsets, fill metadata, copy sequences, pad with N.
             size_t total_query_bytes = 0, total_target_bytes = 0;
             uint32_t max_query_len = 0;
             const uint8_t N_BASE = 4;
@@ -849,13 +679,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 h_flag[i]           = tasks[task_idx].flag;
                 h_bw[i]             = tasks[task_idx].w;
 
-                // Copy sequences into pinned staging buffer
                 memcpy(h_unpacked_query  + total_query_bytes,
                        seq_buffer + tasks[task_idx].qseq_offset, qlen);
                 memcpy(h_unpacked_target + total_target_bytes,
                        seq_buffer + tasks[task_idx].tseq_offset, tlen);
 
-                // Pad tail with N (0x0F) up to 8-byte alignment
                 for (int j = qlen; j < (int)qlen_aligned; j++)
                     h_unpacked_query[total_query_bytes + j] = N_BASE;
                 for (int j = tlen; j < (int)tlen_aligned; j++)
@@ -867,7 +695,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 if ((uint32_t)qlen > max_query_len) max_query_len = qlen;
             }
 
-            // Copy batch data to GPU (async on align_stream so chain stream stays free)
             cudaMemcpyAsync(d_unpacked_query, h_unpacked_query,
                             total_query_bytes, cudaMemcpyHostToDevice, align_stream);
             cudaMemcpyAsync(d_unpacked_target, h_unpacked_target,
@@ -885,7 +712,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemcpyAsync(d_bw, h_bw,
                             batch_size * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
 
-            // Launch packing kernel
             int query_tasks_per_thread = (int)ceil((double)total_query_bytes /
                                                   (8 * kernel_threads * kernel_blocks));
             int target_tasks_per_thread = (int)ceil((double)total_target_bytes /
@@ -902,70 +728,39 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 total_target_bytes / 4
             );
 
-            // ===== Persistent KSW Kernel (unified anti-diagonal, int32 dual-affine) =====
-            // Both phases use the same fused persistent kernel with direct int32 H/E/F/E2/F2.
-            // Anti-diagonal backtrack with banding for all task sizes.
-            //
-            // THREE-TIER buffer management:
-            //   Tier-0 (short): bt_p stride fixed = max_antidiag_short × max_n_col_short
-            //                   bt_off stride = max_antidiag_short (2000) — matches allocation
-            //   Tier-1 (long):  bt_p from dedicated long pool (d_align_backtrack_p_long),
-            //                   bt_p stride = actual_max_antidiag × actual_max_n_col (per batch)
-            //                   bt_off stride = max_antidiag_long (100,000) — matches long alloc
-            //                   Concurrent slots = min(n_long_slots, long_pool / bt_p_stride)
-
             // Short phase: bt_p pool is the shared arena allocation.
             size_t bt_p_total_bytes = (size_t)n_concurrent_blocks *
                                       dev_mem->max_align_backtrack_size;
 
-            // Per-batch backtrack parameters (overridden for long phase below)
             size_t batch_max_backtrack_size = current_max_backtrack_size;
             size_t batch_max_antidiag       = current_max_antidiag;
             int   *d_bt_off_batch           = d_backtrack_off;
             int   *d_bt_off_end_batch       = d_backtrack_off_end;
             int    max_slots_cap            = n_concurrent_blocks;
-            // bt_p pointer and total pool bytes for this batch.
-            // Three possible sources (in priority order):
-            //   1. Long-align arena (after plmem_phase_to_long_align):
-            //        d_backtrack_p was refreshed to the ~13 GB pool;
-            //        long_bt_p_pool_bytes reflects its size.
-            //   2. Dedicated cudaMalloc pool (d_align_backtrack_p_long, single-stream):
-            //        use that pointer and its size from long_bt_p_pool_bytes.
-            //   3. Shared arena bt_p (fallback): d_backtrack_p points to ~5 GB pool.
-            uint8_t *d_bt_p_batch = d_backtrack_p;  // default covers cases 1 and 3
+            uint8_t *d_bt_p_batch           = d_backtrack_p;
 
             if (phase == 1) {
-                // Both arena and dedicated pool may exist.  Pick the LARGER —
-                // a tiny dedicated pool (e.g. 250 MB on memory-tight machines)
-                // would otherwise block a much larger arena pool from being
-                // used and cause OOB writes when batch bt_stride > dedicated.
+                // Pick the LARGER of dedicated and arena bt_p pools to avoid OOB on mismatched dispatch.
                 size_t arena_bytes = dev_mem->long_arena_bt_p_bytes;
                 size_t dedi_bytes  = (dev_mem->d_align_backtrack_p_long != nullptr)
                                      ? dev_mem->long_bt_p_pool_bytes : 0;
                 if (dedi_bytes > arena_bytes) {
-                    // Dedicated pool is bigger — use it.
                     d_bt_p_batch     = dev_mem->d_align_backtrack_p_long;
                     bt_p_total_bytes = dedi_bytes;
                 } else if (arena_bytes > 0) {
-                    // Arena pool is bigger (or only arena exists).
-                    d_bt_p_batch     = d_backtrack_p;  // refreshed by plmem_phase_to_long_align
+                    d_bt_p_batch     = d_backtrack_p;
                     bt_p_total_bytes = arena_bytes;
                 }
-                // If neither has a meaningful size, bt_p_total_bytes keeps the
-                // short-tier estimate computed above.
             }
 
-            // Diagnostic variables for long-batch logging (populated in the phase==1 block below)
-            int    diag_actual_max_qlen  = 0;
-            int    diag_actual_max_tlen  = 0;
-            int    diag_n_exceed         = 0;
-            size_t diag_actual_antidiag  = 0;
-            size_t diag_actual_n_col     = 0;
-            int    batch_max_tlen        = 0;  /* used by shared-mem long kernel dispatch */
+            int    diag_actual_max_qlen = 0;
+            int    diag_actual_max_tlen = 0;
+            int    diag_n_exceed        = 0;
+            size_t diag_actual_antidiag = 0;
+            size_t diag_actual_n_col    = 0;
+            int    batch_max_tlen       = 0;
 
             if (phase == 1) {
-                // Scan this batch to find actual maximum n_col and antidiag needed.
-                // n_col = min(min(qlen, tlen), w+1)  (mirrors kernel line 244-245)
                 size_t actual_max_n_col    = 1;
                 size_t actual_max_antidiag = 1;
                 for (int i = 0; i < batch_size; i++) {
@@ -985,41 +780,26 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         tl > (int)dev_mem->max_align_query_len)
                         diag_n_exceed++;
                 }
-                // The bt_p slot stride = actual_max_antidiag × actual_max_n_col.
-                // We use the REAL per-batch values so the bt_p pool is redistributed
-                // correctly among concurrent slots — no wasted space, no overflow.
                 size_t max_antidiag_long = 2 * (size_t)dev_mem->max_align_query_len;
                 if (actual_max_antidiag > max_antidiag_long)
                     actual_max_antidiag = max_antidiag_long;
 
                 batch_max_backtrack_size = actual_max_antidiag * actual_max_n_col;
-                diag_actual_antidiag = actual_max_antidiag;
-                diag_actual_n_col    = actual_max_n_col;
+                diag_actual_antidiag     = actual_max_antidiag;
+                diag_actual_n_col        = actual_max_n_col;
 
-                // IMPORTANT: batch_max_antidiag passed to the kernel is used as the
-                // per-slot STRIDE in backtrack_off (off = backtrack_off + slot_id * max_antidiag).
-                // This stride MUST match the allocation stride of d_align_backtrack_off_long,
-                // which was allocated as n_long_concurrent_slots × max_antidiag_long × sizeof(int).
-                // Therefore we always pass max_antidiag_long (not actual_max_antidiag) here.
+                // IMPORTANT: batch_max_antidiag is the per-slot stride for backtrack_off.
+                // Must match the allocation stride (max_antidiag_long) of d_align_backtrack_off_long.
                 batch_max_antidiag = max_antidiag_long;
 
-                // Use long-task bt_off buffers (stride = max_antidiag_long per slot)
                 d_bt_off_batch     = dev_mem->d_align_backtrack_off_long;
                 d_bt_off_end_batch = dev_mem->d_align_backtrack_off_end_long;
-                // Concurrent slots bounded by the long-tier bt_off allocation
-                max_slots_cap = dev_mem->n_long_concurrent_slots;
-
-                // bt_p pool and total bytes were already selected above before the
-                // scan loop; no further override needed here.
+                max_slots_cap      = dev_mem->n_long_concurrent_slots;
             }
 
-            // Per-batch path marker for the post-batch log (set by the dispatch).
-            char batch_path_tag = 'L';   // L = legacy, H = sHared-mem long kernel
+            char batch_path_tag = 'L';
 
-            /* Safety guard: even after picking the larger pool, a pathological */
-            /* batch may have bt_stride larger than ANY available pool.  In that*/
-            /* case we cannot safely launch — would OOB the bt_p buffer.  Skip */
-            /* this batch (CIGAR will be empty; tasks fall back to CPU).        */
+            // Safety guard: skip batch if bt_stride exceeds available pool (tasks fall back to CPU).
             if (phase == 1 && batch_max_backtrack_size > bt_p_total_bytes) {
                 fprintf(stderr,
                     "[ERROR] Long batch [%d] needs bt_stride=%.2f MB but largest "
@@ -1028,12 +808,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     phase_batch_num,
                     batch_max_backtrack_size / (1024.0*1024.0),
                     bt_p_total_bytes / (1024.0*1024.0));
-                /* Mark all tasks zdropped = fall back to CPU.                  */
                 for (int i = 0; i < batch_size; i++) {
                     int tidx = current_task_indices[batch_start + i];
-                    tasks[tidx].zdropped  = 1;
-                    tasks[tidx].score     = KSW_NEG_INF;
-                    tasks[tidx].n_cigar   = 0;
+                    tasks[tidx].zdropped = 1;
+                    tasks[tidx].score    = KSW_NEG_INF;
+                    tasks[tidx].n_cigar  = 0;
                 }
                 tasks_processed_in_phase += batch_size;
                 total_tasks_processed    += batch_size;
@@ -1051,58 +830,39 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 phase_concurrent_slots = batch_size;
             if (phase_concurrent_slots < 1) phase_concurrent_slots = 1;
 
-            // Pre-batch long-phase log removed; info merged into post-batch line below.
-
-            // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
             auto t_start = std::chrono::steady_clock::now();
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
             cudaEventRecord(ksw_ev_start, align_stream);
             {
-                int parallel_threads = 32;   // one warp per block
+                int parallel_threads = 32;
 
 #if USE_SHARED_LONG_KERNEL
-                /* Query device's per-block shared-mem opt-in cap once.        *
-                 * V100 (CC 7.0) = 96 KB; A100 (CC 8.0) = 163 KB.              */
+                /* Query device's per-block shared-mem opt-in cap once.
+                 * V100 (CC 7.0) = 96 KB; A100 (CC 8.0) = 163 KB. */
                 static int s_device_shared_cap = 0;
                 if (s_device_shared_cap == 0) {
                     cudaDeviceGetAttribute(&s_device_shared_cap,
                         cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
                     if (s_device_shared_cap <= 0) s_device_shared_cap = 48 * 1024;
                 }
-                /* ─── Shared-memory long kernel dispatch (long phase only) ─── *
-                 * Triggers when:
-                 *   1) phase == 1 (long phase)
-                 *   2) bt_p budget is the bottleneck (phase_concurrent_slots < 100)
-                 *      — avoids slowing down regular long batches that already
-                 *      have many slots
-                 *   3) per-batch max_tlen fits one of the shared variants
-                 *
-                 * Two shared variants tried in order of effectiveness:
-                 *   FULL    (6 deltas in shared)  —  needs 6 × (max_tlen+1) ≤
-                 *                                   per-block shared cap.
-                 *                                   A100: tlen ≤ 27000.
-                 *                                   V100: tlen ≤ 16000 (rare).
-                 *   PARTIAL (3 hottest in shared) —  needs 3 × (max_tlen+1) ≤ cap.
-                 *                                   V100: tlen ≤ 32000 (super-long fits).
-                 *                                   A100: tlen ≤ 54000.
-                 *                                   ~60% reduction in slow accesses.
-                 */
-                int use_shared_variant = 0;  /* 0 = none, 1 = full, 2 = partial */
+                /* Shared-mem long kernel dispatch (long phase only).
+                 * Triggers when: phase==1, bt_p is the bottleneck (slots < 100),
+                 * and batch max_tlen fits a shared variant.
+                 * FULL  variant (6 deltas): needs 6*(max_tlen+1) ≤ shared cap.
+                 * PARTIAL variant (3 hottest): needs 3*(max_tlen+1) ≤ shared cap. */
+                int use_shared_variant = 0;
                 size_t shared_bytes_full    = (size_t)6 * (size_t)(batch_max_tlen + 1);
                 size_t shared_bytes_partial = (size_t)3 * (size_t)(batch_max_tlen + 1);
                 if (phase == 1 &&
                     batch_max_tlen > 0 &&
                     phase_concurrent_slots < 100) {
-                    if (shared_bytes_full <= (size_t)s_device_shared_cap) {
+                    if (shared_bytes_full <= (size_t)s_device_shared_cap)
                         use_shared_variant = 1;
-                    } else if (shared_bytes_partial <= (size_t)s_device_shared_cap) {
+                    else if (shared_bytes_partial <= (size_t)s_device_shared_cap)
                         use_shared_variant = 2;
-                    }
                 }
                 if (use_shared_variant > 0) {
-                    /* One-shot driver opt-in for >48 KB shared per block —     *
-                     * use the device's actual cap.                              */
                     static bool s_shared_attr_set = false;
                     if (!s_shared_attr_set) {
                         cudaFuncSetAttribute(ksw_long_shared_kernel,
@@ -1153,8 +913,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 } else
 #endif
                 {
-                    // Legacy per-cell bt_p path (always for short phase, also long
-                    // phase when SHARED kernel was not picked above).
                     ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
                                                   0, align_stream>>>(
                         d_task_counter,
@@ -1176,7 +934,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         d_bw,
                         ksw_temp_per_task,
                         batch_size,
-                        5,              // m = alphabet size (ACGTN)
+                        5,
                         opt->zdrop,
                         opt->end_bonus,
                         cigar_buffer ? d_cigar_buffer  : NULL,
@@ -1192,10 +950,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         cudaGetErrorString(kernel_err));
             }
 
-            // P1/P2/P3: GPU compaction + fix_cigar + stats before D2H
-            // This eliminates the 960MB stride CIGAR D2H transfer and the CPU mm_fix_cigar/mm_update_extra loop.
             if (cigar_buffer) {
-                // Step A: compute per-task compact offsets via exclusive prefix sum
+                // Step A: exclusive prefix sum over cigar lengths → compact offsets
                 cub::DeviceScan::ExclusiveSum(d_cub_tmp, cub_tmp_size,
                                               d_cigar_lengths, (int*)d_compact_offsets,
                                               batch_size, align_stream);
@@ -1206,8 +962,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     d_cigar_lengths, (int)current_max_cigar_len
                 );
 
-                // Step C: fix CIGAR in-place + compute alignment stats (one thread per task block)
-                // Sequences still valid in d_unpacked_query/target (same stream, not yet overwritten)
+                // Step C: fix CIGAR in-place + compute alignment stats
+                // Sequences still valid in d_unpacked_query/target (same stream, not overwritten)
                 gpu_fix_cigar_and_stats<<<batch_size, 1, 0, align_stream>>>(
                     d_compact_cigar, d_compact_offsets, d_cigar_lengths,
                     d_unpacked_query, d_unpacked_target,
@@ -1225,8 +981,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             double wall_sec = std::chrono::duration<double>(t_end - t_start).count();
             s_ksw_wall_total_sec += wall_sec;
 
-            // D2H Sync 1: small arrays — CIGAR lengths, scores, endpoints, GPU stats
-            // The compact CIGAR bulk D2H happens after we know total_cigar_ops (see Sync 2 below).
             if (cigar_buffer) {
                 cudaMemcpyAsync(h_cigar_lengths, d_cigar_lengths,
                                 batch_size * sizeof(int), cudaMemcpyDeviceToHost, align_stream);
@@ -1237,7 +991,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 cudaMemcpyAsync(h_gpu_stats_valid, d_gpu_stats_valid,
                                 batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             }
-            // Copy score/endpoint results back (async, ordered after kernel via align_stream)
             cudaMemcpyAsync(h_scores,      d_scores,      batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_query_ends,  d_query_ends,  batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_target_ends, d_target_ends, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
@@ -1247,7 +1000,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaMemcpyAsync(h_mte_q, d_mte_q, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
             cudaMemcpyAsync(h_zdropped, d_zdropped, batch_size * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
 
-            // Sync 1: wait for small arrays (D2H above) to arrive on host
             cudaStreamSynchronize(align_stream);
             {
                 float elapsed_ms = 0.0f;
@@ -1261,63 +1013,22 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
             cudaCheck();
 
-            // === DEBUG: validate kernel results before host processing ===
-            if (phase == 0) {
-                int bad_score = 0, bad_cigar = 0, bad_end = 0;
-                for (int i = 0; i < batch_size; i++) {
-                    if (h_scores[i] == (int32_t)(-0x40000000)) bad_score++;
-                    if (h_query_ends[i] < -1 || h_target_ends[i] < -1) bad_end++;
-                    if (cigar_buffer && (h_cigar_lengths[i] < 0 ||
-                        h_cigar_lengths[i] > (int)current_max_cigar_len)) bad_cigar++;
-                }
-                if (bad_score || bad_cigar || bad_end) {
-                    fprintf(stderr, "\n[DEBUG::%s] Phase0 batch %d: bad_score=%d bad_cigar=%d bad_end=%d (batch_size=%d)\n",
-                            __func__, batch_num, bad_score, bad_cigar, bad_end, batch_size);
-                    // Print first few tasks for diagnosis
-                    for (int i = 0; i < batch_size && i < 5; i++) {
-                        int tidx = current_task_indices[batch_start + i];
-                        fprintf(stderr, "  task[%d→%d]: score=%d qend=%d tend=%d cigar_len=%d qlen=%d tlen=%d\n",
-                                i, tidx, h_scores[i], h_query_ends[i], h_target_ends[i],
-                                cigar_buffer ? h_cigar_lengths[i] : -1,
-                                tasks[tidx].qlen, tasks[tidx].tlen);
-                    }
-                }
-            }
-
-            // Sync 2: D2H compact CIGAR (only actual data, no stride padding)
-            // IMPORTANT: d_compact_offsets were computed BEFORE gpu_fix_cigar, which may
-            // shrink CIGARs in-place. The data in d_compact_cigar is still at the ORIGINAL
-            // offsets. We must copy d_compact_offsets from GPU rather than recomputing from
-            // the updated h_cigar_lengths, which would produce wrong (shifted) offsets.
+            // D2H compact CIGAR.
+            // d_compact_offsets were computed BEFORE gpu_fix_cigar (which may shrink CIGARs in-place),
+            // so the data for each task is still at offset[i] with h_cigar_lengths[i] entries.
+            // Copy offsets from GPU to get the true layout, then transfer only the needed extent.
             int total_cigar_ops = 0;
             if (cigar_buffer) {
-                // Validate cigar lengths
                 for (int i = 0; i < batch_size; i++) {
                     int clen = h_cigar_lengths[i];
-                    if (clen < 0 || clen > (int)current_max_cigar_len) {
-                        fprintf(stderr, "\n[DEBUG::%s] CORRUPT cigar_length[%d]=%d (max=%zu), clamping to 0\n",
-                                __func__, i, clen, current_max_cigar_len);
+                    if (clen < 0 || clen > (int)current_max_cigar_len)
                         h_cigar_lengths[i] = 0;
-                    }
                 }
 
-                // Copy the GPU-computed compact offsets (which match the actual data layout)
                 cudaMemcpyAsync(h_compact_offsets, d_compact_offsets,
                                 batch_size * sizeof(uint32_t), cudaMemcpyDeviceToHost, align_stream);
                 cudaStreamSynchronize(align_stream);
 
-                // Compute total data extent: last task's offset + original (pre-fix) length
-                // We need the original length to know the data extent, but we only have the
-                // updated length. Use the GPU offsets: the extent is offset[last] + original_len[last].
-                // Since we can't recover original_len, use offset[last] + max of updated lengths
-                // as a safe upper bound. Or simply: last offset + current_max_cigar_len as safe bound.
-                // Better approach: the total extent equals the sum of ORIGINAL lengths, which is
-                // d_compact_offsets[batch_size-1] + original_length[batch_size-1].
-                // Since original_length >= updated_length, we can use:
-                //   total_extent = h_compact_offsets[batch_size-1] + current_max_cigar_len
-                // But that's wasteful. Instead, the data we need for each task is at
-                // h_compact_offsets[i] with h_cigar_lengths[i] (updated) entries.
-                // Find the maximum extent needed:
                 uint32_t max_extent = 0;
                 for (int i = 0; i < batch_size; i++) {
                     uint32_t end = h_compact_offsets[i] + (uint32_t)h_cigar_lengths[i];
@@ -1332,90 +1043,75 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
             }
 
-            // Map results back to tasks
             for (int i = 0; i < batch_size; i++) {
-                int task_idx = current_task_indices[batch_start + i];  // Use task index from current phase
-                int align_id = i;  // always identity; h_task_to_align_id removed
+                int task_idx = current_task_indices[batch_start + i];
 
-                tasks[task_idx].score = h_scores[align_id];
-                // In approx_max mode (KSW_EZ_APPROX_MAX), max_q/max_t are not tracked and should be -1
-                // h_query_ends/h_target_ends contain backtrack endpoints, not max score positions
+                tasks[task_idx].score = h_scores[i];
                 if (tasks[task_idx].flag & KSW_EZ_APPROX_MAX) {
                     tasks[task_idx].max_q = -1;
                     tasks[task_idx].max_t = -1;
                 } else {
-                    tasks[task_idx].max_q = h_query_ends[align_id];
-                    tasks[task_idx].max_t = h_target_ends[align_id];
+                    tasks[task_idx].max_q = h_query_ends[i];
+                    tasks[task_idx].max_t = h_target_ends[i];
                 }
-                tasks[task_idx].mqe = h_mqe[align_id];
-                tasks[task_idx].mqe_t = h_mqe_t[align_id];
-                tasks[task_idx].mte = h_mte[align_id];
-                tasks[task_idx].mte_q = h_mte_q[align_id];
+                tasks[task_idx].mqe   = h_mqe[i];
+                tasks[task_idx].mqe_t = h_mqe_t[i];
+                tasks[task_idx].mte   = h_mte[i];
+                tasks[task_idx].mte_q = h_mte_q[i];
 
-                // Copy compact CIGAR to output buffer (no stride, direct copy from compact layout)
                 if (cigar_buffer) {
-                    int n_cigar = h_cigar_lengths[align_id];
+                    int n_cigar = h_cigar_lengths[i];
                     tasks[task_idx].n_cigar = n_cigar;
                     if (n_cigar > 0 && n_cigar <= tasks[task_idx].max_cigar) {
                         memcpy(cigar_buffer + tasks[task_idx].cigar_offset,
-                               h_compact_cigar + h_compact_offsets[align_id],
+                               h_compact_cigar + h_compact_offsets[i],
                                n_cigar * sizeof(uint32_t));
                     } else if (n_cigar > tasks[task_idx].max_cigar) {
-                        tasks[task_idx].n_cigar = 0;  // Reset to avoid corruption
+                        tasks[task_idx].n_cigar = 0;
                     }
                 } else {
                     tasks[task_idx].n_cigar = 0;
                 }
 
-                // Store GPU-computed alignment stats (used in map.c to skip CPU mm_update_extra)
-                tasks[task_idx].blen            = h_blen[align_id];
-                tasks[task_idx].mlen            = h_mlen[align_id];
-                tasks[task_idx].n_ambi          = h_n_ambi[align_id];
-                tasks[task_idx].dp_max          = h_dp_max[align_id];
-                tasks[task_idx].gpu_stats_valid = h_gpu_stats_valid[align_id];
+                tasks[task_idx].blen            = h_blen[i];
+                tasks[task_idx].mlen            = h_mlen[i];
+                tasks[task_idx].n_ambi          = h_n_ambi[i];
+                tasks[task_idx].dp_max          = h_dp_max[i];
+                tasks[task_idx].gpu_stats_valid = h_gpu_stats_valid[i];
 
-                // Set completion flags (match CPU ksw2 semantics).
-                // KSW_EZ_RIGHT: reach_end = query end reached (max_q == qlen-1).
-                // Otherwise: reach_end = both ends reached.
                 if (tasks[task_idx].flag & KSW_EZ_RIGHT) {
                     int mq = (tasks[task_idx].flag & KSW_EZ_APPROX_MAX)
-                           ? h_query_ends[align_id]
+                           ? h_query_ends[i]
                            : tasks[task_idx].max_q;
                     tasks[task_idx].reach_end = (mq == tasks[task_idx].qlen - 1);
                 } else if (tasks[task_idx].flag & KSW_EZ_APPROX_MAX) {
-                    tasks[task_idx].reach_end = (h_query_ends[align_id] == tasks[task_idx].qlen - 1) &&
-                                                (h_target_ends[align_id] == tasks[task_idx].tlen - 1);
+                    tasks[task_idx].reach_end =
+                        (h_query_ends[i]  == tasks[task_idx].qlen - 1) &&
+                        (h_target_ends[i] == tasks[task_idx].tlen - 1);
                 } else {
-                    tasks[task_idx].reach_end = (tasks[task_idx].max_q == tasks[task_idx].qlen - 1) &&
-                                                (tasks[task_idx].max_t == tasks[task_idx].tlen - 1);
+                    tasks[task_idx].reach_end =
+                        (tasks[task_idx].max_q == tasks[task_idx].qlen - 1) &&
+                        (tasks[task_idx].max_t == tasks[task_idx].tlen - 1);
                 }
-                tasks[task_idx].zdropped = h_zdropped[align_id] ? 1 : 0;
+                tasks[task_idx].zdropped = h_zdropped[i] ? 1 : 0;
             }
 
-            // h_unpacked_query/target point to pinned dev_mem buffers — no free needed.
-
             tasks_processed_in_phase += batch_size;
-            total_tasks_processed += batch_size;
+            total_tasks_processed    += batch_size;
 
             if (phase == 0) {
-                // Short phase: one batch, single line is enough.
                 PLOG_INFO(stderr, "[Info::%s] %s [%d/%d] tasks=%d slots=%d bt_stride=%zu  (%d/%d done)\n",
                         stream_tag, phase_name, phase_batch_num, total_phase_batches,
                         batch_size, phase_concurrent_slots, batch_max_backtrack_size,
                         tasks_processed_in_phase, n_tasks_in_phase);
             } else {
-                // Long phase: merged one-line log with repeat suppression.
-                // bt_stride in MB (2 decimal places) and n_col from diag vars.
                 double bt_mb = batch_max_backtrack_size / (1024.0 * 1024.0);
-
                 bool same = (batch_max_backtrack_size == rep_bt_stride &&
                              phase_concurrent_slots   == rep_slots      &&
                              batch_size               == rep_batch_size);
                 if (same) {
-                    // Suppress this line — just count it.
                     rep_count++;
                 } else {
-                    // Flush any accumulated repeats from the previous group.
                     if (rep_count > 0) {
                         PLOG_INFO(stderr,
                             "[Info::%s]   ... ×%d more identical batches"
@@ -1424,7 +1120,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                             tasks_processed_in_phase - batch_size, n_tasks_in_phase);
                         rep_count = 0;
                     }
-                    // Print this batch.
                     PLOG_INFO(stderr,
                         "[Info::%s] Long [%d|%c] tasks=%d  n_col=%zu  bt=%.2fMB  slots=%d"
                         "  (%d/%d done)\n",
@@ -1436,7 +1131,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     rep_batch_size = batch_size;
                     rep_done_start = tasks_processed_in_phase - batch_size;
                 }
-                // After the very last batch in this phase, flush any trailing repeats.
                 if (tasks_processed_in_phase >= n_tasks_in_phase && rep_count > 0) {
                     PLOG_INFO(stderr,
                         "[Info::%s]   ... ×%d more identical batches"
@@ -1446,8 +1140,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     rep_count = 0;
                 }
             }
-        }  // End of batch loop within phase
-    }  // End of three-tier loop
+        }
+    }
 
     PLOG_INFO(stderr, "[Info::%s] Alignment complete: %d tasks in %d batches\n",
             stream_tag, n_tasks, batch_num);
@@ -1455,12 +1149,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     cudaEventDestroy(ksw_ev_start);
     cudaEventDestroy(ksw_ev_stop);
 
-    // Cleanup phase-specific arrays
     free(task_indices_short);
     free(task_indices_long);
 
-    // Pinned host buffers are pre-allocated in dev_mem — no free needed here.
-
-    // Switch arena back to chain phase for next batch
     plmem_phase_to_chain(dev_mem);
 }

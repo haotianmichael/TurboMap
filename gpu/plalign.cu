@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include "plalign.cuh"
 #include "gasal_kernels.h"
 #include "plmem.cuh"  // For deviceMemPtr
@@ -13,8 +14,11 @@
 #endif
 
 static double s_ksw_kernel_total_ms = 0.0;
+static double s_ksw_wall_total_sec  = 0.0;
 struct KswTimingPrinter {
     ~KswTimingPrinter() {
+        if (s_ksw_wall_total_sec > 0.0)
+            fprintf(stderr, "[KSW timing] total wall time: %.6f s\n", s_ksw_wall_total_sec);
         if (s_ksw_kernel_total_ms > 0.0)
             fprintf(stderr, "[KSW timing] total kernel time: %.3f ms\n", s_ksw_kernel_total_ms);
     }
@@ -1050,6 +1054,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // Pre-batch long-phase log removed; info merged into post-batch line below.
 
             // Reset atomic task counter to 0 before this batch (on align_stream for ordering)
+            auto t_start = std::chrono::steady_clock::now();
             cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
 
             cudaEventRecord(ksw_ev_start, align_stream);
@@ -1214,6 +1219,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
 
             cudaEventRecord(ksw_ev_stop, align_stream);
+
+            cudaStreamSynchronize(align_stream);
+            auto t_end = std::chrono::steady_clock::now();
+            double wall_sec = std::chrono::duration<double>(t_end - t_start).count();
+            s_ksw_wall_total_sec += wall_sec;
 
             // D2H Sync 1: small arrays — CIGAR lengths, scores, endpoints, GPU stats
             // The compact CIGAR bulk D2H happens after we know total_cigar_ops (see Sync 2 below).

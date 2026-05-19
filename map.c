@@ -1948,116 +1948,21 @@ static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 	read_->mini_pos = NULL;
 }
 
-// CPU alignment path for reads that were CPU re-chained in post_chaining_helper.
-// GPU KSW z-drops on long left/right extensions (bw=751 is too narrow for reads
-// with large soft-clipped regions), producing wrong positions.  CPU KSW handles
-// these correctly.  This function mirrors mm_map_chain_frag's alignment section.
-static void cpu_align_rechained_read(const mm_idx_t *mi, const mm_mapopt_t *opt,
-                                     chain_read_t *read_, void *km,
-                                     gpu_align_batch_t *gpu_batch, int read_idx)
-{
-    read_align_ctx_t *ctx = &gpu_batch->read_ctxs[read_idx];
-    ctx->qseq0[0] = NULL;
-    ctx->qseq0[1] = NULL;
-    ctx->a        = NULL;
-    ctx->n_a      = 0;
-
-    int n_regs0   = read_->n_u;
-    uint64_t *u   = read_->u;
-    mm128_t  *a   = read_->a;
-
-    if (n_regs0 == 0 || u == NULL || a == NULL) {
-        ctx->regs0  = NULL;
-        ctx->n_regs = 0;
-        kfree(km, a);       kfree(km, u);       kfree(km, read_->mini_pos);
-        read_->a = NULL;    read_->u = NULL;    read_->mini_pos = NULL;
-        return;
-    }
-
-    const char *qname   = read_->seq.name;
-    int         qlen    = read_->qlens[0];
-    const char *seq     = read_->qseqs[0];
-    int         qlen_sum = read_->seq.qlen_sum;
-    int         n_segs  = read_->n_seg;
-    const int  *qlens   = read_->qlens;
-    int         rep_len = read_->rep_len;
-    int         frag_gap = read_->frag_gap;
-    int         is_sr   = !!(opt->flag & MM_F_SR);
-
-    uint32_t hash = (qname && !(opt->flag & MM_F_NO_HASH_NAME))
-                  ? __ac_X31_hash_string(qname) : 0;
-    hash ^= __ac_Wang_hash(qlen_sum) + __ac_Wang_hash(opt->seed);
-    hash  = __ac_Wang_hash(hash);
-
-    mm_reg1_t *regs0 = mm_gen_regs(km, hash, qlen_sum, n_regs0, u, a,
-                                   !!(opt->flag & MM_F_QSTRAND));
-    if (mi->n_alt) {
-        mm_mark_alt(mi, n_regs0, regs0);
-        mm_hit_sort(km, &n_regs0, regs0, opt->alt_drop);
-    }
-
-    // chain_post: mask/select sub-optimal chains
-    if (!(opt->flag & MM_F_ALL_CHAINS)) {
-        mm_set_parent(km, opt->mask_level, opt->mask_len, n_regs0, regs0,
-                      opt->a * 2 + opt->b, opt->flag & MM_F_HARD_MLEVEL, opt->alt_drop);
-        if (n_segs <= 1)
-            mm_select_sub(km, opt->pri_ratio, mi->k * 2, opt->best_n, 1,
-                          opt->max_gap * 0.8, &n_regs0, regs0);
-        else
-            mm_select_sub_multi(km, opt->pri_ratio, 0.2f, 0.7f, frag_gap, mi->k * 2,
-                                opt->best_n, n_segs, qlens, &n_regs0, regs0);
-    }
-    if (!is_sr && !(opt->flag & MM_F_QSTRAND)) {
-        mm_est_err(mi, qlen_sum, n_regs0, regs0, a, read_->n_mini_pos, read_->mini_pos);
-        n_regs0 = mm_filter_strand_retained(n_regs0, regs0);
-    }
-
-    // CPU KSW alignment — handles long extensions correctly
-    if (opt->flag & MM_F_CIGAR) {
-        regs0 = mm_align_skeleton(km, opt, mi, qlen, seq, &n_regs0, regs0, a);
-        if (!(opt->flag & MM_F_ALL_CHAINS)) {
-            mm_set_parent(km, opt->mask_level, opt->mask_len, n_regs0, regs0,
-                          opt->a * 2 + opt->b, opt->flag & MM_F_HARD_MLEVEL, opt->alt_drop);
-            mm_select_sub(km, opt->pri_ratio, mi->k * 2, opt->best_n, 0,
-                          opt->max_gap * 0.8, &n_regs0, regs0);
-            mm_set_sam_pri(n_regs0, regs0);
-        }
-    }
-    mm_set_mapq(km, n_regs0, regs0, opt->min_chain_score, opt->a, rep_len, is_sr);
-
-    ctx->regs0  = regs0;
-    ctx->n_regs = n_regs0;
-    ctx->qlen   = qlen;
-    ctx->name   = qname;
-
-    // Free chain arrays (mirrors post_align_helper_gpu)
-    kfree(km, a);       kfree(km, u);       kfree(km, read_->mini_pos);
-    read_->a = NULL;    read_->u = NULL;    read_->mini_pos = NULL;
-}
 
 static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s, int stream_id)
 {
     gpu_align_batch_t *gpu_batch = gpu_align_batch_init(batch->count, batch->km);
 
-    // Process each read: CPU-rechained reads use CPU KSW; others go to GPU KSW.
     for (int iread = 0; iread < batch->count; iread++) {
-        if (batch->reads[iread].use_cpu_align) {
-            cpu_align_rechained_read(s->p->mi, s->p->opt, &batch->reads[iread],
-                                     batch->km, gpu_batch, iread);
-        } else {
-            pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
-                                 batch->km, gpu_batch, iread);
-        }
+        pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
+                             batch->km, gpu_batch, iread);
     }
 
     // Submit all GPU tasks and process results
     gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km, stream_id);
 
-    // CPU fallback: align any r2 regions created by z-drop splits during GPU
-    // result processing.  Skip CPU-rechained reads (mm_align_skeleton handles
-    // z-drops; ctx->a/qseq0 are NULL for those reads).
+    // CPU fallback: align any r2 regions created by z-drop splits during GPU result processing.
     for (int iread = 0; iread < batch->count; iread++) {
-        if (batch->reads[iread].use_cpu_align) continue;
         read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
         for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
             mm_reg1_t *reg = &ctx->regs0[ireg];
@@ -2092,9 +1997,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
         }
     }
 
-    // Post-alignment: GPU reads only (CPU-rechained reads are fully processed already)
-	for (int iread = 0; iread < batch->count; iread++) {
-        if (batch->reads[iread].use_cpu_align) continue;
+    for (int iread = 0; iread < batch->count; iread++) {
         post_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
                          		gpu_batch, batch->km, iread);
     }

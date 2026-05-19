@@ -16,7 +16,7 @@ static double s_ksw_wall_total_sec = 0.0;
 struct KswTimingPrinter {
     ~KswTimingPrinter() {
         if (s_ksw_wall_total_sec > 0.0)
-            fprintf(stderr, "[KSW timing] total wall time: %.6f s\n", s_ksw_wall_total_sec);
+            fprintf(stderr, "\n[KSW timing] total wall time: %.3f ms\n", s_ksw_wall_total_sec * 1000.0);
     }
 } s_ksw_timing_printer;
 

@@ -7,8 +7,6 @@
     "//long_cigar_batch": "Long-task CIGAR buffer cap. 0=auto (formula-derived, recommended). Set e.g. 1024 only to reduce VRAM for CIGAR at the cost of more kernel launches.",
     "max_align_task_len": 50000,
     "//max_align_task_len": "Max sequence length per alignment task (query or target). All KSW buffers scale linearly with this value. Reduce to e.g. 10000 if gap-fills/extensions are short to increase concurrent slots.",
-    "bt_stride_mb": 0,
-    "//bt_stride_mb": "Estimated bt_p memory per long-task concurrent slot in MB. 0=use code default (6MB). Set to: (qlen+tlen)*min(bw+1,min(qlen,tlen))/1MB for your data. E.g. 10000bp bw=500->10, bw=1000->20; 50000bp bw=500->50. Affects static slot count (n_long_cap); runtime pool_cap uses actual bt_stride.",
     "range_kernel": {
         "blockdim": 512,
         "cut_check_anchors": 10,

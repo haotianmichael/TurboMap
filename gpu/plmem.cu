@@ -139,7 +139,7 @@ static size_t g_max_align_task_len = 50000;  // default 50,000 bp
 // Conservative estimate of bt_p cost per concurrent slot, used only to size n_long_cap
 // (the static bt_off/ksw_temp slot array count) at allocation time.
 // Runtime pool_cap0 = bt_p / actual_bt_stride0 always uses the real per-task value.
-// n_long_cap is capped at MAX_LONG_SLOTS (4096) in practice, so this constant only
+// n_long_cap is capped at MAX_LONG_SLOTS (8192) in practice, so this constant only
 // matters for small GPUs or very small tasks where pool_cap0 >> MAX_LONG_SLOTS.
 static const size_t TYPICAL_BT_STRIDE_INTERNAL = (size_t)6 << 20;  // 6 MB
 
@@ -419,7 +419,7 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     // if your data has systematically larger or smaller alignment bandwidth.
     //
     const size_t TYPICAL_BT_STRIDE = TYPICAL_BT_STRIDE_INTERNAL;
-    const size_t MAX_LONG_SLOTS    = 4096;                        // hard cap on slot count
+    const size_t MAX_LONG_SLOTS    = 8192;                        // hard cap on slot count
 
     size_t per_slot_var = dev_mem->align_ksw_temp_per_task + 2 * max_antidiag_long * sizeof(int);
     size_t remaining_for_slots = arena_remaining(a);

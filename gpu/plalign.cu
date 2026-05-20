@@ -639,6 +639,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         int total_phase_batches = (n_tasks_in_phase > 0)
             ? (int)((n_tasks_in_phase + (int)current_batch_size - 1) / (int)current_batch_size) : 0;
 
+        // pool_cap0 and bt_stride0 for the current long-phase batch.
+        // Hoisted so slot computation can reuse them directly instead of recomputing
+        // via the overly-conservative max_antidiag × max_n_col product.
+        size_t pool_cap0   = 0;
+        size_t bt_stride0_val = 0;
+
         // Repeat-suppression state for long-phase batch logging.
         size_t rep_bt_stride  = 0;
         int    rep_slots      = 0;
@@ -671,7 +677,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     bt_p_avail = (size_t)dev_mem->n_long_concurrent_slots * TYPICAL_BT_STRIDE_FALLBACK;
 
                 const size_t LATENCY_HIDE_FACTOR = 3;
-                size_t pool_cap0 = (bt_stride0 > 0) ? (bt_p_avail / bt_stride0) : (size_t)256;
+                bt_stride0_val = bt_stride0;
+                pool_cap0 = (bt_stride0 > 0) ? (bt_p_avail / bt_stride0) : (size_t)256;
                 if (pool_cap0 < 1) pool_cap0 = 1;
 
                 size_t dyn_batch = pool_cap0 * LATENCY_HIDE_FACTOR;
@@ -788,21 +795,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             int    diag_actual_max_tlen = 0;
             int    diag_n_exceed        = 0;
             size_t diag_actual_antidiag = 0;
-            size_t diag_actual_n_col    = 0;
             int    batch_max_tlen       = 0;
 
             if (phase == 1) {
-                size_t actual_max_n_col    = 1;
                 size_t actual_max_antidiag = 1;
                 for (int i = 0; i < batch_size; i++) {
                     int tidx = current_task_indices[batch_start + i];
                     int ql   = tasks[tidx].qlen;
                     int tl   = tasks[tidx].tlen;
-                    int w    = tasks[tidx].w;
-                    int nc   = (ql < tl) ? ql : tl;
-                    if (w >= 0 && w + 1 < nc) nc = w + 1;
                     size_t ad = (size_t)ql + (size_t)tl;
-                    if ((size_t)nc > actual_max_n_col)    actual_max_n_col    = nc;
                     if (ad > actual_max_antidiag) actual_max_antidiag = ad;
                     if (ql > diag_actual_max_qlen) diag_actual_max_qlen = ql;
                     if (tl > diag_actual_max_tlen) diag_actual_max_tlen = tl;
@@ -814,10 +815,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 size_t max_antidiag_long = 2 * (size_t)dev_mem->max_align_task_len;
                 if (actual_max_antidiag > max_antidiag_long)
                     actual_max_antidiag = max_antidiag_long;
+                diag_actual_antidiag = actual_max_antidiag;
 
-                batch_max_backtrack_size = actual_max_antidiag * actual_max_n_col;
-                diag_actual_antidiag     = actual_max_antidiag;
-                diag_actual_n_col        = actual_max_n_col;
+                // Per-slot bt_p stride: use the largest task's actual bt_stride (not the
+                // independent max_antidiag × max_n_col product which overcounts).
+                batch_max_backtrack_size = bt_stride0_val;
 
                 // IMPORTANT: batch_max_antidiag is the per-slot stride for backtrack_off.
                 // Must match the allocation stride (max_antidiag_long) of d_align_backtrack_off_long.
@@ -830,14 +832,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             char batch_path_tag = 'L';
 
-            // Safety guard: skip batch if bt_stride exceeds available pool (tasks fall back to CPU).
-            if (phase == 1 && batch_max_backtrack_size > bt_p_total_bytes) {
+            // Safety guard: skip batch if largest task's bt_stride exceeds available pool.
+            if (phase == 1 && bt_stride0_val > bt_p_total_bytes) {
                 fprintf(stderr,
-                    "[ERROR] Long batch [%d] needs bt_stride=%.2f MB but largest "
+                    "[ERROR] Long batch [%d] largest task bt_stride=%.2f MB but "
                     "available pool is only %.2f MB.  Skipping batch (tasks will "
                     "fall back to CPU).\n",
                     phase_batch_num,
-                    batch_max_backtrack_size / (1024.0*1024.0),
+                    bt_stride0_val / (1024.0*1024.0),
                     bt_p_total_bytes / (1024.0*1024.0));
                 for (int i = 0; i < batch_size; i++) {
                     int tidx = current_task_indices[batch_start + i];
@@ -850,9 +852,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 continue;
             }
 
-            size_t max_slots_this_phase = (batch_max_backtrack_size > 0)
-                ? (bt_p_total_bytes / batch_max_backtrack_size)
-                : (size_t)n_concurrent_blocks;
+            // Long phase: pool_cap0 = bt_p / bt_stride0 (largest task in batch).
+            // Short phase: bt_p / current_max_backtrack_size (uniform allocation).
+            size_t max_slots_this_phase = (phase == 1)
+                ? pool_cap0
+                : ((batch_max_backtrack_size > 0)
+                   ? (bt_p_total_bytes / batch_max_backtrack_size)
+                   : (size_t)n_concurrent_blocks);
 
             int phase_concurrent_slots = max_slots_cap;
             if ((size_t)phase_concurrent_slots > max_slots_this_phase)
@@ -1144,10 +1150,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         rep_count = 0;
                     }
                     PLOG_INFO(stderr,
-                        "[Info::%s] Long [%d|%c] tasks=%d  n_col=%zu  bt=%.2fMB  slots=%d"
+                        "[Info::%s] Long [%d|%c] tasks=%d  bt0=%.2fMB  slots=%d"
                         "  (%d/%d done)\n",
                         stream_tag, phase_batch_num, batch_path_tag,
-                        batch_size, diag_actual_n_col, bt_mb, phase_concurrent_slots,
+                        batch_size, bt_mb, phase_concurrent_slots,
                         tasks_processed_in_phase, n_tasks_in_phase);
                     rep_bt_stride  = batch_max_backtrack_size;
                     rep_slots      = phase_concurrent_slots;

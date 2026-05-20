@@ -1,11 +1,11 @@
 {
-    "num_streams": 2,
+    "num_streams": 1,
     "//num_streams": "Number of GPU streams. Memory auto-scales from actual VRAM.",
     "min_n": 512,
     "//min_n": "queries with less anchors will be handled on cpu",
     "long_cigar_batch": 0,
     "//long_cigar_batch": "Long-task CIGAR buffer cap. 0=auto (formula-derived, recommended). Set e.g. 1024 only to reduce VRAM for CIGAR at the cost of more kernel launches.",
-    "max_align_task_len": 50000,
+    "max_align_task_len": 10000,
     "//max_align_task_len": "Max sequence length per alignment task (query or target). All KSW buffers scale linearly with this value. Reduce to e.g. 10000 if gap-fills/extensions are short to increase concurrent slots.",
     "range_kernel": {
         "blockdim": 512,

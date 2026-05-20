@@ -138,13 +138,13 @@ static size_t g_max_align_task_len = 50000;  // default 50,000 bp
 
 // Estimated bt_p memory per long-task concurrent slot.
 // Used to size n_long_cap (slot count) and MAX_LONG_BATCH.
-// Formula: bt_p_per_slot ≈ (qlen + tlen) × min(bw+1, min(qlen,tlen)) bytes.
-// For 10000bp tasks at bw=500:  ~10 MB; at bw=1000: ~20 MB; at bw=2000: ~40 MB.
+// Formula: bt_p_per_slot = (qlen + tlen) × min(bw+1, min(qlen,tlen)) bytes.
+// Examples: 10000bp bw=500 → 10MB; 10000bp bw=1000 → 20MB; 50000bp bw=500 → 50MB.
 // If set too low: n_long_cap is overestimated (wastes bt_off_long/ksw_temp allocation).
 // If set too high: n_long_cap is underestimated (fewer concurrent slots allocated).
 // Runtime pool_cap0 uses actual bt_stride, so this only affects static slot count.
-// Set via JSON key "bt_stride_mb" in gpu_config.json.
-static size_t g_typical_bt_stride_bytes = (size_t)6 << 20;  // default 6 MB
+// Set via JSON key "bt_stride_mb" in gpu_config.json (0 = keep this default).
+static size_t g_typical_bt_stride_bytes = (size_t)6 << 20;  // conservative default; set via config
 
 // ── compute_long_batch_size ─────────────────────────────────────────────────────
 // Derives the maximum long-task batch size (CIGAR-buffer bound) from the arena

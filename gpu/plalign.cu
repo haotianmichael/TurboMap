@@ -498,6 +498,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     int batch_num = 0;
     int total_tasks_processed = 0;
+    std::string deferred_short_log;
 
     for (int phase = 0; phase < 2; phase++) {
         int  *current_task_indices  = (phase == 0) ? task_indices_short : task_indices_long;
@@ -581,7 +582,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         size_t pool_cap0      = 0;
         size_t bt_stride0_val = 0;
         bool   long_config_logged = false;
-        std::string deferred_short_log;
 
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
@@ -620,11 +620,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
                 if (!long_config_logged) {
                     PLOG_INFO(stderr,
-                        "[Info::Align::LongConfig]: bt_p=%.2fGB  bt_stride0=%.2fMB"
-                        "  pool_cap0=%zu  dyn_batch=%zu  gpu_max_slots=%d\n",
+                        "[Info::Align::LongConfig]: bt_p=%.2fGB  h2d_max=%zu"
+                        "  gpu_max_slots=%d\n",
                         bt_p_avail / (1024.0*1024.0*1024.0),
-                        bt_stride0 / (1024.0*1024.0),
-                        pool_cap0, dyn_batch,
+                        (size_t)long_batch_persistent,
                         dev_mem->n_align_concurrent_blocks);
                     long_config_logged = true;
                 }

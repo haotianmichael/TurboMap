@@ -1310,13 +1310,12 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     if (*long_seg_buffer_size_ < 1000000) *long_seg_buffer_size_ = 1000000;
 
     g_bytes_per_anchor = total_per_n;
-    PLOG_INFO(stderr, "[Info::Arena] Auto-config for %d stream%s (%.2f GB free, %.2f GB/stream, %.0f B/anchor)\n",
+    PLOG_INFO(stderr, "[Info::Arena] Auto-config for %d stream%s (%.2f GB free, %.2f GB/stream)\n",
             *num_stream_, *num_stream_ > 1 ? "s" : "",
             gpu_free_mem / (1024.0*1024.0*1024.0),
-            avail_mem_per_stream / (1024.0*1024.0*1024.0),
-            total_per_n);
-    PLOG_INFO(stderr, "[Info::Chain::Config] max_total_n=%zu, max_read=%d, long_seg_buf=%zu\n",
-            *max_total_n_, *max_read_, *long_seg_buffer_size_);
+            avail_mem_per_stream / (1024.0*1024.0*1024.0));
+    PLOG_INFO(stderr, "[Info::Chain::Config] max_total_n=%zu, max_read=%d, long_seg_buf=%zu, %.0fB/anchor\n",
+            *max_total_n_, *max_read_, *long_seg_buffer_size_, total_per_n);
 }
 
 // intialize and config kernels for gpu blocking setup

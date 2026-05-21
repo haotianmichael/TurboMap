@@ -139,8 +139,7 @@ static size_t g_max_align_task_len = 50000;  // default 50,000 bp
 // Conservative estimate of bt_p cost per concurrent slot, used only to size n_long_cap
 // (the static bt_off/ksw_temp slot array count) at allocation time.
 // Runtime pool_cap0 = bt_p / actual_bt_stride0 always uses the real per-task value.
-// n_long_cap is capped at MAX_LONG_SLOTS (8192) in practice, so this constant only
-// matters for small GPUs or very small tasks where pool_cap0 >> MAX_LONG_SLOTS.
+// Used only in compute_long_batch_size to estimate CIGAR-buffer-bound batch size.
 static const size_t TYPICAL_BT_STRIDE_INTERNAL = (size_t)6 << 20;  // 6 MB
 
 // ── compute_long_batch_size ─────────────────────────────────────────────────────
@@ -402,33 +401,11 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_mat             = (int8_t*)arena_alloc(a, 25 * sizeof(int8_t));
     dev_mem->d_align_task_counter    = (int*)arena_alloc(a, sizeof(int));
 
-    // ---- Step 2: dynamically compute n_long_cap from remaining arena ----
-    //
-    // Remaining arena is split between per-slot variable overhead and the bt_p pool:
-    //   per_slot_var  = ksw_temp_per_task  +  2 × max_antidiag_long × sizeof(int)
-    //                 ≈ 600 KB             +  800 KB  = ~1.4 MB per slot
-    //   bt_p pool     = gets everything else
-    //
-    // We want pool_cap ≈ n_long_cap so neither bottlenecks the other.  If bt_p has
-    // B bytes and each slot costs S bytes in the pool (batch-dependent), then:
-    //   pool_cap = B / S  and  n_long_cap = B / S  iff B = remaining - n_long_cap × per_slot_var
-    //   → n_long_cap = remaining / (per_slot_var + S)
-    //
-    // We approximate S with TYPICAL_BT_STRIDE (the per-slot bt_p cost for typical
-    // long tasks: antidiag ≈ 10 000, n_col ≈ 615 → S ≈ 6 MB).  Adjust this constant
-    // if your data has systematically larger or smaller alignment bandwidth.
-    //
-    const size_t TYPICAL_BT_STRIDE = TYPICAL_BT_STRIDE_INTERNAL;
-    const size_t MAX_LONG_SLOTS    = 8192;                        // hard cap on slot count
+    // ---- Step 2: slot count = GPU hardware concurrent blocks (set by caller) ----
+    size_t n_long_cap = (size_t)dev_mem->n_align_concurrent_blocks;
+    if (n_long_cap < 64) n_long_cap = 64;  // sanity floor
 
-    size_t per_slot_var = dev_mem->align_ksw_temp_per_task + 2 * max_antidiag_long * sizeof(int);
-    size_t remaining_for_slots = arena_remaining(a);
-    size_t n_long_cap = remaining_for_slots / (per_slot_var + TYPICAL_BT_STRIDE);
-    if (n_long_cap > MAX_LONG_SLOTS) n_long_cap = MAX_LONG_SLOTS;
-    if (n_long_cap < 64)             n_long_cap = 64;  // sanity floor
-
-    dev_mem->n_long_concurrent_slots   = (int)n_long_cap;
-    dev_mem->n_align_concurrent_blocks = (int)n_long_cap;
+    dev_mem->n_long_concurrent_slots = (int)n_long_cap;
 
     // ---- Step 3: allocate per-slot arrays ----
     size_t ksw_temp_bytes    = n_long_cap * dev_mem->align_ksw_temp_per_task;

@@ -597,13 +597,13 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     size_t arena_size = min_arena + 4 * 1024 * 1024;  // 4 MB margin for alignment padding
 
     void *arena_base = nullptr;
-    cudaMalloc(&arena_base, arena_size);
-    if (!arena_base) {
+    cudaError_t alloc_err = cudaMalloc(&arena_base, arena_size);
+    if (alloc_err != cudaSuccess || !arena_base) {
         // Fall back to minimum needed
         arena_size = min_arena;
-        cudaMalloc(&arena_base, arena_size);
+        alloc_err = cudaMalloc(&arena_base, arena_size);
     }
-    if (!arena_base) {
+    if (alloc_err != cudaSuccess || !arena_base) {
         fprintf(stderr, "[FATAL] Failed to allocate GPU arena: %.2f GB\n",
                 arena_size / (1024.0*1024.0*1024.0));
         abort();
@@ -1262,7 +1262,7 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     size_t per_anchor_total = chain_per_n + bt_per_n + vt_per_n + cub_per_n;
 
     // L-proportional cost (long segment buffers)
-    size_t per_long_entry = 19;  // ax,ay,sid,range,f,p long arrays
+    size_t per_long_entry = 23;  // ax(4)+ay(4)+sid(1)+range(4)+xrev(4)+f(4)+p(2) long arrays
 
     // Avg anchors per read (for index/cut overhead estimate)
     cJSON *avg_n_json = cJSON_GetObjectItem(json, "avg_read_n");

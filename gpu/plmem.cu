@@ -729,10 +729,6 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     size_t long_batch_max = long_batch_size(arena_size, dev_mem->max_align_task_len);
 
     if (print_info) {
-        double GB = 1024.0*1024.0*1024.0;
-        PLOG_INFO(stderr, "[Info::Arena] Auto-config for %d stream%s (%.2f GB free, %.2f GB/stream)\n",
-                num_streams, num_streams > 1 ? "s" : "",
-                free_mem / GB, arena_size / GB);
         PLOG_INFO(stderr, "[Info::Align::Config]: h2d_max_tasks_short=%zu  h2d_max_tasks_long=%zu (%s)"
                 "  gpu_max_slots=%d\n",
                 dev_mem->max_align_tasks,

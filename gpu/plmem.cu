@@ -135,6 +135,7 @@ static size_t g_long_cigar_batch_override = 0;
 // Reduce to e.g. 10000 for data where gap-fills/extensions are short → more concurrent slots.
 // Set via JSON key "max_align_task_len" in gpu_config.json.
 static size_t g_max_align_task_len = 50000;  // default 50,000 bp
+static double g_bytes_per_anchor   = 0.0;    // set by plmem_stream_initialize, used by plmem_malloc_device_mem
 
 // Conservative estimate of bt_p cost per concurrent slot, used only to size n_long_cap
 // Used only in compute_long_batch_size to estimate CIGAR-buffer-bound batch size.
@@ -729,6 +730,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     size_t long_batch_max = long_batch_size(arena_size, dev_mem->max_align_task_len);
 
     if (print_info) {
+        double GB = 1024.0*1024.0*1024.0;
+        PLOG_INFO(stderr, "[Info::Arena] Auto-config for %d stream%s (%.2f GB free, %.2f GB/stream, %.0f B/anchor)\n",
+                num_streams, num_streams > 1 ? "s" : "",
+                free_mem / GB, arena_size / GB, g_bytes_per_anchor);
         PLOG_INFO(stderr, "[Info::Align::Config]: h2d_max_tasks_short=%zu  h2d_max_tasks_long=%zu (%s)"
                 "  gpu_max_slots=%d\n",
                 dev_mem->max_align_tasks,
@@ -1308,11 +1313,9 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     }
     if (*long_seg_buffer_size_ < 1000000) *long_seg_buffer_size_ = 1000000;
 
-    PLOG_INFO(stderr, "[Info::plmem] Auto-config for %d streams (%.1f GB free, %.1f GB/stream, "
-            "%.0f B/anchor): max_total_n=%zu, max_read=%d, long_seg_buf=%zu\n",
-            *num_stream_, gpu_free_mem / (1024.0*1024.0*1024.0),
-            avail_mem_per_stream / (1024.0*1024.0*1024.0), total_per_n,
-            *max_total_n_, *max_read_, *long_seg_buffer_size_);
+    g_bytes_per_anchor = total_per_n;
+    PLOG_INFO(stderr, "[Info::Chain::Config] max_total_n=%zu, max_read=%d, long_seg_buf=%zu, %.0fB/anchor\n",
+            *max_total_n_, *max_read_, *long_seg_buffer_size_, total_per_n);
 }
 
 // intialize and config kernels for gpu blocking setup

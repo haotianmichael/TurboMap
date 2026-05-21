@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <string>
 #include "plalign.cuh"
 #include "gasal_kernels.h"
 #include "plmem.cuh"
@@ -580,6 +581,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         size_t pool_cap0      = 0;
         size_t bt_stride0_val = 0;
         bool   long_config_logged = false;
+        std::string deferred_short_log;
 
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
@@ -1066,10 +1068,17 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             total_tasks_processed    += batch_size;
 
             if (phase == 0) {
-                PLOG_INFO(stderr, "[Info::Short %d]: %d tasks  slots=%d  bt_stride=%.2fMB  (gpu_ms=%.1f)\n",
+                char tmp[256];
+                snprintf(tmp, sizeof(tmp),
+                        "[Info::Short %d]: %d tasks  slots=%d  bt_stride=%.2fMB  (gpu_ms=%.1f)\n",
                         phase_batch_num, batch_size, phase_concurrent_slots,
                         batch_max_backtrack_size / (1024.0 * 1024.0), gpu_ms);
+                deferred_short_log += tmp;
             } else {
+                if (!deferred_short_log.empty()) {
+                    fprintf(stderr, "%s", deferred_short_log.c_str());
+                    deferred_short_log.clear();
+                }
                 PLOG_INFO(stderr, "[Info::Long %d]: %d tasks  slots=%d  bt0=%.2fMB  (gpu_ms=%.1f)\n",
                         phase_batch_num, batch_size, phase_concurrent_slots,
                         batch_max_backtrack_size / (1024.0 * 1024.0), gpu_ms);

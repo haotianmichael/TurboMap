@@ -769,11 +769,6 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
 
     if (print_info) {
         double GB = 1024.0*1024.0*1024.0;
-        double bt_p_gb = (double)dev_mem->n_align_concurrent_blocks *
-                         dev_mem->max_align_backtrack_size / GB;
-        double bt_off_long_gb = (double)dev_mem->n_long_concurrent_slots *
-                                2 * dev_mem->max_align_task_len * sizeof(int) / GB;
-        double long_pool_gb = dev_mem->long_bt_p_pool_bytes / GB;
         PLOG_INFO(stderr, "[Info] GPU arena: %.2f GB total, %.2f GB free  (%d stream%s, %.2f GB each)\n",
                 total_mem / GB, free_mem / GB,
                 num_streams, num_streams > 1 ? "s" : "",
@@ -786,13 +781,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                 long_batch_max,
                 g_long_cigar_batch_override > 0 ? "manual" : "auto",
                 dev_mem->n_align_concurrent_blocks);
-        PLOG_INFO(stderr, "[Info]   Short bt_p pool (arena): %.2f GB  |  Long bt_p pool (dedicated): %.2f GB\n",
-                bt_p_gb, long_pool_gb);
-        PLOG_INFO(stderr, "[Info]   bt_off long (short-phase): %.2f GB (%d slots × %zuk stride)"
-                "  [long-phase slots computed dynamically at arena transition]\n",
-                bt_off_long_gb, dev_mem->n_long_concurrent_slots,
-                (size_t)dev_mem->max_align_task_len * 2 / 1000);
-    }
+        PLOG_INFO(stderr, "[Info]   Per slot: bt_p (short=static/long=dynamic)  bt_off (short=fixed-stride/long=dynamic-stride)  cigar_buf (short=fixed/long=per-batch)\n");
 
     // Set up chain phase initially
     setup_chain_phase(dev_mem, anchor_per_batch, range_grid_size, num_cut);
@@ -852,10 +841,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             cudaMallocHost(&dev_mem->h_align_unpacked_target, seq_staging);
         }
 
-        if (print_info)
-            PLOG_INFO(stderr, "[Info]   Pinned host buffers: %.2f GB (max_batch=%zu, seq_staging=%.2f MB each)\n",
-                    (cigar_buf_sz * 4 + mbs * 20 * 4) / (1024.0*1024.0*1024.0), mbs,
-                    dev_mem->h_align_seq_staging_bytes / (1024.0*1024.0));
+        (void)print_info;
     }
 
     cudaCheck();

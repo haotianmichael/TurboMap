@@ -462,9 +462,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t cigar_buf_total_tasks  = (size_t)dev_mem->max_align_tasks;
     size_t long_batch_persistent  = cigar_buf_total_tasks * max_cigar_len / long_cigar_len;
 
-    int total_batches_short = n_short_tasks > 0
-        ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
-
     uint32_t *h_compact_cigar   = dev_mem->h_align_compact_cigar;
     uint32_t *h_compact_offsets = dev_mem->h_align_compact_offsets;
     int      *h_cigar_lengths   = dev_mem->h_align_cigar_lengths;
@@ -505,7 +502,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         int  *current_task_indices  = (phase == 0) ? task_indices_short : task_indices_long;
         int   n_tasks_in_phase      = (phase == 0) ? n_short_tasks : n_long_tasks;
         size_t current_batch_size   = (phase == 0) ? short_batch_persistent : long_batch_persistent;
-        const char *phase_name      = (phase == 0) ? "Tier-0 Short" : "Tier-1 Long";
 
         // Short phase: n_col bounded by short_task_max_len regardless of per-task bandwidth.
         // Long phase: n_col and antidiag are computed per-batch below.
@@ -603,7 +599,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         int    rep_slots      = 0;
         int    rep_batch_size = 0;
         int    rep_count      = 0;
-        int    rep_done_start = 0;
 
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
@@ -783,8 +778,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 max_slots_cap      = dev_mem->n_long_concurrent_slots;
             }
 
-            char batch_path_tag = 'L';
-
             // Safety guard: skip batch if largest task's bt_stride exceeds available pool.
             if (phase == 1 && bt_stride0_val > bt_p_total_bytes) {
                 fprintf(stderr,
@@ -862,8 +855,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                             s_device_shared_cap);
                         s_shared_attr_set = true;
                     }
-                    batch_path_tag = (use_shared_variant == 1) ? 'H' : 'P';
-
                     if (use_shared_variant == 1) {
                         ksw_long_shared_kernel<<<phase_concurrent_slots, parallel_threads,
                                                  shared_bytes_full, align_stream>>>(
@@ -1112,7 +1103,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     rep_bt_stride  = batch_max_backtrack_size;
                     rep_slots      = phase_concurrent_slots;
                     rep_batch_size = batch_size;
-                    rep_done_start = tasks_processed_in_phase - batch_size;
                 }
                 if (tasks_processed_in_phase >= n_tasks_in_phase && rep_count > 0) {
                     PLOG_INFO(stderr,

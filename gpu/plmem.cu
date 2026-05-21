@@ -137,23 +137,11 @@ static size_t g_long_cigar_batch_override = 0;
 static size_t g_max_align_task_len = 50000;  // default 50,000 bp
 
 // Conservative estimate of bt_p cost per concurrent slot, used only to size n_long_cap
-// (the static bt_off/ksw_temp slot array count) at allocation time.
-// Runtime pool_cap0 = bt_p / actual_bt_stride0 always uses the real per-task value.
 // Used only in compute_long_batch_size to estimate CIGAR-buffer-bound batch size.
 static const size_t TYPICAL_BT_STRIDE_INTERNAL = (size_t)6 << 20;  // 6 MB
 
-// ── compute_long_batch_size ─────────────────────────────────────────────────────
-// Derives the maximum long-task batch size (CIGAR-buffer bound) from the arena
-// size and resource costs.  The derivation targets pool_cap ≈ n_long_cap, where
-// pool_cap = bt_p_total / TYPICAL_BT_STRIDE and n_long_cap = MAX_LONG_BATCH / L.
-//
-// Arena ≈ batch × K1  +  n_long × per_slot_var  +  bt_p
-//   bt_p ≈ n_long × TYPICAL_BT_STRIDE       (pool_cap = n_long)
-//   n_long = batch / L
-// ⟹  batch = L × arena / (L × K1 + per_slot_var + TYPICAL_BT_STRIDE)
-//
-// K1 = per-task arena cost in Step 1 (seq_unp×2, seq_pack×2, cigar×2, misc).
-// Called from setup_long_align_phase() and plmem_malloc_device_mem().
+// Returns the max long-task H2D batch size given available arena and max task length.
+// Derived from CIGAR buffer budget: batch × K1_per_task ≤ arena.
 static size_t compute_long_batch_size(size_t arena_bytes, size_t max_len) {
     const size_t L = 3;                                    // latency-hide factor
     const size_t TYPICAL_BT_STRIDE = TYPICAL_BT_STRIDE_INTERNAL;
@@ -515,13 +503,9 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_backtrack_n_col   = (int*)arena_alloc(a, alloc_slots * sizeof(int));
 
     // ---- Long-task backtrack_off buffers ----
-    // Short-task off buffers use stride = max_antidiag_short (2000), which is far too small for
-    // long tasks (antidiag up to 2*max_align_task_len = 100000).  We allocate a separate pair
-    // with the full long-task antidiag stride.  The number of concurrent long-task slots is
-    // bounded by both the bt_p pool capacity and this allocation.
-    // n_long_concurrent_slots = 512: caps the bt_off_long allocation while the actual
-    // concurrency is dynamically determined by the dedicated long bt_p pool size in plalign.cu.
-    size_t max_antidiag_long = 2 * dev_mem->max_align_task_len;  // 100,000
+    // bt_off_long uses full long-task antidiag stride; placeholder allocation of 512 slots
+    // during short phase — upgraded to gpu_max_slots when setup_long_align_phase is called.
+    size_t max_antidiag_long = 2 * dev_mem->max_align_task_len;
     dev_mem->n_long_concurrent_slots = 512;
     size_t bt_off_long_bytes = (size_t)dev_mem->n_long_concurrent_slots *
                                max_antidiag_long * sizeof(int);

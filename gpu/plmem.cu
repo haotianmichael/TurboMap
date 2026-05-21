@@ -782,6 +782,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                 g_long_cigar_batch_override > 0 ? "manual" : "auto",
                 dev_mem->n_align_concurrent_blocks);
         PLOG_INFO(stderr, "[Info]   Per batch: slots × (bt_p + bt_off + cigar_buf + ksw_temp)\n");
+    }
 
     // Set up chain phase initially
     setup_chain_phase(dev_mem, anchor_per_batch, range_grid_size, num_cut);
@@ -841,7 +842,6 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             cudaMallocHost(&dev_mem->h_align_unpacked_target, seq_staging);
         }
 
-        (void)print_info;
     }
 
     cudaCheck();

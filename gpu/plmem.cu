@@ -730,10 +730,6 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     size_t long_batch_max = long_batch_size(arena_size, dev_mem->max_align_task_len);
 
     if (print_info) {
-        double GB = 1024.0*1024.0*1024.0;
-        PLOG_INFO(stderr, "[Info::Arena] Auto-config for %d stream%s (%.2f GB free, %.2f GB/stream, %.0f B/anchor)\n",
-                num_streams, num_streams > 1 ? "s" : "",
-                free_mem / GB, arena_size / GB, g_bytes_per_anchor);
         PLOG_INFO(stderr, "[Info::Align::Config]: h2d_max_tasks_short=%zu  h2d_max_tasks_long=%zu (%s)"
                 "  gpu_max_slots=%d\n",
                 dev_mem->max_align_tasks,
@@ -1314,8 +1310,13 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     if (*long_seg_buffer_size_ < 1000000) *long_seg_buffer_size_ = 1000000;
 
     g_bytes_per_anchor = total_per_n;
-    PLOG_INFO(stderr, "[Info::Chain::Config] max_total_n=%zu, max_read=%d, long_seg_buf=%zu, %.0fB/anchor\n",
-            *max_total_n_, *max_read_, *long_seg_buffer_size_, total_per_n);
+    PLOG_INFO(stderr, "[Info::Arena] Auto-config for %d stream%s (%.2f GB free, %.2f GB/stream, %.0f B/anchor)\n",
+            *num_stream_, *num_stream_ > 1 ? "s" : "",
+            gpu_free_mem / (1024.0*1024.0*1024.0),
+            avail_mem_per_stream / (1024.0*1024.0*1024.0),
+            total_per_n);
+    PLOG_INFO(stderr, "[Info::Chain::Config] max_total_n=%zu, max_read=%d, long_seg_buf=%zu\n",
+            *max_total_n_, *max_read_, *long_seg_buffer_size_);
 }
 
 // intialize and config kernels for gpu blocking setup

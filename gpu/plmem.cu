@@ -781,7 +781,7 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                 long_batch_max,
                 g_long_cigar_batch_override > 0 ? "manual" : "auto",
                 dev_mem->n_align_concurrent_blocks);
-        PLOG_INFO(stderr, "[Info]   Per slot: bt_p (short=static/long=dynamic)  bt_off (short=fixed-stride/long=dynamic-stride)  cigar_buf (short=fixed/long=per-batch)\n");
+        PLOG_INFO(stderr, "[Info]   Per batch: slots × (bt_p + bt_off + cigar_buf + ksw_temp)\n");
 
     // Set up chain phase initially
     setup_chain_phase(dev_mem, anchor_per_batch, range_grid_size, num_cut);

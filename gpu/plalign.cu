@@ -411,44 +411,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             return sa > sb;
         });
 
-    // ---- bt_stride distribution statistics (temporary diagnostic) ----
-    {
-        // Bins: <1MB, 1-2, 2-5, 5-10, 10-20, 20-50, >=50MB
-        const size_t MB = 1024ULL * 1024ULL;
-        const size_t bin_edges[] = {1*MB, 2*MB, 5*MB, 10*MB, 20*MB, 50*MB};
-        const int n_bins = 7;
-        const char *bin_labels[] = {"<1MB","1-2MB","2-5MB","5-10MB","10-20MB","20-50MB",">=50MB"};
-        int bin_count[7] = {};
-        size_t total_bt = 0, max_bt = 0, min_bt = SIZE_MAX;
-
-        for (int i = 0; i < n_long_tasks; i++) {
-            int idx = task_indices_long[i];
-            int ql = tasks[idx].qlen, tl = tasks[idx].tlen, w = tasks[idx].w;
-            int nc = (ql < tl) ? ql : tl;
-            if (w >= 0 && w + 1 < nc) nc = w + 1;
-            size_t bt = (size_t)(ql + tl) * (size_t)nc;
-            total_bt += bt;
-            if (bt > max_bt) max_bt = bt;
-            if (bt < min_bt) min_bt = bt;
-            int b = n_bins - 1;
-            for (int k = 0; k < n_bins - 1; k++) { if (bt < bin_edges[k]) { b = k; break; } }
-            bin_count[b]++;
-        }
-
-        fprintf(stderr, "[BT-DIST] long tasks=%d  total=%.1fGB  min=%.2fMB  max=%.2fMB\n",
-                n_long_tasks,
-                total_bt / (1024.0*1024.0*1024.0),
-                min_bt == SIZE_MAX ? 0.0 : min_bt / (1024.0*1024.0),
-                max_bt / (1024.0*1024.0));
-        for (int k = 0; k < n_bins; k++) {
-            if (bin_count[k] > 0)
-                fprintf(stderr, "[BT-DIST]   %8s : %6d tasks (%5.1f%%)\n",
-                        bin_labels[k], bin_count[k],
-                        100.0 * bin_count[k] / (n_long_tasks > 0 ? n_long_tasks : 1));
-        }
-    }
-    // ---- end bt_stride distribution ----
-
     char stream_tag[32];
     snprintf(stream_tag, sizeof(stream_tag), "stream_%d", stream_id);
 

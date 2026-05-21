@@ -780,9 +780,9 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                 arena_size / GB);
         PLOG_INFO(stderr, "[Info]   Chain phase: %.2f GB  |  Align phase: %.2f GB\n",
                 chain_size / GB, align_size / GB);
-        PLOG_INFO(stderr, "[Info]   Align config: max_tasks=%zu  short_batch=%d"
-                "  long_batch_max=%zu (%s)  n_concurrent=%d\n",
-                dev_mem->max_align_tasks, dev_mem->short_task_batch_size,
+        PLOG_INFO(stderr, "[Info]   Align config: h2d_max_tasks_short=%zu  h2d_max_tasks_long=%zu (%s)"
+                "  gpu_max_slots=%d\n",
+                dev_mem->max_align_tasks,
                 long_batch_max,
                 g_long_cigar_batch_override > 0 ? "manual" : "auto",
                 dev_mem->n_align_concurrent_blocks);

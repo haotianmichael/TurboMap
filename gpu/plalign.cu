@@ -411,7 +411,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             return sa > sb;
         });
 
-    PLOG_INFO(stderr, "[Info] Alignment: %d short (max_len≤%zubp) + %d long (max_len>%zubp, dynamic bt)\n",
+    PLOG_INFO(stderr, "[Info::Align::Tasks]: %d short (max_len≤%zubp) + %d long (max_len>%zubp, dynamic bt)\n",
             n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
 
     int kernel_threads = 256;
@@ -571,34 +571,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             long_batch_persistent = (size_t)dev_mem->long_task_batch_size;
             current_batch_size    = long_batch_persistent;
-
-            size_t _arena_bt = dev_mem->long_arena_bt_p_bytes;
-            size_t _dedi_bt  = (dev_mem->d_align_backtrack_p_long != nullptr)
-                               ? dev_mem->long_bt_p_pool_bytes : 0;
-            size_t _eff_bt = (_arena_bt > _dedi_bt) ? _arena_bt : _dedi_bt;
-            PLOG_INFO(stderr, "[Info::Long]: cigar_cap=%zu  bt_p=%.2f GB  gpu_max_slots=%d\n",
-                    long_batch_persistent,
-                    _eff_bt / (1024.0*1024.0*1024.0),
-                    dev_mem->n_long_concurrent_slots);
         }
 
 
         int tasks_processed_in_phase = 0;
         int phase_batch_num = 0;
-        int total_phase_batches = (n_tasks_in_phase > 0)
-            ? (int)((n_tasks_in_phase + (int)current_batch_size - 1) / (int)current_batch_size) : 0;
 
-        // pool_cap0 and bt_stride0 for the current long-phase batch.
-        // Hoisted so slot computation can reuse them directly instead of recomputing
-        // via the overly-conservative max_antidiag × max_n_col product.
-        size_t pool_cap0   = 0;
+        size_t pool_cap0      = 0;
         size_t bt_stride0_val = 0;
-
-        // Repeat-suppression state for long-phase batch logging.
-        size_t rep_bt_stride  = 0;
-        int    rep_slots      = 0;
-        int    rep_batch_size = 0;
-        int    rep_count      = 0;
+        bool   long_config_logged = false;
 
         while (tasks_processed_in_phase < n_tasks_in_phase) {
             int batch_start = tasks_processed_in_phase;
@@ -634,6 +615,17 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 if (dyn_batch > (size_t)long_batch_persistent) dyn_batch = (size_t)long_batch_persistent;
 
                 current_batch_size = dyn_batch;
+
+                if (!long_config_logged) {
+                    PLOG_INFO(stderr,
+                        "[Info::Align::LongConfig]: bt_p=%.2fGB  bt_stride0=%.2fMB"
+                        "  pool_cap0=%zu  dyn_batch=%zu  gpu_max_slots=%d\n",
+                        bt_p_avail / (1024.0*1024.0*1024.0),
+                        bt_stride0 / (1024.0*1024.0),
+                        pool_cap0, dyn_batch,
+                        dev_mem->n_align_concurrent_blocks);
+                    long_config_logged = true;
+                }
             }
 
             int batch_size = (tasks_processed_in_phase + (int)current_batch_size <= n_tasks_in_phase)
@@ -958,10 +950,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             auto t_end = std::chrono::steady_clock::now();
             double wall_sec = std::chrono::duration<double>(t_end - t_start).count();
             s_ksw_wall_total_sec += wall_sec;
-            fprintf(stderr, "[BATCH-TIME] %s batch=%d  tasks=%d  slots=%d  gpu_ms=%.1f\n",
-                    phase == 1 ? "Long" : "Short",
-                    phase_batch_num, batch_size, phase_concurrent_slots,
-                    wall_sec * 1000.0);
+            double gpu_ms = wall_sec * 1000.0;
 
             if (cigar_buffer) {
                 cudaMemcpyAsync(h_cigar_lengths, d_cigar_lengths,
@@ -1077,40 +1066,13 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             total_tasks_processed    += batch_size;
 
             if (phase == 0) {
-                PLOG_INFO(stderr, "[Info::Short %d/%d]: %d tasks  slots=%d  bt_stride=%zu\n",
-                        phase_batch_num, total_phase_batches,
-                        batch_size, phase_concurrent_slots, batch_max_backtrack_size);
+                PLOG_INFO(stderr, "[Info::Short %d]: %d tasks  slots=%d  bt_stride=%.2fMB  (gpu_ms=%.1f)\n",
+                        phase_batch_num, batch_size, phase_concurrent_slots,
+                        batch_max_backtrack_size / (1024.0 * 1024.0), gpu_ms);
             } else {
-                double bt_mb = batch_max_backtrack_size / (1024.0 * 1024.0);
-                bool same = (batch_max_backtrack_size == rep_bt_stride &&
-                             phase_concurrent_slots   == rep_slots      &&
-                             batch_size               == rep_batch_size);
-                if (same) {
-                    rep_count++;
-                } else {
-                    if (rep_count > 0) {
-                        PLOG_INFO(stderr,
-                            "[Info::Long]:   ...×%d more identical  (%d/%d done)\n",
-                            rep_count,
-                            tasks_processed_in_phase - batch_size, n_tasks_in_phase);
-                        rep_count = 0;
-                    }
-                    PLOG_INFO(stderr,
-                        "[Info::Long %d]: %d tasks  slots=%d  bt0=%.2fMB  (%d/%d done)\n",
-                        phase_batch_num,
-                        batch_size, phase_concurrent_slots, bt_mb,
-                        tasks_processed_in_phase, n_tasks_in_phase);
-                    rep_bt_stride  = batch_max_backtrack_size;
-                    rep_slots      = phase_concurrent_slots;
-                    rep_batch_size = batch_size;
-                }
-                if (tasks_processed_in_phase >= n_tasks_in_phase && rep_count > 0) {
-                    PLOG_INFO(stderr,
-                        "[Info::Long]:   ...×%d more identical  (%d/%d done)\n",
-                        rep_count,
-                        tasks_processed_in_phase, n_tasks_in_phase);
-                    rep_count = 0;
-                }
+                PLOG_INFO(stderr, "[Info::Long %d]: %d tasks  slots=%d  bt0=%.2fMB  (gpu_ms=%.1f)\n",
+                        phase_batch_num, batch_size, phase_concurrent_slots,
+                        batch_max_backtrack_size / (1024.0 * 1024.0), gpu_ms);
             }
         }
     }

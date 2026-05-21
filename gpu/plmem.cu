@@ -730,19 +730,16 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
 
     if (print_info) {
         double GB = 1024.0*1024.0*1024.0;
-        PLOG_INFO(stderr, "[Info] GPU arena: %.2f GB total, %.2f GB free  (%d stream%s, %.2f GB each)\n",
-                total_mem / GB, free_mem / GB,
+        PLOG_INFO(stderr, "[Info::Arena] Auto-config for %d stream%s (%.2f GB free, %.2f GB/stream)\n",
                 num_streams, num_streams > 1 ? "s" : "",
-                arena_size / GB);
-        PLOG_INFO(stderr, "[Info]   Chain phase: %.2f GB  |  Align phase: %.2f GB\n",
-                chain_size / GB, align_size / GB);
-        PLOG_INFO(stderr, "[Info]   Align config: h2d_max_tasks_short=%zu  h2d_max_tasks_long=%zu (%s)"
+                free_mem / GB, arena_size / GB);
+        PLOG_INFO(stderr, "[Info::Align::Config]: h2d_max_tasks_short=%zu  h2d_max_tasks_long=%zu (%s)"
                 "  gpu_max_slots=%d\n",
                 dev_mem->max_align_tasks,
                 long_batch_max,
                 g_long_cigar_batch_override > 0 ? "manual" : "auto",
                 dev_mem->n_align_concurrent_blocks);
-        PLOG_INFO(stderr, "[Info]   Per batch: slots × (bt_p + bt_off + cigar_buf + ksw_temp)\n");
+        PLOG_INFO(stderr, "[Info::Align::Per Batch]: slots × (bt_p + bt_off + cigar_buf + ksw_temp)\n");
     }
 
     // Set up chain phase initially

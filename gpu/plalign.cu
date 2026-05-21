@@ -976,11 +976,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             auto t_end = std::chrono::steady_clock::now();
             double wall_sec = std::chrono::duration<double>(t_end - t_start).count();
             s_ksw_wall_total_sec += wall_sec;
-            if (phase == 1) {
-                fprintf(stderr, "[BATCH-TIME] Long batch=%d  tasks=%d  slots=%d  gpu_ms=%.1f\n",
-                        phase_batch_num, batch_size, phase_concurrent_slots,
-                        wall_sec * 1000.0);
-            }
+            fprintf(stderr, "[BATCH-TIME] %s batch=%d  tasks=%d  slots=%d  gpu_ms=%.1f\n",
+                    phase == 1 ? "Long" : "Short",
+                    phase_batch_num, batch_size, phase_concurrent_slots,
+                    wall_sec * 1000.0);
 
             if (cigar_buffer) {
                 cudaMemcpyAsync(h_cigar_lengths, d_cigar_lengths,

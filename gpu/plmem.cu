@@ -788,9 +788,10 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                 dev_mem->n_align_concurrent_blocks);
         PLOG_INFO(stderr, "[Info]   Short bt_p pool (arena): %.2f GB  |  Long bt_p pool (dedicated): %.2f GB\n",
                 bt_p_gb, long_pool_gb);
-        PLOG_INFO(stderr, "[Info]   bt_off long (short-phase): %.2f GB (%d slots × 100k stride)"
+        PLOG_INFO(stderr, "[Info]   bt_off long (short-phase): %.2f GB (%d slots × %zuk stride)"
                 "  [long-phase slots computed dynamically at arena transition]\n",
-                bt_off_long_gb, dev_mem->n_long_concurrent_slots);
+                bt_off_long_gb, dev_mem->n_long_concurrent_slots,
+                (size_t)dev_mem->max_align_task_len * 2 / 1000);
     }
 
     // Set up chain phase initially

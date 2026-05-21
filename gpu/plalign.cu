@@ -411,11 +411,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             return sa > sb;
         });
 
-    char stream_tag[32];
-    snprintf(stream_tag, sizeof(stream_tag), "stream_%d", stream_id);
-
-    PLOG_INFO(stderr, "[Info::%s] Alignment: %d short (max_len≤%zubp) + %d long (max_len>%zubp, dynamic bt)\n",
-            stream_tag, n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
+    PLOG_INFO(stderr, "[Info] Alignment: %d short (max_len≤%zubp) + %d long (max_len>%zubp, dynamic bt)\n",
+            n_short_tasks, short_task_max_len, n_long_tasks, short_task_max_len);
 
     int kernel_threads = 256;
     uint8_t  *d_unpacked_query  = dev_mem->d_align_unpacked_query;
@@ -467,11 +464,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
     int total_batches_short = n_short_tasks > 0
         ? (int)((n_short_tasks + short_batch_persistent - 1) / short_batch_persistent) : 0;
-    PLOG_INFO(stderr, "[Info::%s]   Tier-0 (short): %d batch(es) × up to %zu tasks  [fixed bt stride: %zu×%zu bytes]\n",
-            stream_tag, total_batches_short, short_batch_persistent,
-            2 * short_task_max_len, short_task_max_len + 1);
-    PLOG_INFO(stderr, "[Info::%s]   Tier-1 (long):  %d tasks  [bt_stride-sorted; batch count determined dynamically]\n",
-            stream_tag, n_long_tasks);
 
     uint32_t *h_compact_cigar   = dev_mem->h_align_compact_cigar;
     uint32_t *h_compact_offsets = dev_mem->h_align_compact_offsets;
@@ -588,13 +580,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             size_t _dedi_bt  = (dev_mem->d_align_backtrack_p_long != nullptr)
                                ? dev_mem->long_bt_p_pool_bytes : 0;
             size_t _eff_bt = (_arena_bt > _dedi_bt) ? _arena_bt : _dedi_bt;
-            PLOG_INFO(stderr, "[Info::%s]   Tier-1 (long): CIGAR cap=%zu  bt_p=%.2f GB  slots=%d\n",
-                    stream_tag, long_batch_persistent,
+            PLOG_INFO(stderr, "[Info::Long]: cigar_cap=%zu  bt_p=%.2f GB  gpu_max_slots=%d\n",
+                    long_batch_persistent,
                     _eff_bt / (1024.0*1024.0*1024.0),
                     dev_mem->n_long_concurrent_slots);
         }
 
-        PLOG_INFO(stderr, "[Info::%s] === %s: %d tasks ===\n", stream_tag, phase_name, n_tasks_in_phase);
 
         int tasks_processed_in_phase = 0;
         int phase_batch_num = 0;
@@ -1095,10 +1086,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             total_tasks_processed    += batch_size;
 
             if (phase == 0) {
-                PLOG_INFO(stderr, "[Info::%s] %s [%d/%d] tasks=%d slots=%d bt_stride=%zu  (%d/%d done)\n",
-                        stream_tag, phase_name, phase_batch_num, total_phase_batches,
-                        batch_size, phase_concurrent_slots, batch_max_backtrack_size,
-                        tasks_processed_in_phase, n_tasks_in_phase);
+                PLOG_INFO(stderr, "[Info::Short %d/%d]: %d tasks  slots=%d  bt_stride=%zu\n",
+                        phase_batch_num, total_phase_batches,
+                        batch_size, phase_concurrent_slots, batch_max_backtrack_size);
             } else {
                 double bt_mb = batch_max_backtrack_size / (1024.0 * 1024.0);
                 bool same = (batch_max_backtrack_size == rep_bt_stride &&
@@ -1109,17 +1099,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 } else {
                     if (rep_count > 0) {
                         PLOG_INFO(stderr,
-                            "[Info::%s]   ... ×%d more identical batches"
-                            "  (%d/%d done)\n",
-                            stream_tag, rep_count,
+                            "[Info::Long]:   ...×%d more identical  (%d/%d done)\n",
+                            rep_count,
                             tasks_processed_in_phase - batch_size, n_tasks_in_phase);
                         rep_count = 0;
                     }
                     PLOG_INFO(stderr,
-                        "[Info::%s] Long [%d|%c] tasks=%d  bt0=%.2fMB  slots=%d"
-                        "  (%d/%d done)\n",
-                        stream_tag, phase_batch_num, batch_path_tag,
-                        batch_size, bt_mb, phase_concurrent_slots,
+                        "[Info::Long %d]: %d tasks  slots=%d  bt0=%.2fMB  (%d/%d done)\n",
+                        phase_batch_num,
+                        batch_size, phase_concurrent_slots, bt_mb,
                         tasks_processed_in_phase, n_tasks_in_phase);
                     rep_bt_stride  = batch_max_backtrack_size;
                     rep_slots      = phase_concurrent_slots;
@@ -1128,9 +1116,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
                 if (tasks_processed_in_phase >= n_tasks_in_phase && rep_count > 0) {
                     PLOG_INFO(stderr,
-                        "[Info::%s]   ... ×%d more identical batches"
-                        "  (%d/%d done)\n",
-                        stream_tag, rep_count,
+                        "[Info::Long]:   ...×%d more identical  (%d/%d done)\n",
+                        rep_count,
                         tasks_processed_in_phase, n_tasks_in_phase);
                     rep_count = 0;
                 }
@@ -1138,8 +1125,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         }
     }
 
-    PLOG_INFO(stderr, "[Info::%s] Alignment complete: %d tasks in %d batches\n",
-            stream_tag, n_tasks, batch_num);
+    PLOG_INFO(stderr, "[Info] Alignment complete: %d tasks in %d batches\n",
+            n_tasks, batch_num);
 
     free(task_indices_short);
     free(task_indices_long);

@@ -350,18 +350,20 @@ static void start_backtrack_impl(stream_ptr_t *sp,
         hostMemPtr *hm = &sp->host_mems[uid];
         if (hm->size == 0) continue;
         size_t n = hm->total_n;
-        cudaMemcpyAsync(dev_mem->d_bt_ax_in   + combined_total_n, hm->ax,
-                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
-        cudaMemcpyAsync(dev_mem->d_bt_ay_in   + combined_total_n, hm->ay,
-                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
-        cudaMemcpyAsync(dev_mem->d_bt_xrev_in + combined_total_n, hm->xrev,
-                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
-        cudaMemcpyAsync(dev_mem->d_bt_yrev_in + combined_total_n, hm->yrev,
-                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
-        cudaMemcpyAsync(dev_mem->d_bt_f_in    + combined_total_n, hm->f,
-                        sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
-        cudaMemcpyAsync(dev_mem->d_bt_p_in    + combined_total_n, hm->p,
-                        sizeof(uint16_t) * n, cudaMemcpyHostToDevice, bt_stream);
+        if (n > 0) {
+            cudaMemcpyAsync(dev_mem->d_bt_ax_in   + combined_total_n, hm->ax,
+                            sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
+            cudaMemcpyAsync(dev_mem->d_bt_ay_in   + combined_total_n, hm->ay,
+                            sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
+            cudaMemcpyAsync(dev_mem->d_bt_xrev_in + combined_total_n, hm->xrev,
+                            sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
+            cudaMemcpyAsync(dev_mem->d_bt_yrev_in + combined_total_n, hm->yrev,
+                            sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
+            cudaMemcpyAsync(dev_mem->d_bt_f_in    + combined_total_n, hm->f,
+                            sizeof(int32_t) * n, cudaMemcpyHostToDevice, bt_stream);
+            cudaMemcpyAsync(dev_mem->d_bt_p_in    + combined_total_n, hm->p,
+                            sizeof(uint16_t) * n, cudaMemcpyHostToDevice, bt_stream);
+        }
         combined_total_n += n;
         combined_n_reads += hm->size;
     }

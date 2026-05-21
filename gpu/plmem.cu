@@ -916,6 +916,19 @@ void plmem_async_h2d_short_memcpy(stream_ptr_t* stream_ptrs, size_t uid) {
     hostMemPtr *host_mem = &stream_ptrs->host_mems[uid];
     deviceMemPtr *dev_mem = &stream_ptrs->dev_mem;
     cudaStream_t *stream = &stream_ptrs->cudastream;
+
+    // Update device-side metadata first so plrange/plscore see correct values.
+    dev_mem->total_n = host_mem->total_n;
+    dev_mem->num_cut = host_mem->cut_num;
+    dev_mem->size    = host_mem->size;
+    dev_mem->griddim = host_mem->griddim;
+
+    // Skip CUDA ops when there are no anchors. cudaMemsetAsync/cudaMemcpyAsync
+    // with count=0 returns cudaErrorInvalidValue on older CUDA drivers (pre-11.1).
+    // This happens with partial-reference inputs (e.g. chr3.mmi) where reads
+    // mapping to other chromosomes have n=0 anchors.
+    if (host_mem->total_n == 0) return;
+
     cudaMemcpyAsync(dev_mem->d_ax, host_mem->ax,
                     sizeof(int32_t) * host_mem->total_n, cudaMemcpyHostToDevice,
                     *stream);
@@ -947,10 +960,6 @@ void plmem_async_h2d_short_memcpy(stream_ptr_t* stream_ptrs, size_t uid) {
     cudaMemsetAsync(dev_mem->d_p, 0, sizeof(uint16_t) * host_mem->total_n,
                     *stream);
     cudaCheck();
-    dev_mem->total_n = host_mem->total_n;
-    dev_mem->num_cut = host_mem->cut_num;
-    dev_mem->size = host_mem->size;
-    dev_mem->griddim = host_mem->griddim;
 }
 
 void plmem_async_h2d_memcpy(stream_ptr_t* stream_ptrs) {
@@ -1046,6 +1055,7 @@ void plmem_async_d2h_short_memcpy(stream_ptr_t *stream_ptrs, size_t uid) {
     hostMemPtr *host_mem = &stream_ptrs->host_mems[uid];
     deviceMemPtr *dev_mem = &stream_ptrs->dev_mem;
     cudaStream_t *stream = &stream_ptrs->cudastream;
+    if (host_mem->total_n == 0) return;
     cudaMemcpyAsync(host_mem->f, dev_mem->d_f,
                     sizeof(int32_t) * host_mem->total_n, cudaMemcpyDeviceToHost,
                     *stream);

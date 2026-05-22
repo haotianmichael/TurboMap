@@ -1381,9 +1381,26 @@ static int task_compare(const void *a, const void *b) {
     return ta->task_sub_idx - tb->task_sub_idx;
 }
 
+// ---------------------------------------------------------------------------
+// GPU second-pass retry for GAP_FILL tasks that fail mm_test_zdrop.
+// Mirrors the CPU two-pass approach: first pass uses APPROX_MAX (no zdrop),
+// mm_test_zdrop detects real z-drops, second pass re-runs with zdrop enabled.
+// ---------------------------------------------------------------------------
+
+#define MAX_ZDROP_RETRY 1024
+
+typedef struct {
+    int read_idx;
+    int reg_idx;
+    int sub_idx;    // task_sub_idx of the failed GAP_FILL
+    int zdrop_code; // 1=normal zdrop, 2=inversion (use zdrop_inv)
+} zdrop_retry_t;
+
 static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                        const mm_mapopt_t *opt,
-                                       const mm_idx_t *mi, void *km)
+                                       const mm_idx_t *mi, void *km,
+                                       int enable_zdrop_retry,
+                                       zdrop_retry_t *retry_out, int *n_retry_out)
 {
     if (gpu_batch->n_tasks == 0) return;
     qsort(gpu_batch->tasks, gpu_batch->n_tasks,
@@ -1491,11 +1508,21 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                                    task->n_cigar, cigar, mat);
                     kfree(km, tseq_gap);
                     if (zdrop_code != 0) {
-                        // Real z-drop: discard partial GPU work for this region.
-                        // Free r->p so the CPU fallback loop (after gpu_batch_submit_and_process)
-                        // detects p==NULL and calls mm_align1 to redo the whole alignment.
-                        free(r->p);
-                        r->p = NULL;
+                        if (enable_zdrop_retry && retry_out && n_retry_out
+                                && *n_retry_out < MAX_ZDROP_RETRY) {
+                            // Queue GPU second-pass retry: re-run this GAP_FILL with
+                            // zdrop enabled (and zdrop_inv for inversion).  r->p is
+                            // kept intact here; it is reset before retry processing.
+                            zdrop_retry_t *rp = &retry_out[(*n_retry_out)++];
+                            rp->read_idx  = current_read;
+                            rp->reg_idx   = current_reg;
+                            rp->sub_idx   = task->task_sub_idx;
+                            rp->zdrop_code = zdrop_code;
+                        } else {
+                            // Fallback: original CPU path.
+                            free(r->p);
+                            r->p = NULL;
+                        }
                         dropped = 1;
                         continue;
                     }
@@ -1770,12 +1797,108 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
 {
     if (gpu_batch->n_tasks == 0) return;
 
-    // Submit to GPU kernel
+    // First GPU pass
     gpu_align_batch_execute(opt, gpu_batch->tasks, gpu_batch->n_tasks,
                            gpu_batch->seq_buffer, gpu_batch->cigar_buffer, stream_id);
-    
-    // Process results back to mm_reg1_t structures
-    gpu_batch_process_results(gpu_batch, opt, mi, km);
+
+    // Process results; collect GAP_FILL tasks that fail mm_test_zdrop
+    zdrop_retry_t retry_list[MAX_ZDROP_RETRY];
+    int n_retry = 0;
+    gpu_batch_process_results(gpu_batch, opt, mi, km,
+                              /*enable_zdrop_retry=*/1, retry_list, &n_retry);
+
+    if (n_retry == 0) return;
+
+    // -----------------------------------------------------------------------
+    // GPU second pass: re-run ALL tasks for reads/regs that had a zdrop hit,
+    // with the specific failing GAP_FILL modified to use zdrop (no APPROX_MAX).
+    // This matches the CPU two-pass approach (mm_align_pair APPROX_MAX →
+    // mm_test_zdrop → mm_align_pair with zdrop).
+    // -----------------------------------------------------------------------
+
+    // Build a lookup set: (read_idx, reg_idx) pairs that need retry
+    // Use a flat array; n_retry is bounded by MAX_ZDROP_RETRY (≤1024).
+    // Build retry task array by scanning original tasks for affected read/reg.
+    int max_retry_tasks = gpu_batch->n_tasks; // upper bound
+    gpu_align_task_t *retry_tasks = (gpu_align_task_t*)malloc(
+            max_retry_tasks * sizeof(gpu_align_task_t));
+    if (!retry_tasks) {
+        fprintf(stderr, "[WARN] zdrop retry: malloc failed, falling back to CPU\n");
+        for (int r = 0; r < n_retry; r++) {
+            int ri = retry_list[r].read_idx, rg = retry_list[r].reg_idx;
+            if (ri >= 0 && ri < gpu_batch->n_reads) {
+                read_align_ctx_t *ctx = &gpu_batch->read_ctxs[ri];
+                if (rg >= 0 && rg < ctx->n_regs && ctx->regs0[rg].p) {
+                    free(ctx->regs0[rg].p);
+                    ctx->regs0[rg].p = NULL;
+                }
+            }
+        }
+        return;
+    }
+
+    // Reset r->p for all affected (read_idx, reg_idx).
+    // We redo the full region alignment (LEFT_EXT + all GAP_FILLs + RIGHT_EXT)
+    // so the partially-built first-pass CIGAR must be discarded.
+    for (int r = 0; r < n_retry; r++) {
+        int ri = retry_list[r].read_idx, rg = retry_list[r].reg_idx;
+        if (ri < 0 || ri >= gpu_batch->n_reads) continue;
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[ri];
+        if (rg < 0 || rg >= ctx->n_regs) continue;
+        mm_reg1_t *rp = &ctx->regs0[rg];
+        if (rp->p) { free(rp->p); rp->p = NULL; }
+    }
+
+    // Collect all tasks belonging to affected (read_idx, reg_idx) pairs.
+    // tasks[] is already sorted; scan linearly (n_tasks typically ≤ 50k).
+    int n_retry_tasks = 0;
+    for (int t = 0; t < gpu_batch->n_tasks; t++) {
+        gpu_align_task_t *orig = &gpu_batch->tasks[t];
+        // Check if this task's (read_idx, reg_idx) is in retry set
+        int in_retry = 0;
+        int zdrop_code_for_task = 0;
+        for (int r = 0; r < n_retry; r++) {
+            if (retry_list[r].read_idx == orig->read_idx &&
+                    retry_list[r].reg_idx == orig->reg_idx) {
+                in_retry = 1;
+                // Check if this specific GAP_FILL is the one that failed
+                if (orig->task_type == GPU_TASK_GAP_FILL &&
+                        orig->task_sub_idx == retry_list[r].sub_idx)
+                    zdrop_code_for_task = retry_list[r].zdrop_code;
+            }
+        }
+        if (!in_retry) continue;
+
+        gpu_align_task_t rt = *orig;  // copy all fields (incl. qseq_offset, tseq_offset)
+        if (zdrop_code_for_task != 0) {
+            // Second pass: remove APPROX_MAX, enable zdrop
+            rt.flag  &= ~KSW_EZ_APPROX_MAX;
+            rt.zdrop  = (zdrop_code_for_task == 2) ? opt->zdrop_inv : opt->zdrop;
+        }
+        // Reuse same cigar_offset — old CIGAR is being discarded
+        retry_tasks[n_retry_tasks++] = rt;
+    }
+
+    if (n_retry_tasks == 0) { free(retry_tasks); return; }
+
+    // Second GPU pass
+    gpu_align_batch_execute(opt, retry_tasks, n_retry_tasks,
+                            gpu_batch->seq_buffer, gpu_batch->cigar_buffer, stream_id);
+
+    // Process retry results into the (now-reset) r->p.
+    // Temporarily swap tasks so process_results sees the retry batch.
+    gpu_align_task_t *orig_tasks = gpu_batch->tasks;
+    int orig_n_tasks = gpu_batch->n_tasks;
+    gpu_batch->tasks   = retry_tasks;
+    gpu_batch->n_tasks = n_retry_tasks;
+
+    // No further zdrop retry (avoid infinite loop)
+    gpu_batch_process_results(gpu_batch, opt, mi, km,
+                              /*enable_zdrop_retry=*/0, NULL, NULL);
+
+    gpu_batch->tasks   = orig_tasks;
+    gpu_batch->n_tasks = orig_n_tasks;
+    free(retry_tasks);
 }
 
 static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,

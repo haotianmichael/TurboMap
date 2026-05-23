@@ -1614,17 +1614,17 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                     qe1 = task->task_ctx.ref_qs + (task->max_q + 1);
                     dropped = 1;
 
-                    // Split remaining anchors into r2 (matches CPU mm_align1 logic).
-                    // Note: the GPU always aligns with opt->zdrop, skipping the CPU
-                    // two-pass approach (APPROX_MAX + mm_test_zdrop) that distinguishes
-                    // normal z-drop (zdrop_code=1) from inversion z-drop (zdrop_code=2).
-                    // Therefore r2->split_inv is never set here; inversion detection
-                    // will happen when the CPU fallback re-aligns r2 via mm_align1.
+                    // Split remaining anchors into r2 (mirrors CPU mm_align1 logic).
+                    // task->zdrop==opt->zdrop_inv signals inversion zdrop (code=2); set
+                    // r2.split_inv so mm_align1 later gives r2 the mm_align1_inv treatment.
                     {
                         int as1 = task->task_ctx.as1;
                         int cnt1 = task->task_ctx.cnt1;
                         int gap_i = task->task_sub_idx;  // gap fill anchor index within as1..as1+cnt1
                         int rs_gap = task->task_ctx.ref_rs;
+                        int rev_zd = task->task_ctx.rev;
+                        int is_inv_zdrop = (opt->zdrop_inv != opt->zdrop &&
+                                            task->zdrop == (uint32_t)opt->zdrop_inv);
                         int j;
                         // Find last anchor before the z-drop point
                         for (j = gap_i - 1; j >= 0; --j)
@@ -1636,26 +1636,40 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             memset(&r2, 0, sizeof(mm_reg1_t));
                             mm_split_reg(r, &r2, as1 + j + 1 - r->as, qlen, ctx->a, !!(opt->flag & MM_F_QSTRAND));
                             if (r2.cnt > 0) {
+                                if (is_inv_zdrop) r2.split_inv = 1;
                                 ctx->regs0 = mm_insert_reg(&r2, current_reg, &ctx->n_regs, ctx->regs0);
                                 // Update r pointer since realloc may have moved the array
                                 r = &ctx->regs0[current_reg];
                             }
                         }
-                        // Fix: mm_split_reg calls mm_reg_set_coor which overwrites r->rs/re/qs/qe
-                        // with anchor-based coordinates.  We must restore the alignment-derived
-                        // coordinates here, because is_last_task will never fire for the
-                        // remaining skipped tasks (dropped=1 short-circuits the loop).
+                        // mm_split_reg calls mm_reg_set_coor which overwrites r->rs/re/qs/qe
+                        // with anchor-based coordinates.  Restore alignment-derived coordinates:
+                        // is_last_task will never fire for remaining skipped tasks (dropped=1).
                         r->rs = rs1;
                         r->re = re1;
-                        {
-                            int rev_zd = task->task_ctx.rev;
-                            if (!rev_zd || (opt->flag & MM_F_QSTRAND)) {
-                                r->qs = qs1;
-                                r->qe = qe1;
-                            } else {
-                                r->qs = qlen - qe1;
-                                r->qe = qlen - qs1;
-                            }
+                        if (!rev_zd || (opt->flag & MM_F_QSTRAND)) {
+                            r->qs = qs1;
+                            r->qe = qe1;
+                        } else {
+                            r->qs = qlen - qe1;
+                            r->qe = qlen - qs1;
+                        }
+                        // mm_update_extra must be called here: dropped=1 skips remaining tasks
+                        // so is_last_task will never run for this region.  Compute blen/mlen/
+                        // dp_max over the truncated CIGAR [rs1..re1] × [qs1..qe1].
+                        if (r->p && r->p->n_cigar > 0 && re1 > rs1 &&
+                                qs1 >= 0 && qs1 < qlen && qe1 <= qlen) {
+                            uint8_t *qseq_ue;
+                            if (!rev_zd || (opt->flag & MM_F_QSTRAND))
+                                qseq_ue = ctx->qseq0[0] + qs1;
+                            else
+                                qseq_ue = ctx->qseq0[1] + qs1;
+                            uint8_t *tseq_ue = (uint8_t*)kmalloc(km, re1 - rs1);
+                            mm_idx_getseq(mi, task->task_ctx.rid, rs1, re1, tseq_ue);
+                            mm_update_extra(r, qseq_ue, tseq_ue, mat, opt->q, opt->e,
+                                           opt->flag & MM_F_EQX, !(opt->flag & MM_F_SR));
+                            if (rev_zd && r->p->trans_strand) r->p->trans_strand ^= 3;
+                            kfree(km, tseq_ue);
                         }
                     }
 				} else if (!has_valid_alignment) {

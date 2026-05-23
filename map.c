@@ -1642,6 +1642,24 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                 r = &ctx->regs0[current_reg];
                             }
                         }
+                        // Derive the truncated coordinates from the ACTUAL accumulated CIGAR.
+                        // mm_update_extra (via mm_fix_cigar) requires the CIGAR to consume
+                        // EXACTLY (re1-rs1) target and (qe1-qs1) query — the asserts at
+                        // align.c:126/288 enforce this.  Under -DNDEBUG those asserts are
+                        // gone, so a mismatch reads tseq/qseq out of bounds -> segfault.
+                        // The GPU zdrop CIGAR is not guaranteed to end exactly at
+                        // (max_t,max_q), so trust the CIGAR as the source of truth for span.
+                        if (r->p && r->p->n_cigar > 0) {
+                            int cig_qlen = 0, cig_tlen = 0;
+                            for (uint32_t ci = 0; ci < r->p->n_cigar; ++ci) {
+                                int cop = r->p->cigar[ci] & 0xf, clen = r->p->cigar[ci] >> 4;
+                                if (cop == MM_CIGAR_MATCH) { cig_qlen += clen; cig_tlen += clen; }
+                                else if (cop == MM_CIGAR_INS) cig_qlen += clen;
+                                else if (cop == MM_CIGAR_DEL || cop == MM_CIGAR_N_SKIP) cig_tlen += clen;
+                            }
+                            re1 = rs1 + cig_tlen;
+                            qe1 = qs1 + cig_qlen;
+                        }
                         // mm_split_reg calls mm_reg_set_coor which overwrites r->rs/re/qs/qe
                         // with anchor-based coordinates.  Restore alignment-derived coordinates:
                         // is_last_task will never fire for remaining skipped tasks (dropped=1).
@@ -1672,6 +1690,11 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             kfree(km, tseq_ue);
                         }
                     }
+                    // This region's processing ends at the z-drop: all remaining tasks are
+                    // skipped (dropped=1).  Skip the is_last_task block to avoid a SECOND
+                    // mm_update_extra call when this zdropped GAP_FILL happens to be the last
+                    // task — the second call would mis-count the already eqx-converted CIGAR.
+                    continue;
 				} else if (!has_valid_alignment) {
                     // 任务失败：需要在CIGAR中添加操作来表示整个gap
                     // 计算gap大小

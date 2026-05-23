@@ -465,7 +465,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
         FILE *lf = btdist_log_open();
         g_btdist_batch_num++;
-        // Header line per batch
         if (lf) fprintf(lf, "=== Batch %d ===\n", g_btdist_batch_num);
 
         const char *type_names[] = {"LEFT_EXT", "GAP_FILL", "RIGHT_EXT"};
@@ -474,15 +473,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             double total_gb = stat[t].total_bt / (1024.0*1024.0*1024.0);
             double min_mb   = stat[t].min_bt == SIZE_MAX ? 0.0 : stat[t].min_bt / (1024.0*1024.0);
             double max_mb   = stat[t].max_bt / (1024.0*1024.0);
-            fprintf(stderr, "[BT-DIST] %s  n=%d  total=%.2fGB  min=%.2fMB  max=%.2fMB\n",
-                    type_names[t], stat[t].count, total_gb, min_mb, max_mb);
             if (lf) fprintf(lf, "[BT-DIST] %s  n=%d  total=%.2fGB  min=%.2fMB  max=%.2fMB\n",
                     type_names[t], stat[t].count, total_gb, min_mb, max_mb);
             for (int k = 0; k < n_bins; k++) {
                 if (stat[t].bin_count[k] > 0) {
                     double pct = 100.0 * stat[t].bin_count[k] / stat[t].count;
-                    fprintf(stderr, "[BT-DIST]   %8s : %6d (%5.1f%%)\n",
-                            bin_labels[k], stat[t].bin_count[k], pct);
                     if (lf) fprintf(lf, "[BT-DIST]   %8s : %6d (%5.1f%%)\n",
                             bin_labels[k], stat[t].bin_count[k], pct);
                 }

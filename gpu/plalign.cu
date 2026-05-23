@@ -783,7 +783,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             int    diag_actual_max_qlen = 0;
             int    diag_actual_max_tlen = 0;
-            int    diag_n_exceed        = 0;
             size_t diag_actual_antidiag = 0;
             int    batch_max_tlen       = 0;
 
@@ -799,12 +798,24 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     if (tl > diag_actual_max_tlen) diag_actual_max_tlen = tl;
                     if (tl > batch_max_tlen)       batch_max_tlen       = tl;
                     if (ql > (int)dev_mem->max_align_task_len ||
-                        tl > (int)dev_mem->max_align_task_len)
-                        diag_n_exceed++;
+                        tl > (int)dev_mem->max_align_task_len) {
+                        fprintf(stderr,
+                            "[FATAL] Long batch task: qlen=%d or tlen=%d exceeds "
+                            "max_align_task_len=%zu. Increase max_align_task_len in "
+                            "gpu_config.json.\n",
+                            ql, tl, dev_mem->max_align_task_len);
+                        exit(EXIT_FAILURE);
+                    }
                 }
                 size_t max_antidiag_long = 2 * (size_t)dev_mem->max_align_task_len;
-                if (actual_max_antidiag > max_antidiag_long)
-                    actual_max_antidiag = max_antidiag_long;
+                if (actual_max_antidiag > max_antidiag_long) {
+                    fprintf(stderr,
+                        "[FATAL] Batch actual anti-diagonal count %zu exceeds bt_off_long "
+                        "stride %zu (2 × max_align_task_len=%zu). This should not happen "
+                        "if qlen/tlen checks passed — possible bug.\n",
+                        actual_max_antidiag, max_antidiag_long, dev_mem->max_align_task_len);
+                    exit(EXIT_FAILURE);
+                }
                 diag_actual_antidiag = actual_max_antidiag;
 
                 // Per-slot bt_p stride: use the largest task's actual bt_stride (not the

@@ -317,7 +317,7 @@ __global__ void ksw_long_shared_kernel(
         int last_st = -1, last_en = -1;
         for (int r = 0; r < qlen + tlen - 1; r++) {
             if (r >= max_antidiag) {
-                if (lane_id == 0) ez_zdropped = 1;
+                __trap();
                 break;
             }
 
@@ -863,7 +863,7 @@ __global__ void ksw_long_shared3_kernel(
         int last_st = -1, last_en = -1;
         for (int r = 0; r < qlen + tlen - 1; r++) {
             if (r >= max_antidiag) {
-                if (lane_id == 0) ez_zdropped = 1;
+                __trap();
                 break;
             }
 

@@ -256,7 +256,11 @@ __global__ void ksw_fused_persistent_kernel(
         int last_st = -1, last_en = -1;
         for (int r = 0; r < qlen + tlen - 1; r++) {
             if (r >= (int)max_antidiag) {
-                if (lane_id == 0) ez_zdropped = 1;
+                // Task exceeds bt_off buffer stride (2 × max_align_task_len anti-diagonals).
+                // This means qlen+tlen > 2×max_align_task_len, which the CPU-side FATAL
+                // in gpu_align_batch_execute should have caught first.
+                // If we reach here something is wrong — abort loudly.
+                __trap();
                 break;
             }
 

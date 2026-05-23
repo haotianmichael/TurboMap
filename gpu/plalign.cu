@@ -377,6 +377,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         return;
     }
 
+    // Always reset arena to short-align layout before capturing local GPU pointers below.
+    // If the previous call left dev_mem in long-align state (current_phase==GPU_PHASE_ALIGN),
+    // plmem_phase_to_align() would be a no-op: the short-phase pointer captures at lines
+    // ~491-531 would then point to long-phase arena locations (wrong size, wrong stride).
+    // Forcing GPU_PHASE_CHAIN causes plmem_phase_to_align() to always call setup_align_phase().
+    dev_mem->current_phase = GPU_PHASE_CHAIN;
     plmem_phase_to_align(dev_mem);
 
     int kernel_blocks = 28;

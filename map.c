@@ -1748,7 +1748,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 // (which adjusts r->rs/r->qs), and correct blen/mlen/dp_max
                 // computed over the FULL alignment, not just the last subtask.
                 if (r->p && r->p->n_cigar > 0) {
-                    if (qs1 < 0 || qs1 >= qlen || rs1 < 0 || re1 <= rs1) {
+                    if (qs1 < 0 || qs1 >= qlen || qe1 > qlen || rs1 < 0 || re1 <= rs1) {
                         fprintf(stderr, "[BUG] mm_update_extra bounds: qs1=%d qe1=%d qlen=%d rs1=%d re1=%d read=%d reg=%d task[%d] type=%d\n",
                                 qs1, qe1, qlen, rs1, re1, current_read, current_reg, i, task->task_type);
                     } else {

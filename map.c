@@ -1838,14 +1838,12 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
     gpu_align_batch_execute(opt, gpu_batch->tasks, gpu_batch->n_tasks,
                            gpu_batch->seq_buffer, gpu_batch->cigar_buffer, stream_id);
 
-    // Process results; collect GAP_FILL tasks that fail mm_test_zdrop
-    zdrop_retry_t retry_list[MAX_ZDROP_RETRY];
-    int n_retry = 0;
+    // TEMP TEST: skip GPU retry; mm_test_zdrop hits fall back to CPU mm_align1
+    // via post_align_helper_gpu (r->p=NULL regions).  Compare accuracy against
+    // GPU retry to isolate how much accuracy comes from this zdrop block.
     gpu_batch_process_results(gpu_batch, opt, mi, km,
-                              /*enable_zdrop_retry=*/1, retry_list, &n_retry);
-
-    fprintf(stderr, "[Info::ZdropRetry] GAP_FILL mm_test_zdrop hits: %d (0=no retry needed)\n", n_retry);
-    if (n_retry == 0) return;
+                              /*enable_zdrop_retry=*/0, NULL, NULL);
+    return; // TEMP: rest is GPU retry code, skipped for this test
 
     // -----------------------------------------------------------------------
     // GPU second pass: re-run ALL tasks for reads/regs that had a zdrop hit,

@@ -8,6 +8,23 @@
 #include "plksw_shared_kernel.cuh"
 #include "pllog.h"
 #include <cub/device/device_scan.cuh>
+#include <cerrno>
+#include <cstring>
+
+// Log file for long-task bt_stride distribution (diagnostic).
+// Opened on first batch, appended thereafter, never explicitly closed
+// (flushed on exit via atexit).
+static FILE *g_btdist_log = nullptr;
+static int   g_btdist_batch_num = 0;
+
+static FILE *btdist_log_open(void) {
+    if (!g_btdist_log) {
+        g_btdist_log = fopen("long_task_dist.log", "w");
+        if (!g_btdist_log)
+            fprintf(stderr, "[Warn] Cannot open long_task_dist.log: %s\n", strerror(errno));
+    }
+    return g_btdist_log;
+}
 
 #ifndef USE_SHARED_LONG_KERNEL
 #define USE_SHARED_LONG_KERNEL 0
@@ -446,21 +463,32 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             stat[tt].bin_count[b]++;
         }
 
+        FILE *lf = btdist_log_open();
+        g_btdist_batch_num++;
+        // Header line per batch
+        if (lf) fprintf(lf, "=== Batch %d ===\n", g_btdist_batch_num);
+
         const char *type_names[] = {"LEFT_EXT", "GAP_FILL", "RIGHT_EXT"};
         for (int t = 0; t < 3; t++) {
             if (stat[t].count == 0) continue;
+            double total_gb = stat[t].total_bt / (1024.0*1024.0*1024.0);
+            double min_mb   = stat[t].min_bt == SIZE_MAX ? 0.0 : stat[t].min_bt / (1024.0*1024.0);
+            double max_mb   = stat[t].max_bt / (1024.0*1024.0);
             fprintf(stderr, "[BT-DIST] %s  n=%d  total=%.2fGB  min=%.2fMB  max=%.2fMB\n",
-                    type_names[t], stat[t].count,
-                    stat[t].total_bt / (1024.0*1024.0*1024.0),
-                    stat[t].min_bt == SIZE_MAX ? 0.0 : stat[t].min_bt / (1024.0*1024.0),
-                    stat[t].max_bt / (1024.0*1024.0));
+                    type_names[t], stat[t].count, total_gb, min_mb, max_mb);
+            if (lf) fprintf(lf, "[BT-DIST] %s  n=%d  total=%.2fGB  min=%.2fMB  max=%.2fMB\n",
+                    type_names[t], stat[t].count, total_gb, min_mb, max_mb);
             for (int k = 0; k < n_bins; k++) {
-                if (stat[t].bin_count[k] > 0)
+                if (stat[t].bin_count[k] > 0) {
+                    double pct = 100.0 * stat[t].bin_count[k] / stat[t].count;
                     fprintf(stderr, "[BT-DIST]   %8s : %6d (%5.1f%%)\n",
-                            bin_labels[k], stat[t].bin_count[k],
-                            100.0 * stat[t].bin_count[k] / stat[t].count);
+                            bin_labels[k], stat[t].bin_count[k], pct);
+                    if (lf) fprintf(lf, "[BT-DIST]   %8s : %6d (%5.1f%%)\n",
+                            bin_labels[k], stat[t].bin_count[k], pct);
+                }
             }
         }
+        if (lf) fflush(lf);
     }
     // ---- end bt_stride distribution ----
 

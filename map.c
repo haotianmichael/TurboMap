@@ -2070,38 +2070,74 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     // Submit all GPU tasks and process results
     gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km, stream_id);
 
-    // CPU fallback: align any r2 regions created by z-drop splits during GPU result processing.
+    // B2: re-align z-drop split remainders ON GPU instead of on the CPU.
+    // gpu_batch_process_results creates remainder regions (p==NULL, anchor-based
+    // coords) whenever a gap-fill z-drops.  Such a remainder always carries
+    // >= opt->min_cnt anchors, so feeding it back through mm_align1_batched -> the
+    // same kernel re-aligns it; a remainder may itself z-drop again, so iterate to
+    // a fixpoint.  The whole batch (all reads, all pending remainders) is collapsed
+    // into one GPU submission per wave.  mm_test_zdrop still runs on the CPU inside
+    // gpu_batch_submit_and_process, and inversions stay on the CPU below — only the
+    // extension DP moves to the GPU here.
+    {
+        const int MAX_REALIGN_WAVES = 16; // safety cap; each split strictly shrinks
+                                          // the remainder, so cascades terminate well
+                                          // before this in practice.
+        for (int wave = 0; wave < MAX_REALIGN_WAVES; ++wave) {
+            // Reuse the same batch object: the previous wave's CIGARs are already in
+            // r->p, so the task/seq/cigar buffers can be reset and refilled.
+            gpu_batch->n_tasks = 0;
+            gpu_batch->seq_buffer_used = 0;
+            gpu_batch->cigar_buffer_used = 0;
+
+            for (int iread = 0; iread < batch->count; iread++) {
+                read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
+                if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a)
+                    continue;
+                for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
+                    mm_reg1_t *reg = &ctx->regs0[ireg];
+                    if (reg->cnt > 0 && reg->p == NULL) {
+                        // mm_align1_batched only enqueues tasks; the z-drop split of
+                        // this remainder (if any) happens in gpu_batch_process_results.
+                        mm_reg1_t r2_unused;
+                        memset(&r2_unused, 0, sizeof(mm_reg1_t));
+                        mm_align1_batched(gpu_batch, batch->km, s->p->opt, s->p->mi,
+                                          ctx->qlen, ctx->qseq0, reg, &r2_unused,
+                                          ctx->n_a, ctx->a, iread, ireg);
+                    }
+                }
+            }
+            // Terminate on the real task count: a remainder whose coordinate guards
+            // produce no tasks never gets re-aligned here (the CPU net in
+            // post_align_helper_gpu is the backstop), so stop spinning waves on it.
+            if (gpu_batch->n_tasks == 0) break;
+            gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi,
+                                         batch->km, stream_id);
+        }
+    }
+
+    // B3 (kept on CPU by design): inversion alignment for split_inv remainders.
+    // split_inv is set in gpu_batch_process_results when a z-drop looks like an
+    // inversion (mm_test_zdrop code 2).  mm_align1_inv relies on ksw_ll_i16, a
+    // different DP than the main kernel, so it stays on the CPU.  Run it after the
+    // GPU re-align waves, when every remainder is already aligned.
     for (int iread = 0; iread < batch->count; iread++) {
         read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
-        for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
+        if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a)
+            continue;
+        for (int ireg = 1; ireg < ctx->n_regs; ireg++) {
             mm_reg1_t *reg = &ctx->regs0[ireg];
-            if (reg->cnt > 0 && reg->p == NULL) {
-                // Unaligned region (from z-drop split) — run CPU mm_align1
-                ksw_extz_t ez;
-                memset(&ez, 0, sizeof(ksw_extz_t));
-                mm_reg1_t r2_cpu;
-                memset(&r2_cpu, 0, sizeof(mm_reg1_t));
-                mm_align1(batch->km, s->p->opt, s->p->mi, ctx->qlen,
-                          ctx->qseq0, reg, &r2_cpu, ctx->n_a, ctx->a,
-                          &ez, s->p->opt->flag);
-                kfree(batch->km, ez.cigar);
-                if (r2_cpu.cnt > 0) {
-                    ctx->regs0 = mm_insert_reg(&r2_cpu, ireg, &ctx->n_regs, ctx->regs0);
-                    reg = &ctx->regs0[ireg]; // realloc may have moved the array
+            if (reg->split_inv && !(s->p->opt->flag & MM_F_NO_INV)) {
+                mm_reg1_t r2_inv;
+                memset(&r2_inv, 0, sizeof(mm_reg1_t));
+                ksw_extz_t ez_inv;
+                memset(&ez_inv, 0, sizeof(ksw_extz_t));
+                if (mm_align1_inv(batch->km, s->p->opt, s->p->mi, ctx->qlen,
+                                 ctx->qseq0, &ctx->regs0[ireg-1], reg, &r2_inv, &ez_inv)) {
+                    ctx->regs0 = mm_insert_reg(&r2_inv, ireg, &ctx->n_regs, ctx->regs0);
+                    ++ireg; // skip the inserted inversion alignment
                 }
-                // Handle inversion z-drop
-                if (ireg > 0 && reg->split_inv && !(s->p->opt->flag & MM_F_NO_INV)) {
-                    mm_reg1_t r2_inv;
-                    memset(&r2_inv, 0, sizeof(mm_reg1_t));
-                    ksw_extz_t ez_inv;
-                    memset(&ez_inv, 0, sizeof(ksw_extz_t));
-                    if (mm_align1_inv(batch->km, s->p->opt, s->p->mi, ctx->qlen,
-                                     ctx->qseq0, &ctx->regs0[ireg-1], reg, &r2_inv, &ez_inv)) {
-                        ctx->regs0 = mm_insert_reg(&r2_inv, ireg, &ctx->n_regs, ctx->regs0);
-                        ++ireg;
-                    }
-                    kfree(batch->km, ez_inv.cigar);
-                }
+                kfree(batch->km, ez_inv.cigar);
             }
         }
     }

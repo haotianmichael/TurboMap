@@ -1517,11 +1517,13 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             }
         }
         
-        // 累积score
-        if (has_valid_alignment && r->p && task->score > 0) {
-			int old_score = r->p->dp_score;
+        // Accumulate DP score, mirroring CPU mm_align1: left/right extensions and
+        // zdrop add ez->max (always >=0) while gap-fills add ez->score (which may be
+        // negative). task->score already holds the correct per-task value, so do NOT
+        // drop negative gap-fill contributions the way a ">0" guard would.
+        if (has_valid_alignment && r->p) {
             r->p->dp_score += task->score;
-        } 
+        }
         
         // 根据任务类型更新边界
         switch (task->task_type) {

@@ -135,9 +135,11 @@ __device__ static inline uint32_t* sh_push_cigar(
 }
 
 __device__ __forceinline__ int8_t sh_dp_score(
-    uint8_t a, uint8_t b, const int8_t *mat, int m)
+    uint8_t a, uint8_t b, const int8_t *mat, int m, int8_t sc_N)
 {
-    return (a < m && b < m) ? mat[a * m + b] : 0;
+    // Mirror CPU ksw2_extd2_sse: an ambiguous base (value m-1, i.e. 'N') scores sc_N
+    // (= mat[m*m-1]==0 ? -e2 : mat[m*m-1]); every other pair uses the matrix.
+    return (a >= (uint8_t)(m - 1) || b >= (uint8_t)(m - 1)) ? sc_N : mat[a * m + b];
 }
 
 /* ============================================================================
@@ -242,6 +244,9 @@ __global__ void ksw_long_shared_kernel(
         }
         int8_t qe  = q  + e;
         int8_t qe2 = q2 + e2;
+        // sc_N: score for any cell involving an ambiguous base. CPU ksw2_extd2_sse
+        // uses -e2 when mat[m*m-1]==0 (e.g. --score-N 0), otherwise mat[m*m-1].
+        int8_t sc_N = (device_mat[m * m - 1] == 0) ? (int8_t)(-e2) : device_mat[m * m - 1];
 
         int wl = (w < 0) ? max(qlen, tlen) : w;
         int wr = (w < 0) ? max(qlen, tlen) : w;
@@ -411,7 +416,7 @@ __global__ void ksw_long_shared_kernel(
                     if (qi >= 0 && qi < qlen && t >= 0 && t < tlen) {
                         uint8_t qb = __ldg(&qr[qi_rev]);
                         uint8_t tb = __ldg(&target[t]);
-                        my_score = sh_dp_score(qb, tb, device_mat, m);
+                        my_score = sh_dp_score(qb, tb, device_mat, m, sc_N);
                     } else {
                         my_score = 0;
                     }
@@ -785,6 +790,9 @@ __global__ void ksw_long_shared3_kernel(
         }
         int8_t qe  = q  + e;
         int8_t qe2 = q2 + e2;
+        // sc_N: score for any cell involving an ambiguous base. CPU ksw2_extd2_sse
+        // uses -e2 when mat[m*m-1]==0 (e.g. --score-N 0), otherwise mat[m*m-1].
+        int8_t sc_N = (device_mat[m * m - 1] == 0) ? (int8_t)(-e2) : device_mat[m * m - 1];
 
         int wl = (w < 0) ? max(qlen, tlen) : w;
         int wr = (w < 0) ? max(qlen, tlen) : w;
@@ -950,7 +958,7 @@ __global__ void ksw_long_shared3_kernel(
                     if (qi >= 0 && qi < qlen && t >= 0 && t < tlen) {
                         uint8_t qb = __ldg(&qr[qi_rev]);
                         uint8_t tb = __ldg(&target[t]);
-                        my_score = sh_dp_score(qb, tb, device_mat, m);
+                        my_score = sh_dp_score(qb, tb, device_mat, m, sc_N);
                     } else {
                         my_score = 0;
                     }

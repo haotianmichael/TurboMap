@@ -6,6 +6,18 @@ layout change.
 
 ---
 
+## ABSOLUTE PROHIBITION — GPU EXTENSION PHASE
+
+**禁止Extension阶段任何提到CPU FALL BACK的尝试。**
+**禁止Extension阶段任何提到CPU FALL BACK的尝试。**
+**禁止Extension阶段任何提到CPU FALL BACK的尝试。**
+
+THE GPU EXTENSION MUST REPLICATE ALL CPU EXTENSION LOGIC ON GPU.
+DO NOT SUGGEST, IMPLEMENT, OR MENTION CPU FALLBACK IN ANY FORM DURING EXTENSION.
+EVERY ALIGNMENT OPERATION IN THE EXTENSION PHASE MUST RUN ON GPU.
+
+---
+
 ## Working Branch
 
 Active development branch: `claude/clean-v100-nvidia-only-P39Ok`

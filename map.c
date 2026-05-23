@@ -1807,6 +1807,7 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
     gpu_batch_process_results(gpu_batch, opt, mi, km,
                               /*enable_zdrop_retry=*/1, retry_list, &n_retry);
 
+    fprintf(stderr, "[Info::ZdropRetry] GAP_FILL mm_test_zdrop hits: %d (0=no retry needed)\n", n_retry);
     if (n_retry == 0) return;
 
     // -----------------------------------------------------------------------

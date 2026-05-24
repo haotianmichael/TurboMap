@@ -1210,20 +1210,8 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     } else {
         rs0 = (int32_t)a[r->as].x + 1 - (int32_t)(a[r->as].y>>32&0xff);
         qs0 = (int32_t)a[r->as].y + 1 - (int32_t)(a[r->as].y>>32&0xff);
-
-        // Clamp qs0 to valid range to prevent crash on corrupted voting anchors
-        if (qs0 < 0 || qs0 > qlen) {
-#ifdef DEBUG_PRINT
-            fprintf(stderr, "[DEBUG] Invalid qs0=%d (qlen=%d) read=%d reg=%d: "
-                    "a[r->as].y=0x%lx q_span=%u qs=%d qe=%d rs=%d re=%d\n",
-                    qs0, qlen, read_idx, reg_idx,
-                    a[r->as].y, (uint32_t)(a[r->as].y>>32&0xff), qs, qe, rs, re);
-#endif
-            if (qs0 < 0) qs0 = 0;
-            if (qs0 > qlen) qs0 = qlen;
-        }
-        if (rs0 < 0) rs0 = 0;
-        assert(qs0 >= 0);
+        if (rs0 < 0) rs0 = 0; // this may happen when HPC is in use
+        assert(qs0 >= 0); // this should never happen, or it is logic error
         rs1 = qs1 = 0;
         for (i = r->as - 1, l = 0; i >= 0 && a[i].x>>32 == a[r->as].x>>32; --i) {
             int32_t x = (int32_t)a[i].x + 1 - (int32_t)(a[i].y>>32&0xff);
@@ -1284,18 +1272,6 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
         if (qe0 - r->qe > max_ext) qe0 = r->qe + max_ext;
     }
 
-    // Clamp re0/qe0 to hard sequence boundaries BEFORE tseq allocation.
-    // Voting rechain can mix anchors from different chromosomes into one chain:
-    // the tail anchor's ref_pos may belong to another rid whose sequence is
-    // longer than the current one, so re0 ends up > mi->seq[rid].len.
-    // Without this clamp, the gap-fill guard "re > re0" never fires even when
-    // re > seq_len, and mm_idx_getseq reads past the chromosome → SIGSEGV.
-    {
-        int32_t seq_len_rid = (int32_t)mi->seq[rid].len;
-        if (re0 > seq_len_rid) re0 = seq_len_rid;
-        if (qe0 > qlen) qe0 = qlen;
-    }
-
     if (re0 <= rs0) return;
     tseq = (uint8_t*)kmalloc(km, re0 - rs0);
     junc = (uint8_t*)kmalloc(km, re0 - rs0);
@@ -1307,25 +1283,6 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
 
     rs1 = rs, qs1 = qs;
 
-    // Validate anchor-derived coordinates before touching qseq0 / tseq buffers.
-    // Corrupted anchors from voting can produce qs/rs values that exceed allocated
-    // buffers, causing mm_seq_rev to write past the end of qseq0[rev] or tseq.
-    {
-        int32_t seq_len = (int32_t)mi->seq[rid].len;
-        int bad = 0;
-        if (qs0 < 0 || qs0 > qlen) { bad = 1; }
-        if (qs  < 0 || qs  > qlen) { bad = 1; }
-        if (qs0 > qs)              { bad = 1; }
-        if (rs0 < 0 || rs0 > seq_len) { bad = 1; }
-        if (rs  < 0 || rs  > seq_len) { bad = 1; }
-        if (rs0 > rs)              { bad = 1; }
-        if (bad) {
-            kfree(km, tseq);
-            kfree(km, junc);
-            return;
-        }
-    }
-
 	task_ctx_t task_ctx;
     task_ctx.qs0 = qs0;
 	task_ctx.qe0 = qe0;
@@ -1336,12 +1293,8 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
 	task_ctx.as1 = as1;
 	task_ctx.cnt1 = cnt1;
  
-	// Left extension
-    // Guard: rs must not exceed re0, or mm_idx_getseq would write (rs-rs0) bytes
-    // into a (re0-rs0)-byte tseq buffer → overflow.  Pre-ext guard ensures
-    // rs <= seq_len; after clamping re0 = seq_len this gives rs <= re0, but
-    // add the explicit check in case re0 was not clamped (is_sr path).
-    if (qs > 0 && rs > 0 && rs <= re0) {
+	// Left extension; probably the condition can be changed to "qs > qs0 && rs > rs0"
+    if (qs > 0 && rs > 0) {
         if (opt->flag & MM_F_QSTRAND) {
             qseq = &qseq0[0][qs0];
             mm_idx_getseq2(mi, rev, rid, rs0, rs, tseq);
@@ -1379,29 +1332,6 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
 
         if (i == cnt1 - 1 || (a[as1+i].y&MM_SEED_LONG_JOIN) ||
                          (qe - qs >= opt->min_ksw_len && re - rs >= opt->min_ksw_len)) {
-            // Guard: voting-recombined anchors can produce re > re0 (overflows
-            // tseq buffer) or qe > qlen (overflows qseq0). Check before any
-            // sequence operations.
-            if (re <= rs || qe <= qs) {
-                // Anchor coordinates go backward in ref or query (can happen
-                // with voting-recombined anchors).  Skip this anchor entirely
-                // without advancing rs or qs: the next valid anchor's task will
-                // cover the accumulated range including this skipped position.
-                // BUG-FIX: previously "qs = qe" here silently ate up to ~13 kbp
-                // of query bases without creating a CIGAR task for them.
-                continue;
-            }
-            if (re > re0 || qe > qlen) {
-                if (re > re0) re = re0;
-                if (qe > qlen) qe = qlen;
-                if (re <= rs || qe <= qs) {
-                    // Same bug as the outer guard: advancing qs here without
-                    // creating a CIGAR task silently drops query bases.
-                    // Just skip this anchor; the next valid anchor's task
-                    // (or RIGHT_EXT) will cover the accumulated range.
-                    continue;
-                }
-            }
             int bw1 = bw_long;
             if (a[as1+i].y & MM_SEED_LONG_JOIN)
                 bw1 = qe - qs > re - rs? qe - qs : re - rs;
@@ -1440,13 +1370,7 @@ void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
     }
 
     // Right extension
-    // Guard: if gap fill was skipped due to bad voting anchors, qe/re may be
-    // negative or beyond buffer bounds. Only extend when coords are sane.
-    // Critical: also require re >= rs0, because tseq was allocated (re0-rs0)
-    // bytes and mm_idx_getseq writes (re0-re) bytes — if re < rs0 then
-    // re0-re > re0-rs0 and we overflow the heap.
-    if (qe >= 0 && qe <= qlen && re >= rs0 && re <= (int32_t)mi->seq[rid].len
-            && qe < qe0 && re < re0) {
+    if (qe < qe0 && re < re0) {
         if (opt->flag & MM_F_QSTRAND) {
             qseq = &qseq0[0][qe];
             mm_idx_getseq2(mi, rev, rid, re, re0, tseq);

@@ -61,22 +61,28 @@ File: `gpu/plmem.cu`, function `plmem_config_batch`.
 | `chain_per_n` | 27 B | ax(4)+ay(4)+sid(1)+xrev(4)+yrev(4)+range(4)+f(4)+p(2) per anchor |
 | `bt_per_n` | `mb × 82` B | backtrack arrays per anchor |
 | `cub_per_n` | `mb × 16` B | CUB sort temp per anchor |
+| `vt_reserve_per_n` | `mb × 61` B | **reserve only** — voting device arrays are gone, but this term is kept to cap `max_total_n` (see below) |
 | `per_long_entry` | **23** B | long-seg buffers; **includes `d_xrev_long`** (was 19 → crash) |
 | `long_ratio` | 2.0 | `buffer_size_long = long_ratio × max_total_n` |
 | `mb` | usually 4 | `score_kernel_config.micro_batch` |
 | `global_reserve` | 256 MB | JSON `global_vram_reserve_mb`; ≥1024 MB for cuda-gdb |
 
 ```
-per_anchor_total = chain_per_n + bt_per_n + cub_per_n        // voting (mb×61) removed
+per_anchor_total = chain_per_n + bt_per_n + cub_per_n + vt_reserve_per_n
 total_per_n      = per_anchor_total + long_ratio*per_long_entry + overhead_per_n
 budget           = (gpu_free_mem - global_reserve) / num_streams * 0.98
 max_total_n      = budget / total_per_n
 ```
 
-**Keep this formula in sync with `setup_chain_phase`.** Per-anchor cost is now
-~465 B (was ~709 B before voting removal), so `max_total_n` is ~1.5× higher for the
-same budget. `per_long_entry` = 23 must stay (the missing-`xrev` underestimate at 19
-was the V100s `invalid argument` crash).
+**Why `vt_reserve_per_n` is kept even though voting is removed:** `max_total_n` bounds
+how many reads the chain pipeline fits into one batch, which in turn sizes the
+per-batch HOST allocation in `gpu_align_batch_init` (~8 MB/read × reads-fitted). Removing
+`vt_reserve_per_n` raised `max_total_n` ~1.5× and OOM-killed the host on large inputs
+(50 k reads). The reclaimed device VRAM still helps extension: the voting arrays are not
+allocated, so that space falls through to the **long bt_p pool** (remaining arena space).
+
+`per_long_entry` = 23 must stay (the missing-`xrev` underestimate at 19 was the V100s
+`invalid argument` crash).
 
 ---
 
@@ -146,7 +152,9 @@ micro_batch    = score_kernel_config.micro_batch  // typically 4
 ## Known Issues / History
 
 - **Voting/rechain removed**: no kernel used the `d_vt_*` arrays; their chain-arena
-  allocations and the `vt_per_n` budget term were deleted (VRAM reclaimed).
+  device allocations were deleted (VRAM reclaimed → long bt_p pool). The `mb×61`
+  budget term is **kept as `vt_reserve_per_n`** — dropping it ~1.5×'d `max_total_n`
+  and OOM-killed the host (per-batch `gpu_align_batch_init` is ~8 MB/read).
 - **Dead align buffers removed**: `d_align_global_buffer` (AGAThA,
   ~14 KB × `max_align_task_len`), `d_align_ez_array`, `d_align_backtrack_n_col`.
 - **Z-drop split remainders** are re-aligned on GPU (iterative re-batch through the

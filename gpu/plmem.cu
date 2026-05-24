@@ -1216,15 +1216,22 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     //   CUB sort temp (N*mb): ~16 bytes (double-buffer for int64 key+value pairs)
     //   Long seg data (L):  ax(4)+ay(4)+sid(1)+range(4)+f(4)+p(2) = 19
     //   Long seg index (L): seg_t*2 + map(4) per (long_seg_cutoff*cut_unit) entries = 36/10240 per L
-    //   Index/cut:          per-grid(24) + per-cut(12) + per bt_r(mb*24)
-    //   (Voting arrays removed: setup_chain_phase no longer allocates them.)
+    //   Index/cut:          per-grid(24) + per-cut(12) + per bt_r(mb*24) + vt reserve(mb*24)
     int mb = score_kernel_config.micro_batch;
 
     // N-proportional cost
     size_t chain_per_n = 27;
     size_t bt_per_n    = (size_t)mb * 82;   // backtrack: 82 bytes × micro_batch
     size_t cub_per_n   = (size_t)mb * 16;   // CUB sort temp: ~16 bytes × micro_batch (key+value double-buffer)
-    size_t per_anchor_total = chain_per_n + bt_per_n + cub_per_n;  // voting (mb*61) removed
+    // The voting DEVICE arrays were removed (setup_chain_phase no longer allocates
+    // them), but KEEP this mb*61 term as a budget reserve.  It caps max_total_n at the
+    // pre-removal value, which bounds the per-batch HOST allocation in
+    // gpu_align_batch_init (~8 MB/read × reads-fitted-per-batch).  Dropping it raised
+    // max_total_n ~1.5x and OOM-killed the host on large inputs.  The reclaimed device
+    // VRAM still benefits extension: it falls through to the long bt_p pool (which takes
+    // all remaining arena space).
+    size_t vt_reserve_per_n = (size_t)mb * 61;
+    size_t per_anchor_total = chain_per_n + bt_per_n + cub_per_n + vt_reserve_per_n;
 
     // L-proportional cost (long segment buffers)
     size_t per_long_entry = 23;  // ax(4)+ay(4)+sid(1)+range(4)+xrev(4)+f(4)+p(2) long arrays
@@ -1238,14 +1245,14 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     cJSON *long_seg_json = cJSON_GetObjectItem(json, "long_seg_buffer_size");
     double long_ratio = 2.0;  // L = long_ratio * N
 
-    // Per-read overhead (index + cut + bt_r arrays):
+    // Per-read overhead (index + cut + bt_r + vt-reserve arrays):
     //   G ≈ N/anchor_per_block + N/avg_read_n
     //   C ≈ N/blockdim + N/avg_read_n
-    //   per G: 24 (index) + mb*24 (bt_r) = 24 + 24*mb   (voting vt_r arrays removed)
+    //   per G: 24 (index) + mb*24 (bt_r) + mb*24 (vt reserve) = 24 + 48*mb
     //   per C: 8 (d_cut) + 4*sizeof(seg_t)/(mid_seg_cutoff+1) ≈ 12
     double grids_per_n = 1.0 / range_kernel_config.anchor_per_block + 1.0 / avg_read_n;
     double cuts_per_n  = 1.0 / range_kernel_config.blockdim + 1.0 / avg_read_n;
-    size_t per_grid = 24 + (size_t)mb * 24;
+    size_t per_grid = 24 + (size_t)mb * 48;
     size_t per_cut  = 12;
     double overhead_per_n = grids_per_n * per_grid + cuts_per_n * per_cut;
 

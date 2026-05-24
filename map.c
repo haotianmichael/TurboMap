@@ -1391,6 +1391,15 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
           sizeof(gpu_align_task_t), task_compare);
     
     int current_read = -1, current_reg = -1;
+    // reg_offset tracks how many regions z-drop splits have inserted into this
+    // read's ctx->regs0 so far.  Tasks carry the reg_idx frozen at enqueue time,
+    // but mm_insert_reg shifts later regions, so the true array slot of a task's
+    // region is (reg_idx + reg_offset).  Without this, a split in any non-last
+    // region of a multi-region read mis-maps every following region's tasks onto
+    // the wrong region — silent CIGAR corruption.  Valid because tasks are
+    // processed in ascending reg_idx order and mm_insert_reg always inserts right
+    // after the current region.
+    int reg_offset = 0, actual_reg = -1;
     read_align_ctx_t *ctx = NULL;
     mm_reg1_t *r = NULL;
     int32_t rs1 = 0, qs1 = 0, re1 = 0, qe1 = 0;
@@ -1409,6 +1418,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
         
         // 切换到新region
         if (task->read_idx != current_read || task->reg_idx != current_reg) {
+            if (task->read_idx != current_read) reg_offset = 0; // new read: fresh regs0
             current_read = task->read_idx;
             current_reg = task->reg_idx;
             if (current_read < 0 || current_read >= gpu_batch->n_reads) {
@@ -1417,12 +1427,14 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                 dropped = 1; continue;
             }
             ctx = &gpu_batch->read_ctxs[current_read];
-            if (current_reg < 0 || current_reg >= ctx->n_regs) {
-                fprintf(stderr, "[BUG] task[%d]: reg_idx=%d OOB (n_regs=%d, read=%d), skipping\n",
-                        i, current_reg, ctx->n_regs, current_read);
+            // Map the frozen reg_idx to its current array slot (shifted by earlier splits).
+            actual_reg = current_reg + reg_offset;
+            if (actual_reg < 0 || actual_reg >= ctx->n_regs) {
+                fprintf(stderr, "[BUG] task[%d]: reg_idx=%d (actual=%d) OOB (n_regs=%d, read=%d), skipping\n",
+                        i, current_reg, actual_reg, ctx->n_regs, current_read);
                 dropped = 1; continue;
             }
-            r = &ctx->regs0[current_reg];
+            r = &ctx->regs0[actual_reg];
             
             // 获取query长度
              qlen = ctx->qlen; 
@@ -1581,9 +1593,13 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             mm_split_reg(r, &r2, as1 + j + 1 - r->as, qlen, ctx->a, !!(opt->flag & MM_F_QSTRAND));
                             if (r2.cnt > 0) {
                                 if (is_inv_zdrop) r2.split_inv = 1;
-                                ctx->regs0 = mm_insert_reg(&r2, current_reg, &ctx->n_regs, ctx->regs0);
-                                // Update r pointer since realloc may have moved the array
-                                r = &ctx->regs0[current_reg];
+                                ctx->regs0 = mm_insert_reg(&r2, actual_reg, &ctx->n_regs, ctx->regs0);
+                                // r2 is inserted at actual_reg+1; the head region stays at
+                                // actual_reg (re-fetch since realloc may have moved the array).
+                                // Bump reg_offset so every following region's reg_idx maps to
+                                // its new, shifted slot.
+                                r = &ctx->regs0[actual_reg];
+                                reg_offset++;
                             }
                         }
                         // Derive the truncated coordinates from the ACTUAL accumulated CIGAR.

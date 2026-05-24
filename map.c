@@ -1707,6 +1707,24 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                           (gpu_batch->tasks[i+1].reg_idx != current_reg);
 
         if (is_last_task) {
+            // Match CPU mm_align1: the accumulated CIGAR is the source of truth for
+            // the span. Derive re1/qe1 from it (as the z-drop path already does) so
+            // r->re/qe and the tseq/qseq passed to mm_update_extra are exactly
+            // consistent with the CIGAR; otherwise per-task coordinate drift makes
+            // mm_update_extra consume past the tseq buffer (SIGSEGV).
+            if (!dropped && r->p && r->p->n_cigar > 0) {
+                int64_t cig_qlen = 0, cig_tlen = 0;
+                for (uint32_t ci = 0; ci < r->p->n_cigar; ++ci) {
+                    int cop = r->p->cigar[ci] & 0xf, clen = r->p->cigar[ci] >> 4;
+                    if (cop == MM_CIGAR_MATCH)       { cig_qlen += clen; cig_tlen += clen; }
+                    else if (cop == MM_CIGAR_INS)    cig_qlen += clen;
+                    else if (cop == MM_CIGAR_DEL ||
+                             cop == MM_CIGAR_N_SKIP) cig_tlen += clen;
+                }
+                re1 = rs1 + (int32_t)cig_tlen;
+                qe1 = qs1 + (int32_t)cig_qlen;
+            }
+
             // Set final boundaries (even for dropped regions — they still need
             // valid coordinates for the truncated alignment, matching CPU logic)
             r->rs = rs1;

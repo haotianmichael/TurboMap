@@ -205,7 +205,6 @@ typedef struct {
     int32_t *d_align_bw;
 
     // Working buffers
-    void *d_align_global_buffer;     // AGATHA working buffer
     void *d_align_ksw_temp_buffer;   // KSW temp buffer
     size_t align_ksw_temp_per_task;  // KSW temp size per task
 
@@ -213,7 +212,6 @@ typedef struct {
     uint8_t *d_align_backtrack_p;
     int *d_align_backtrack_off;
     int *d_align_backtrack_off_end;
-    int *d_align_backtrack_n_col;
     // Long-task specific backtrack_off buffers (stride = max_antidiag_long = 2*max_align_task_len)
     // The short-task off buffers use stride = max_antidiag_short = 2*short_task_max_len (2000),
     // which is too small for long tasks whose antidiag can reach 2*max_align_task_len (100000).
@@ -257,7 +255,6 @@ typedef struct {
 
     // Result buffers
     void *d_align_device_res;        // gasal_res_t structure
-    void *d_align_ez_array;          // ksw_extz_t array
     int32_t *d_align_scores;
     int32_t *d_align_query_ends;
     int32_t *d_align_target_ends;

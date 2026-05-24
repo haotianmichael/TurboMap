@@ -331,9 +331,6 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_flag            = (int32_t*)arena_alloc(a, meta);
     dev_mem->d_align_bw              = (int32_t*)arena_alloc(a, meta);
 
-    // Global DP buffer: not used by KSW kernel; keep a 4-byte placeholder
-    dev_mem->d_align_global_buffer = arena_alloc(a, 4);
-
     // Short-stride bt_off stubs (not used in long phase — long tasks use bt_off_long)
     dev_mem->d_align_backtrack_off     = (int*)arena_alloc(a, sizeof(int));
     dev_mem->d_align_backtrack_off_end = (int*)arena_alloc(a, sizeof(int));
@@ -359,7 +356,6 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_dp_max          = (int32_t*)arena_alloc(a, res);
     dev_mem->d_align_gpu_stats_valid = (int32_t*)arena_alloc(a, res);
     dev_mem->d_align_device_res      = arena_alloc(a, sizeof(gasal_res_t));
-    dev_mem->d_align_ez_array        = arena_alloc(a, sizeof(ksw_extz_t) * MAX_LONG_BATCH);
     dev_mem->d_align_scores          = (int32_t*)arena_alloc(a, res);
     dev_mem->d_align_query_ends      = (int32_t*)arena_alloc(a, res);
     dev_mem->d_align_target_ends     = (int32_t*)arena_alloc(a, res);
@@ -383,7 +379,6 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
     size_t bt_off_long_bytes = n_long_cap * max_antidiag_long * sizeof(int);
 
     dev_mem->d_align_ksw_temp_buffer        = arena_alloc(a, ksw_temp_bytes);
-    dev_mem->d_align_backtrack_n_col        = (int*)arena_alloc(a, n_long_cap * sizeof(int));
     dev_mem->d_align_backtrack_off_long     = (int*)arena_alloc(a, bt_off_long_bytes);
     dev_mem->d_align_backtrack_off_end_long = (int*)arena_alloc(a, bt_off_long_bytes);
 
@@ -441,11 +436,6 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_flag            = (int32_t*)arena_alloc(a, metadata_size);
     dev_mem->d_align_bw              = (int32_t*)arena_alloc(a, metadata_size);
 
-    // ---- Global DP buffer ----
-    size_t global_buffer_size = 28 * (256 / 8) * dev_mem->max_align_task_len * 4;
-    size_t global_buffer_bytes = global_buffer_size * sizeof(short2);
-    dev_mem->d_align_global_buffer = arena_alloc(a, global_buffer_bytes);
-
     // ---- KSW temp buffer (slot-indexed by blockIdx.x) ----
     // Layout: H[tlen]*int32 (max tracking) + u/v/x/y/x2/y2[(tlen+1)]*int8 + qr + target (uint8)
     size_t max_len = dev_mem->max_align_task_len;
@@ -471,7 +461,6 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     dev_mem->d_align_backtrack_p       = (uint8_t*)arena_alloc(a, bt_p_bytes);
     dev_mem->d_align_backtrack_off     = (int*)arena_alloc(a, bt_off_bytes);
     dev_mem->d_align_backtrack_off_end = (int*)arena_alloc(a, bt_off_bytes);
-    dev_mem->d_align_backtrack_n_col   = (int*)arena_alloc(a, alloc_slots * sizeof(int));
 
     // ---- Long-task backtrack_off buffers ----
     // bt_off_long uses full long-task antidiag stride; placeholder allocation of 512 slots
@@ -510,8 +499,6 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
 
     // ---- Result buffers ----
     dev_mem->d_align_device_res       = arena_alloc(a, sizeof(gasal_res_t));
-    dev_mem->d_align_ez_array         = arena_alloc(a,
-        sizeof(ksw_extz_t) * dev_mem->short_task_batch_size);
     dev_mem->d_align_scores           = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
     dev_mem->d_align_query_ends       = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));
     dev_mem->d_align_target_ends      = (int32_t*)arena_alloc(a, dev_mem->max_align_tasks * sizeof(int32_t));

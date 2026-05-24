@@ -273,33 +273,10 @@ typedef struct {
     int   n_align_concurrent_blocks; // number of slots for persistent kernel
     int  *d_align_task_counter;      // atomic task counter (reset before each kernel launch)
 
-    // ========== Voting Pre-allocated Buffers ==========
-    // Pre-allocated to eliminate hot-path cudaMalloc/cudaFree in run_voting_minibatch.
-    // Sized by d_vt_max_anchors (= anchor_per_batch * micro_batch, same as backtrack).
-    // n_bins upper bound: same as max_anchors (each anchor can map to at most 1 bin).
-    size_t d_vt_max_anchors;         // capacity of anchor-sized arrays
-    // Anchor-sized (uint64_t):
-    uint64_t *d_vt_ax;               // upload anchor x
-    uint64_t *d_vt_ay;               // upload anchor y
-    uint64_t *d_vt_bx;               // output compacted x
-    uint64_t *d_vt_by;               // output compacted y
-    // Anchor-sized (int32_t):
-    int32_t  *d_vt_mark;             // anchor keep/discard flag
-    int32_t  *d_vt_anchor_seg;       // anchor → segment mapping
-    int32_t  *d_vt_out_pos;          // scatter output positions
-    // Bin-sized (reuse max_anchors as upper bound for bins):
-    int32_t  *d_vt_votes;            // voting histogram
-    int8_t   *d_vt_keep_bin;         // bin keep flag
-    int32_t  *d_vt_seg_start;        // segment start flags
-    int32_t  *d_vt_seg_id;           // segment IDs
-    int32_t  *d_vt_seg_cnt_flat;     // per-segment anchor counts
-    // Read-sized (int32_t × max_reads, reuse d_bt_max_n_reads):
-    int32_t  *d_vt_bin_off;          // bin offset per group (+1)
-    int32_t  *d_vt_anchor_off;       // anchor offset per group (+1)
-    int32_t  *d_vt_ref_min;          // min ref pos per group
-    int32_t  *d_vt_bin_size;         // effective bin size per group
-    int32_t  *d_vt_nsegs;            // segments per group
-    int32_t  *d_vt_ncompact;         // compacted anchors per group
+    // ========== Voting buffers removed ==========
+    // The GPU voting/rechain path was deleted; these pre-allocated arrays were
+    // unused.  Their arena allocations (setup_chain_phase) and budget term
+    // (plmem_config_batch vt_per_n) have been removed to reclaim VRAM.
 
     // ========== Deferred D2H metadata (backtrack → voting fusion) ==========
     // Set by plbacktrack_gpu, freed by plbacktrack_d2h_finish.

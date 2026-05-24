@@ -262,29 +262,11 @@ static void setup_chain_phase(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     dev_mem->d_bt_cub_tmp_size = cub_sort_tmp_size(bt_n, bt_r);
     dev_mem->d_bt_cub_tmp      = arena_alloc(a, dev_mem->d_bt_cub_tmp_size);
 
-    // ---- Voting buffers ----
-    size_t vt_a = bt_anchor_total;
-    size_t vt_r = dev_mem->d_bt_max_n_reads + 1;
-    dev_mem->d_vt_max_anchors = vt_a;
-
-    dev_mem->d_vt_ax          = (uint64_t*)arena_alloc(a, vt_a * sizeof(uint64_t));
-    dev_mem->d_vt_ay          = (uint64_t*)arena_alloc(a, vt_a * sizeof(uint64_t));
-    dev_mem->d_vt_bx          = (uint64_t*)arena_alloc(a, vt_a * sizeof(uint64_t));
-    dev_mem->d_vt_by          = (uint64_t*)arena_alloc(a, vt_a * sizeof(uint64_t));
-    dev_mem->d_vt_mark        = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
-    dev_mem->d_vt_anchor_seg  = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
-    dev_mem->d_vt_out_pos     = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
-    dev_mem->d_vt_votes        = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
-    dev_mem->d_vt_keep_bin     = (int8_t*)arena_alloc(a, vt_a * sizeof(int8_t));
-    dev_mem->d_vt_seg_start    = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
-    dev_mem->d_vt_seg_id       = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
-    dev_mem->d_vt_seg_cnt_flat = (int32_t*)arena_alloc(a, vt_a * sizeof(int32_t));
-    dev_mem->d_vt_bin_off     = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
-    dev_mem->d_vt_anchor_off  = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
-    dev_mem->d_vt_ref_min     = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
-    dev_mem->d_vt_bin_size    = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
-    dev_mem->d_vt_nsegs       = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
-    dev_mem->d_vt_ncompact    = (int32_t*)arena_alloc(a, vt_r * sizeof(int32_t));
+    // ---- Voting buffers removed ----
+    // The GPU voting/rechain path was deleted; these arrays were allocated but never
+    // used by any kernel.  Dropping them removes mb*61 B/anchor (+ read-sized arrays)
+    // from the chain-phase arena, so the same VRAM budget now holds more anchors per
+    // batch.  MUST stay in sync with plmem_config_batch (vt_per_n removed there too).
 
     dev_mem->current_phase = GPU_PHASE_CHAIN;
 }
@@ -1247,19 +1229,18 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     // Exact per-anchor memory costs matching setup_chain_phase() allocations:
     //   Chain anchors (N):  ax(4)+ay(4)+sid(1)+xrev(4)+yrev(4)+range(4)+f(4)+p(2) = 27
     //   Backtrack (N*mb):   ax,ay,xrev,yrev,f,p(22) + zx,zy,v,p_abs(32) + t,u(12) + ax,ay,xrev,yrev_out(16) = 82
-    //   Voting (N*mb):      ax,ay,bx,by(32) + mark,anchor_seg,out_pos,votes(16) + keep_bin(1) + seg_start,seg_id,seg_cnt_flat(12) = 61
     //   CUB sort temp (N*mb): ~16 bytes (double-buffer for int64 key+value pairs)
     //   Long seg data (L):  ax(4)+ay(4)+sid(1)+range(4)+f(4)+p(2) = 19
     //   Long seg index (L): seg_t*2 + map(4) per (long_seg_cutoff*cut_unit) entries = 36/10240 per L
-    //   Index/cut:          per-grid(24) + per-cut(12) + per bt_r/vt_r(24+24=48 per mb*G)
+    //   Index/cut:          per-grid(24) + per-cut(12) + per bt_r(mb*24)
+    //   (Voting arrays removed: setup_chain_phase no longer allocates them.)
     int mb = score_kernel_config.micro_batch;
 
     // N-proportional cost
     size_t chain_per_n = 27;
     size_t bt_per_n    = (size_t)mb * 82;   // backtrack: 82 bytes × micro_batch
-    size_t vt_per_n    = (size_t)mb * 61;   // voting: 61 bytes × micro_batch
     size_t cub_per_n   = (size_t)mb * 16;   // CUB sort temp: ~16 bytes × micro_batch (key+value double-buffer)
-    size_t per_anchor_total = chain_per_n + bt_per_n + vt_per_n + cub_per_n;
+    size_t per_anchor_total = chain_per_n + bt_per_n + cub_per_n;  // voting (mb*61) removed
 
     // L-proportional cost (long segment buffers)
     size_t per_long_entry = 23;  // ax(4)+ay(4)+sid(1)+range(4)+xrev(4)+f(4)+p(2) long arrays
@@ -1273,14 +1254,14 @@ void plmem_config_batch(cJSON *json, int *num_stream_,
     cJSON *long_seg_json = cJSON_GetObjectItem(json, "long_seg_buffer_size");
     double long_ratio = 2.0;  // L = long_ratio * N
 
-    // Per-read overhead (index + cut + bt_r + vt_r arrays):
+    // Per-read overhead (index + cut + bt_r arrays):
     //   G ≈ N/anchor_per_block + N/avg_read_n
     //   C ≈ N/blockdim + N/avg_read_n
-    //   per G: 24 (index) + mb*24 (bt_r) + mb*24 (vt_r) = 24 + 48*mb
+    //   per G: 24 (index) + mb*24 (bt_r) = 24 + 24*mb   (voting vt_r arrays removed)
     //   per C: 8 (d_cut) + 4*sizeof(seg_t)/(mid_seg_cutoff+1) ≈ 12
     double grids_per_n = 1.0 / range_kernel_config.anchor_per_block + 1.0 / avg_read_n;
     double cuts_per_n  = 1.0 / range_kernel_config.blockdim + 1.0 / avg_read_n;
-    size_t per_grid = 24 + (size_t)mb * 48;
+    size_t per_grid = 24 + (size_t)mb * 24;
     size_t per_cut  = 12;
     double overhead_per_n = grids_per_n * per_grid + cuts_per_n * per_cut;
 

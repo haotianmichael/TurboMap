@@ -1478,10 +1478,14 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             // in the correct appending order.  Do NOT reverse it again.
             mm_append_cigar(r, task->n_cigar, cigar);
 			// For GAP_FILL tasks: if alignment terminated early, add CIGAR ops to cover unaligned region.
-            // Skip when KSW_EZ_APPROX_MAX: backtracking to (qlen-1,tlen-1) already covers the full gap;
-            // max_q/max_t are -1 in approx_max mode and must not be used here.
+            // GAP_FILL backtracks from the corner (full gap) unless z-dropped, so this
+            // normally adds nothing.  max_q/max_t < 0 is the APPROX_MAX sentinel meaning
+            // "corner backtrack, full gap already covered" — and since the two-pass clears
+            // APPROX_MAX from the flag, that sentinel is the reliable signal.  Using max_q=-1
+            // here would append a second full copy of the gap (CIGAR 2x -> qe1 > qlen).
             if (task->task_type == GPU_TASK_GAP_FILL && has_valid_alignment && !task->zdropped
-                    && !(task->flag & KSW_EZ_APPROX_MAX)) {
+                    && !(task->flag & KSW_EZ_APPROX_MAX)
+                    && task->max_q >= 0 && task->max_t >= 0) {
                 int aligned_qlen = task->max_q + 1;
                 int aligned_tlen = task->max_t + 1;
                 int expected_qlen = task->task_ctx.ref_qe - task->task_ctx.ref_qs;

@@ -433,7 +433,7 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
     cudaStreamSynchronize(stream);
 
     // Save per-read offset/n_u on host for later use by finish_backtrack
-    // (needed for deferred D2H of non-rechain reads and for voting)
+    // (needed for deferred D2H of anchor data)
     dev_mem->bt_n_reads = n_reads;
     dev_mem->bt_total_n = total_n;
 
@@ -453,8 +453,7 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
             // a_full pointer is set later in finish_backtrack_impl once D2H is done.
             reads[i].n_full = reads[i].n;
             reads[i].n = new_n;
-            // reads[i].a is stale (old anchors) — will be rebuilt by
-            // plbacktrack_d2h_read() after voting decides which reads need it.
+            // reads[i].a is stale (old anchors) — rebuilt by plbacktrack_d2h_read().
         } else {
             reads[i].u = NULL;
             reads[i].n = 0;
@@ -478,8 +477,7 @@ void plbacktrack_gpu(int n_reads, size_t total_n, deviceMemPtr *dev_mem,
 
 /**
  * plbacktrack_d2h_read: Deferred D2H for a single read's anchor data.
- * Called after voting decides this read does NOT need GPU re-chaining,
- * so we must pull its anchor arrays from GPU to rebuild reads[i].a.
+ * Pulls the read's anchor arrays from GPU to rebuild reads[i].a.
  */
 void plbacktrack_d2h_read(deviceMemPtr *dev_mem, chain_read_t *read,
                            int read_idx, void *km, cudaStream_t stream)

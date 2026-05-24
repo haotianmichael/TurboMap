@@ -521,7 +521,7 @@ void start_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 }
 
 /**
- * finish_backtrack_gpu: Voting + post_chaining (CPU work).
+ * finish_backtrack_gpu: post_chaining (CPU work).
  *   After return, reads[] have u/n_u/rep_len/frag_gap set.
  */
 void finish_backtrack_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
@@ -577,7 +577,7 @@ void chain_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t *
 }
 
 /**
- * finish_stream_gpu: Drain the last chain batch — sync + backtrack + voting.
+ * finish_stream_gpu: Drain the last chain batch — sync + backtrack + post_chaining.
  */
 void finish_stream_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read_t **reads_,
                        int *n_read_, int t, void *km) {

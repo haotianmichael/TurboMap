@@ -23,7 +23,7 @@ typedef struct {
 } gpu_arena_t;
 
 typedef enum {
-    GPU_PHASE_CHAIN = 0,   // chain + backtrack + voting
+    GPU_PHASE_CHAIN = 0,   // chain + backtrack
     GPU_PHASE_ALIGN = 1    // KSW alignment
 } gpu_mem_phase_t;
 
@@ -270,14 +270,11 @@ typedef struct {
     int   n_align_concurrent_blocks; // number of slots for persistent kernel
     int  *d_align_task_counter;      // atomic task counter (reset before each kernel launch)
 
-    // ========== Voting buffers removed ==========
-    // The GPU voting/rechain path was deleted; these pre-allocated arrays were
-    // unused.  Their arena allocations (setup_chain_phase) and budget term
-    // (plmem_config_batch vt_per_n) have been removed to reclaim VRAM.
+    // Voting buffers removed (dead GPU voting path; arena allocs + vt_per_n deleted).
 
-    // ========== Deferred D2H metadata (backtrack → voting fusion) ==========
+    // ========== Deferred D2H metadata ==========
     // Set by plbacktrack_gpu, freed by plbacktrack_d2h_finish.
-    // Allows anchor data to stay on GPU between backtrack and voting stages.
+    // Lets anchor data stay on GPU until post_chaining pulls it back.
     int       bt_n_reads;            // reads in current batch
     size_t    bt_total_n;            // total anchors (pre-backtrack count, array capacity)
     int      *bt_h_offset;           // host: per-read offset in d_bt_*_out

@@ -554,12 +554,8 @@ void post_chaining_helper(const mm_idx_t *mi, const mm_mapopt_t *opt, chain_read
 #endif /* DEBUG_CHAIN_COMPARE */
 
     // Long-read rescue: if the best chain leaves a large query portion
-    // uncovered, redo the chain with bw_long using a second mg_lchain_dp
-    // call (mirrors CPU mm_map_chain's post-rmq rescue, but swaps
-    // mg_lchain_rmq for a wider-bandwidth mg_lchain_dp — the pre-RMQ
-    // minimap2 behavior). This replaces the old voting-based GPU
-    // rechain path and keeps all chaining inside the DP algorithm CPU
-    // uses for the first pass.
+    // uncovered, redo the chain with bw_long via a second mg_lchain_dp call
+    // (mirrors CPU mm_map_chain's post-rmq rescue with a wider bandwidth).
     if (opt->bw_long > opt->bw &&
         (opt->flag & (MM_F_SPLICE | MM_F_SR | MM_F_NO_LJOIN)) == 0 &&
         n_segs == 1 && *n_regs0 > 1 && *u != NULL && *a != NULL) {
@@ -1391,14 +1387,8 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
           sizeof(gpu_align_task_t), task_compare);
     
     int current_read = -1, current_reg = -1;
-    // reg_offset tracks how many regions z-drop splits have inserted into this
-    // read's ctx->regs0 so far.  Tasks carry the reg_idx frozen at enqueue time,
-    // but mm_insert_reg shifts later regions, so the true array slot of a task's
-    // region is (reg_idx + reg_offset).  Without this, a split in any non-last
-    // region of a multi-region read mis-maps every following region's tasks onto
-    // the wrong region — silent CIGAR corruption.  Valid because tasks are
-    // processed in ascending reg_idx order and mm_insert_reg always inserts right
-    // after the current region.
+    // A z-drop split inserts a region (mm_insert_reg), shifting later regions; tasks
+    // keep their enqueue-time reg_idx, so the real slot is reg_idx + reg_offset.
     int reg_offset = 0, actual_reg = -1;
     read_align_ctx_t *ctx = NULL;
     mm_reg1_t *r = NULL;
@@ -1529,10 +1519,7 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
             }
         }
         
-        // Accumulate DP score, mirroring CPU mm_align1: left/right extensions and
-        // zdrop add ez->max (always >=0) while gap-fills add ez->score (which may be
-        // negative). task->score already holds the correct per-task value, so do NOT
-        // drop negative gap-fill contributions the way a ">0" guard would.
+        // Accumulate DP score like CPU mm_align1 (gap-fill scores may be negative).
         if (has_valid_alignment && r->p) {
             r->p->dp_score += task->score;
         }
@@ -1594,12 +1581,8 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                             if (r2.cnt > 0) {
                                 if (is_inv_zdrop) r2.split_inv = 1;
                                 ctx->regs0 = mm_insert_reg(&r2, actual_reg, &ctx->n_regs, ctx->regs0);
-                                // r2 is inserted at actual_reg+1; the head region stays at
-                                // actual_reg (re-fetch since realloc may have moved the array).
-                                // Bump reg_offset so every following region's reg_idx maps to
-                                // its new, shifted slot.
-                                r = &ctx->regs0[actual_reg];
-                                reg_offset++;
+                                r = &ctx->regs0[actual_reg];  // re-fetch after realloc
+                                reg_offset++;                 // later regions shifted by one
                             }
                         }
                         // Derive the truncated coordinates from the ACTUAL accumulated CIGAR.
@@ -1908,8 +1891,6 @@ static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 {
     extern unsigned char seq_nt4_table[256];
 
-    /* Voting reads now output b[]/u[] directly into rd->a/rd->u and flow
-     * through the normal path below (mm_gen_regs → mm_align1_batched). */
     int n_segs = read_->n_seg;
     const int *qlens = read_->qlens;
     const char **seqs = read_->qseqs;
@@ -2086,22 +2067,13 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     // Submit all GPU tasks and process results
     gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km, stream_id);
 
-    // B2: re-align z-drop split remainders ON GPU instead of on the CPU.
-    // gpu_batch_process_results creates remainder regions (p==NULL, anchor-based
-    // coords) whenever a gap-fill z-drops.  Such a remainder always carries
-    // >= opt->min_cnt anchors, so feeding it back through mm_align1_batched -> the
-    // same kernel re-aligns it; a remainder may itself z-drop again, so iterate to
-    // a fixpoint.  The whole batch (all reads, all pending remainders) is collapsed
-    // into one GPU submission per wave.  mm_test_zdrop still runs on the CPU inside
-    // gpu_batch_submit_and_process, and inversions stay on the CPU below — only the
-    // extension DP moves to the GPU here.
+    // Re-align z-drop split remainders (p==NULL) on the GPU: feed each back through
+    // mm_align1_batched -> the same kernel and iterate to a fixpoint (a remainder may
+    // split again). mm_test_zdrop and inversion stay on CPU.
     {
-        const int MAX_REALIGN_WAVES = 16; // safety cap; each split strictly shrinks
-                                          // the remainder, so cascades terminate well
-                                          // before this in practice.
+        const int MAX_REALIGN_WAVES = 16; // each split shrinks the remainder; cap is a guard
         for (int wave = 0; wave < MAX_REALIGN_WAVES; ++wave) {
-            // Reuse the same batch object: the previous wave's CIGARs are already in
-            // r->p, so the task/seq/cigar buffers can be reset and refilled.
+            // Reuse the batch: prior CIGARs are already in r->p, so reset and refill.
             gpu_batch->n_tasks = 0;
             gpu_batch->seq_buffer_used = 0;
             gpu_batch->cigar_buffer_used = 0;
@@ -2113,9 +2085,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
                 for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
                     mm_reg1_t *reg = &ctx->regs0[ireg];
                     if (reg->cnt > 0 && reg->p == NULL) {
-                        // mm_align1_batched only enqueues tasks; the z-drop split of
-                        // this remainder (if any) happens in gpu_batch_process_results.
-                        mm_reg1_t r2_unused;
+                        mm_reg1_t r2_unused;  // mm_align1_batched only enqueues tasks
                         memset(&r2_unused, 0, sizeof(mm_reg1_t));
                         mm_align1_batched(gpu_batch, batch->km, s->p->opt, s->p->mi,
                                           ctx->qlen, ctx->qseq0, reg, &r2_unused,
@@ -2123,20 +2093,14 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
                     }
                 }
             }
-            // Terminate on the real task count: a remainder whose coordinate guards
-            // produce no tasks never gets re-aligned here (the CPU net in
-            // post_align_helper_gpu is the backstop), so stop spinning waves on it.
-            if (gpu_batch->n_tasks == 0) break;
+            if (gpu_batch->n_tasks == 0) break;  // nothing left to re-align (CPU net is backstop)
             gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi,
                                          batch->km, stream_id);
         }
     }
 
-    // B3 (kept on CPU by design): inversion alignment for split_inv remainders.
-    // split_inv is set in gpu_batch_process_results when a z-drop looks like an
-    // inversion (mm_test_zdrop code 2).  mm_align1_inv relies on ksw_ll_i16, a
-    // different DP than the main kernel, so it stays on the CPU.  Run it after the
-    // GPU re-align waves, when every remainder is already aligned.
+    // Inversion alignment stays on CPU (mm_align1_inv uses ksw_ll_i16, a different DP);
+    // run after the GPU re-align waves when every remainder is aligned.
     for (int iread = 0; iread < batch->count; iread++) {
         read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
         if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a)
@@ -2341,17 +2305,17 @@ static void deep_copy_read_to_batch(mm_batch_trbuf_t *dst, const chain_read_t *s
  * Multi-stream task-parallel GPU batch consumer.
  *
  * Each CUDA stream runs the full pipeline independently:
- *   chain → sync → backtrack → voting → alignment
+ *   chain → sync → backtrack → alignment
  *
- * Parallelism: while the CPU processes stream N's results (backtrack/voting/
- * alignment), stream N+1's chain kernels run concurrently on the GPU.
+ * Parallelism: while the CPU processes stream N's results (backtrack/alignment),
+ * stream N+1's chain kernels run concurrently on the GPU.
  *
  * Timeline (2 streams, steady state):
  *
  *   GPU stream 0:  ████ chain(A) ████████████  bt(A)  align(A)  ████ chain(C) ████
  *   GPU stream 1:       ████ chain(B) ████████████  bt(B)  align(B)  ████ chain(D) ███
- *   Drain thread 0:                        sync(A) bt(A) vote(A) align(A)
- *   Drain thread 1:                                      sync(B) bt(B) vote(B) align(B)
+ *   Drain thread 0:                        sync(A) bt(A) align(A)
+ *   Drain thread 1:                                      sync(B) bt(B) align(B)
  *   Main thread:    launch(A) accum launch(B) accum ... (drain threads run in parallel)
  */
 

@@ -179,7 +179,7 @@ static size_t long_batch_size(size_t arena_bytes, size_t max_len) {
     return compute_long_batch_size(arena_bytes, max_len);
 }
 
-/* Set up chain + backtrack + voting buffers from arena.
+/* Set up chain + backtrack buffers from arena.
  * Called during init (chain phase first) and after alignment completes. */
 static void setup_chain_phase(deviceMemPtr *dev_mem, size_t anchor_per_batch,
                                int range_grid_size, int num_cut) {
@@ -262,11 +262,8 @@ static void setup_chain_phase(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     dev_mem->d_bt_cub_tmp_size = cub_sort_tmp_size(bt_n, bt_r);
     dev_mem->d_bt_cub_tmp      = arena_alloc(a, dev_mem->d_bt_cub_tmp_size);
 
-    // ---- Voting buffers removed ----
-    // The GPU voting/rechain path was deleted; these arrays were allocated but never
-    // used by any kernel.  Dropping them removes mb*61 B/anchor (+ read-sized arrays)
-    // from the chain-phase arena, so the same VRAM budget now holds more anchors per
-    // batch.  MUST stay in sync with plmem_config_batch (vt_per_n removed there too).
+    // Voting buffers removed (dead GPU voting path): freed mb*61 B/anchor here and
+    // vt_per_n in plmem_config_batch — keep both in sync.
 
     dev_mem->current_phase = GPU_PHASE_CHAIN;
 }

@@ -684,43 +684,71 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
             int nA = (int)idx_A.size(), nB = (int)idx_B.size(), nC = (int)idx_C.size();
 
-            // --- bt_p pool (larger of arena vs dedicated) ---
-            size_t bt_p_avail = dev_mem->long_arena_bt_p_bytes;
-            uint8_t *bt_p_base = d_backtrack_p;
-            {
-                size_t dedi = (dev_mem->d_align_backtrack_p_long != nullptr)
-                              ? dev_mem->long_bt_p_pool_bytes : 0;
-                if (dedi > bt_p_avail) {
-                    bt_p_avail = dedi;
-                    bt_p_base  = dev_mem->d_align_backtrack_p_long;
-                }
-            }
-
-            // Optimal slot allocation: minimize max(nX*strideX/sX) subject to
-            // Σ(sX*strideX) ≤ bt_p_avail.  Closed-form solution:
-            //   sX = nX*strideX / λ,  λ = Σ(nX*strideX²) / bt_p_avail
-            // This equalises wall-clock time across classes and saturates BTP.
+            // --- Two bt_p pools: arena (A+B) + dedicated (C) ---
+            // The dedicated d_align_backtrack_p_long pool (~12GB carved from VRAM the
+            // arena didn't claim) was previously IGNORED — the old dispatch picked
+            // max(arena, dedicated) and left the smaller idle.  Here we use BOTH:
+            //   class C (largest strides, fewest tasks) → dedicated pool
+            //   classes A+B                              → arena pool
+            // This raises usable bt_p from ~22.5GB to ~34GB on a 1-stream A100.
             const int TOTAL_SLOTS = dev_mem->n_long_concurrent_slots;
 
-            double sum_stride2 = 0.0;
-            if (nC > 0) sum_stride2 += (double)nC * (double)stride_C_max * (double)stride_C_max;
-            if (nB > 0) sum_stride2 += (double)nB * (double)stride_B_max * (double)stride_B_max;
-            if (nA > 0) sum_stride2 += (double)nA * (double)stride_A_max * (double)stride_A_max;
+            size_t arena_pool = dev_mem->long_arena_bt_p_bytes;
+            uint8_t *arena_base_p = d_backtrack_p;
+            size_t dedi_pool = (dev_mem->d_align_backtrack_p_long != nullptr)
+                               ? dev_mem->long_bt_p_pool_bytes : 0;
+            uint8_t *dedi_base_p = dev_mem->d_align_backtrack_p_long;
 
-            double lambda_btp = (sum_stride2 > 0.0 && bt_p_avail > 0)
-                ? sum_stride2 / (double)bt_p_avail
-                : 1.0;
+            // Use two pools only if the dedicated pool can hold ≥1 class-C task.
+            bool two_pools = (nC > 0 && dedi_pool >= stride_C_max);
 
-            // Integer truncation guarantees Σ(sX*strideX) ≤ bt_p_avail by construction.
-            int sC = (nC > 0) ? (int)((double)nC * (double)stride_C_max / lambda_btp) : 0;
-            int sB = (nB > 0) ? (int)((double)nB * (double)stride_B_max / lambda_btp) : 0;
-            int sA = (nA > 0) ? (int)((double)nA * (double)stride_A_max / lambda_btp) : 0;
-            // Ensure each active class gets at least 1 slot (may add ≤3 extra strides to BTP).
-            if (sC < 1 && nC > 0) sC = 1;
-            if (sB < 1 && nB > 0) sB = 1;
-            if (sA < 1 && nA > 0) sA = 1;
+            // Pool assigned to C, and pool shared by A+B.
+            uint8_t *poolC_base; size_t poolC_avail;
+            uint8_t *poolAB_base; size_t poolAB_avail;
+            if (two_pools) {
+                poolC_base  = dedi_base_p;  poolC_avail  = dedi_pool;
+                poolAB_base = arena_base_p; poolAB_avail = arena_pool;
+            } else {
+                // Single pool: everything in the larger of the two.
+                uint8_t *big_base = (dedi_pool > arena_pool) ? dedi_base_p : arena_base_p;
+                size_t   big_avail = (dedi_pool > arena_pool) ? dedi_pool   : arena_pool;
+                poolC_base = poolAB_base = big_base;
+                poolC_avail = poolAB_avail = big_avail;
+            }
 
-            // Scale down proportionally if total exceeds GPU slot cap.
+            // Slot allocation. Within each pool, minimize max(nX*strideX/sX) via
+            //   sX = nX*strideX / λ,  λ = Σ(nX*strideX²) / pool_avail.
+            int sA = 0, sB = 0, sC = 0;
+            if (two_pools) {
+                // C alone in dedicated pool
+                sC = (int)((double)dedi_pool / (double)stride_C_max);
+                if (sC < 1) sC = 1;
+                // A+B share arena pool
+                double sum2_AB = 0.0;
+                if (nA > 0) sum2_AB += (double)nA * (double)stride_A_max * (double)stride_A_max;
+                if (nB > 0) sum2_AB += (double)nB * (double)stride_B_max * (double)stride_B_max;
+                double lam_AB = (sum2_AB > 0.0 && poolAB_avail > 0)
+                                ? sum2_AB / (double)poolAB_avail : 1.0;
+                sA = (nA > 0) ? (int)((double)nA * (double)stride_A_max / lam_AB) : 0;
+                sB = (nB > 0) ? (int)((double)nB * (double)stride_B_max / lam_AB) : 0;
+                if (sA < 1 && nA > 0) sA = 1;
+                if (sB < 1 && nB > 0) sB = 1;
+            } else {
+                // Single combined pool across all 3 classes
+                double sum2 = 0.0;
+                if (nC > 0) sum2 += (double)nC * (double)stride_C_max * (double)stride_C_max;
+                if (nB > 0) sum2 += (double)nB * (double)stride_B_max * (double)stride_B_max;
+                if (nA > 0) sum2 += (double)nA * (double)stride_A_max * (double)stride_A_max;
+                double lam = (sum2 > 0.0 && poolAB_avail > 0) ? sum2 / (double)poolAB_avail : 1.0;
+                sC = (nC > 0) ? (int)((double)nC * (double)stride_C_max / lam) : 0;
+                sB = (nB > 0) ? (int)((double)nB * (double)stride_B_max / lam) : 0;
+                sA = (nA > 0) ? (int)((double)nA * (double)stride_A_max / lam) : 0;
+                if (sC < 1 && nC > 0) sC = 1;
+                if (sB < 1 && nB > 0) sB = 1;
+                if (sA < 1 && nA > 0) sA = 1;
+            }
+
+            // Cap total slots to GPU slot count (bt_off / ksw_temp are sized for TOTAL_SLOTS).
             {
                 int total_want = sC + sB + sA;
                 if (total_want > TOTAL_SLOTS) {
@@ -728,7 +756,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                     sC = (nC > 0) ? std::max(1, (int)(sC * scale)) : 0;
                     sB = (nB > 0) ? std::max(1, (int)(sB * scale)) : 0;
                     sA = (nA > 0) ? std::max(1, (int)(sA * scale)) : 0;
-                    // Fine-trim to guarantee total ≤ TOTAL_SLOTS
                     while (sC + sB + sA > TOTAL_SLOTS) {
                         if      (sA > 1 && nA > 0) --sA;
                         else if (sB > 1 && nB > 0) --sB;
@@ -738,17 +765,17 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
             }
 
-            // Safety: clamp sub-pool pointers to stay within bt_p_avail.
-            // With the optimal formula this should never trigger, but guards
-            // against rounding (the min-1-slot overrides above).
+            // Safety: clamp so sub-pool offsets stay within each pool.
             {
-                size_t bt_used = (size_t)sC * stride_C_max
-                               + (size_t)sB * stride_B_max
-                               + (size_t)sA * stride_A_max;
-                while (bt_used > bt_p_avail) {
-                    if      (sA > 1 && nA > 0) { --sA; bt_used -= stride_A_max; }
-                    else if (sB > 1 && nB > 0) { --sB; bt_used -= stride_B_max; }
-                    else if (sC > 1 && nC > 0) { --sC; bt_used -= stride_C_max; }
+                // C in poolC
+                while ((size_t)sC * stride_C_max > poolC_avail && sC > 1) --sC;
+                // A+B in poolAB (or C+B+A if single pool)
+                size_t ab_used = (size_t)sB * stride_B_max + (size_t)sA * stride_A_max;
+                if (!two_pools) ab_used += (size_t)sC * stride_C_max;
+                while (ab_used > poolAB_avail) {
+                    if      (sA > 1 && nA > 0) { --sA; ab_used -= stride_A_max; }
+                    else if (sB > 1 && nB > 0) { --sB; ab_used -= stride_B_max; }
+                    else if (!two_pools && sC > 1 && nC > 0) { --sC; ab_used -= stride_C_max; }
                     else break;
                 }
             }
@@ -760,18 +787,29 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             PLOG_INFO(stderr,
                 "[Info::MultiClass] nA=%d nB=%d nC=%d  "
                 "sA=%d(%.1fMB) sB=%d(%.1fMB) sC=%d(%.1fMB)  "
-                "bt_p=%.2fGB\n",
+                "pool=%s arena=%.1fGB dedi=%.1fGB\n",
                 nA, nB, nC,
                 sA, stride_A_max / (1024.0*1024.0),
                 sB, stride_B_max / (1024.0*1024.0),
                 sC, stride_C_max / (1024.0*1024.0),
-                bt_p_avail / (1024.0*1024.0*1024.0));
+                two_pools ? "2" : "1",
+                arena_pool / (1024.0*1024.0*1024.0),
+                dedi_pool  / (1024.0*1024.0*1024.0));
 
             // --- Sub-pool pointers ---
-            // bt_p layout: [C slots][B slots][A slots]
-            uint8_t *bt_p_C = bt_p_base;
-            uint8_t *bt_p_B = bt_p_C + (size_t)sC * stride_C_max;
-            uint8_t *bt_p_A = bt_p_B + (size_t)sB * stride_B_max;
+            // bt_p:  C in poolC at offset 0; B and A packed in poolAB.
+            // (Single-pool mode: poolC_base==poolAB_base, so C/B/A all in one block —
+            //  layout [C][B][A] is preserved because bt_p_B starts after sC*stride_C.)
+            uint8_t *bt_p_C, *bt_p_B, *bt_p_A;
+            if (two_pools) {
+                bt_p_C = poolC_base;
+                bt_p_B = poolAB_base;
+                bt_p_A = bt_p_B + (size_t)sB * stride_B_max;
+            } else {
+                bt_p_C = poolC_base;
+                bt_p_B = bt_p_C + (size_t)sC * stride_C_max;
+                bt_p_A = bt_p_B + (size_t)sB * stride_B_max;
+            }
 
             // bt_off layout: [C slots][B slots][A slots] × max_antidiag_long each
             size_t max_ad_long = 2 * dev_mem->max_align_task_len;

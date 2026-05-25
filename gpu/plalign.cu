@@ -696,33 +696,62 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
             }
 
-            // --- Slot allocation: C priority (fewest slots/byte), then B, then A ---
-            const int    TOTAL_SLOTS = dev_mem->n_long_concurrent_slots;
-            const size_t HIDE        = 3;
+            // Optimal slot allocation: minimize max(nX*strideX/sX) subject to
+            // Σ(sX*strideX) ≤ bt_p_avail.  Closed-form solution:
+            //   sX = nX*strideX / λ,  λ = Σ(nX*strideX²) / bt_p_avail
+            // This equalises wall-clock time across classes and saturates BTP.
+            const int TOTAL_SLOTS = dev_mem->n_long_concurrent_slots;
 
-            size_t sC_pool = (stride_C_max > 0) ? (bt_p_avail / stride_C_max) : TOTAL_SLOTS;
-            int sC = (nC > 0)
-                ? (int)std::min({sC_pool, (size_t)nC * HIDE, (size_t)(TOTAL_SLOTS / 4)})
-                : 0;
+            double sum_stride2 = 0.0;
+            if (nC > 0) sum_stride2 += (double)nC * (double)stride_C_max * (double)stride_C_max;
+            if (nB > 0) sum_stride2 += (double)nB * (double)stride_B_max * (double)stride_B_max;
+            if (nA > 0) sum_stride2 += (double)nA * (double)stride_A_max * (double)stride_A_max;
+
+            double lambda_btp = (sum_stride2 > 0.0 && bt_p_avail > 0)
+                ? sum_stride2 / (double)bt_p_avail
+                : 1.0;
+
+            // Integer truncation guarantees Σ(sX*strideX) ≤ bt_p_avail by construction.
+            int sC = (nC > 0) ? (int)((double)nC * (double)stride_C_max / lambda_btp) : 0;
+            int sB = (nB > 0) ? (int)((double)nB * (double)stride_B_max / lambda_btp) : 0;
+            int sA = (nA > 0) ? (int)((double)nA * (double)stride_A_max / lambda_btp) : 0;
+            // Ensure each active class gets at least 1 slot (may add ≤3 extra strides to BTP).
             if (sC < 1 && nC > 0) sC = 1;
-
-            size_t bt_rem_B  = bt_p_avail - (size_t)sC * stride_C_max;
-            int    slot_rem_B = TOTAL_SLOTS - sC;
-            size_t sB_pool   = (stride_B_max > 0 && bt_rem_B > 0)
-                                ? (bt_rem_B / stride_B_max) : (size_t)slot_rem_B;
-            int sB = (nB > 0)
-                ? (int)std::min({sB_pool, (size_t)nB * HIDE, (size_t)slot_rem_B})
-                : 0;
             if (sB < 1 && nB > 0) sB = 1;
-
-            size_t bt_rem_A  = bt_rem_B - (size_t)sB * stride_B_max;
-            int    slot_rem_A = TOTAL_SLOTS - sC - sB;
-            size_t sA_pool   = (stride_A_max > 0 && bt_rem_A > 0)
-                                ? (bt_rem_A / stride_A_max) : (size_t)slot_rem_A;
-            int sA = (nA > 0)
-                ? (int)std::min({sA_pool, (size_t)nA * HIDE, (size_t)slot_rem_A})
-                : 0;
             if (sA < 1 && nA > 0) sA = 1;
+
+            // Scale down proportionally if total exceeds GPU slot cap.
+            {
+                int total_want = sC + sB + sA;
+                if (total_want > TOTAL_SLOTS) {
+                    double scale = (double)TOTAL_SLOTS / total_want;
+                    sC = (nC > 0) ? std::max(1, (int)(sC * scale)) : 0;
+                    sB = (nB > 0) ? std::max(1, (int)(sB * scale)) : 0;
+                    sA = (nA > 0) ? std::max(1, (int)(sA * scale)) : 0;
+                    // Fine-trim to guarantee total ≤ TOTAL_SLOTS
+                    while (sC + sB + sA > TOTAL_SLOTS) {
+                        if      (sA > 1 && nA > 0) --sA;
+                        else if (sB > 1 && nB > 0) --sB;
+                        else if (sC > 1 && nC > 0) --sC;
+                        else break;
+                    }
+                }
+            }
+
+            // Safety: clamp sub-pool pointers to stay within bt_p_avail.
+            // With the optimal formula this should never trigger, but guards
+            // against rounding (the min-1-slot overrides above).
+            {
+                size_t bt_used = (size_t)sC * stride_C_max
+                               + (size_t)sB * stride_B_max
+                               + (size_t)sA * stride_A_max;
+                while (bt_used > bt_p_avail) {
+                    if      (sA > 1 && nA > 0) { --sA; bt_used -= stride_A_max; }
+                    else if (sB > 1 && nB > 0) { --sB; bt_used -= stride_B_max; }
+                    else if (sC > 1 && nC > 0) { --sC; bt_used -= stride_C_max; }
+                    else break;
+                }
+            }
 
             if (!deferred_short_log.empty()) {
                 fprintf(stderr, "%s", deferred_short_log.c_str());

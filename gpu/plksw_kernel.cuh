@@ -108,7 +108,8 @@ __global__ void ksw_fused_persistent_kernel(
     int end_bonus,
     uint32_t *cigar_buffer,
     int *cigar_lengths,
-    int max_cigar_len
+    int max_cigar_len,
+    int task_id_base
 )
 {
     const int slot_id = blockIdx.x;
@@ -135,15 +136,16 @@ __global__ void ksw_fused_persistent_kernel(
 
         if (qlen <= 0 || tlen <= 0) {
             if (lane_id == 0) {
-                device_res->aln_score[task_id] = 0;
-                device_res->query_batch_end[task_id]  = -1;
-                device_res->target_batch_end[task_id] = -1;
-                device_res->mqe[task_id]   = KSW_NEG_INF;
-                device_res->mqe_t[task_id] = -1;
-                device_res->mte[task_id]   = KSW_NEG_INF;
-                device_res->mte_q[task_id] = -1;
-                device_res->zdropped[task_id] = 0;
-                if (cigar_buffer) cigar_lengths[task_id] = 0;
+                int gid = task_id + task_id_base;
+                device_res->aln_score[gid] = 0;
+                device_res->query_batch_end[gid]  = -1;
+                device_res->target_batch_end[gid] = -1;
+                device_res->mqe[gid]   = KSW_NEG_INF;
+                device_res->mqe_t[gid] = -1;
+                device_res->mte[gid]   = KSW_NEG_INF;
+                device_res->mte_q[gid] = -1;
+                device_res->zdropped[gid] = 0;
+                if (cigar_buffer) cigar_lengths[gid] = 0;
             }
             __syncwarp();
             continue;
@@ -641,14 +643,15 @@ __global__ void ksw_fused_persistent_kernel(
             if (flag & KSW_EZ_EXTZ_ONLY)      out_score = ez_max;
             else if (ez_zdropped)             out_score = ez_max;
             else                              out_score = ez_score;
-            device_res->aln_score[task_id]        = out_score;
-            device_res->query_batch_end[task_id]  = backtrack_q;
-            device_res->target_batch_end[task_id] = backtrack_t;
-            device_res->mqe[task_id]              = ez_mqe;
-            device_res->mqe_t[task_id]            = ez_mqe_t;
-            device_res->mte[task_id]              = ez_mte;
-            device_res->mte_q[task_id]            = ez_mte_q;
-            device_res->zdropped[task_id]         = ez_zdropped;
+            int gid = task_id + task_id_base;
+            device_res->aln_score[gid]        = out_score;
+            device_res->query_batch_end[gid]  = backtrack_q;
+            device_res->target_batch_end[gid] = backtrack_t;
+            device_res->mqe[gid]              = ez_mqe;
+            device_res->mqe_t[gid]            = ez_mqe_t;
+            device_res->mte[gid]              = ez_mte;
+            device_res->mte_q[gid]            = ez_mte_q;
+            device_res->zdropped[gid]         = ez_zdropped;
         }
         backtrack_q = __shfl_sync(0xffffffff, backtrack_q, 0);
         backtrack_t = __shfl_sync(0xffffffff, backtrack_t, 0);
@@ -664,7 +667,7 @@ __global__ void ksw_fused_persistent_kernel(
             int n_cigar_ops = 0;
             int is_rev = !!(flag & KSW_EZ_REV_CIGAR);
 
-            uint32_t *cigar = cigar_buffer + (size_t)task_id * max_cigar_len;
+            uint32_t *cigar = cigar_buffer + (size_t)(task_id + task_id_base) * max_cigar_len;
 
             while (i >= 0 && j >= 0) {
                 int force_state = -1;
@@ -719,9 +722,9 @@ __global__ void ksw_fused_persistent_kernel(
                 }
             }
 
-            cigar_lengths[task_id] = n_cigar_ops;
+            cigar_lengths[task_id + task_id_base] = n_cigar_ops;
         } else if (cigar_buffer && lane_id == 0) {
-            cigar_lengths[task_id] = 0;
+            cigar_lengths[task_id + task_id_base] = 0;
         }
 
         __syncwarp();

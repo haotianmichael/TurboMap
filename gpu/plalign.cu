@@ -653,6 +653,458 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             current_batch_size    = long_batch_persistent;
         }
 
+        // ===== MULTI-CLASS LONG-PHASE DISPATCH =====
+        // Splits long tasks into 3 bt_stride classes (A<5MB, B 5-20MB, C≥20MB),
+        // allocates separate bt_p/bt_off/ksw_temp sub-pools for each class,
+        // and launches 3 concurrent kernels so all 3456 GPU slots stay active
+        // instead of collapsing to ~432 slots for the largest-stride class.
+        if (phase == 1) {
+            const size_t THRESH_B = (size_t)5  << 20;   // 5 MB
+            const size_t THRESH_C = (size_t)20 << 20;   // 20 MB
+
+            // --- Classify ---
+            std::vector<int> idx_A, idx_B, idx_C;
+            size_t stride_A_max = 8, stride_B_max = 8, stride_C_max = 8;
+            for (int i = 0; i < n_long_tasks; i++) {
+                int tidx = task_indices_long[i];
+                int ql = tasks[tidx].qlen, tl = tasks[tidx].tlen, w = tasks[tidx].w;
+                int nc = (ql < tl) ? ql : tl;
+                if (w >= 0 && w + 1 < nc) nc = w + 1;
+                size_t bt = ((size_t)(ql + tl) * (size_t)nc + 7) & ~(size_t)7;
+                if (bt < THRESH_B) {
+                    idx_A.push_back(tidx);
+                    if (bt > stride_A_max) stride_A_max = bt;
+                } else if (bt < THRESH_C) {
+                    idx_B.push_back(tidx);
+                    if (bt > stride_B_max) stride_B_max = bt;
+                } else {
+                    idx_C.push_back(tidx);
+                    if (bt > stride_C_max) stride_C_max = bt;
+                }
+            }
+            int nA = (int)idx_A.size(), nB = (int)idx_B.size(), nC = (int)idx_C.size();
+
+            // --- bt_p pool (larger of arena vs dedicated) ---
+            size_t bt_p_avail = dev_mem->long_arena_bt_p_bytes;
+            uint8_t *bt_p_base = d_backtrack_p;
+            {
+                size_t dedi = (dev_mem->d_align_backtrack_p_long != nullptr)
+                              ? dev_mem->long_bt_p_pool_bytes : 0;
+                if (dedi > bt_p_avail) {
+                    bt_p_avail = dedi;
+                    bt_p_base  = dev_mem->d_align_backtrack_p_long;
+                }
+            }
+
+            // --- Slot allocation: C priority (fewest slots/byte), then B, then A ---
+            const int    TOTAL_SLOTS = dev_mem->n_long_concurrent_slots;
+            const size_t HIDE        = 3;
+
+            size_t sC_pool = (stride_C_max > 0) ? (bt_p_avail / stride_C_max) : TOTAL_SLOTS;
+            int sC = (nC > 0)
+                ? (int)std::min({sC_pool, (size_t)nC * HIDE, (size_t)(TOTAL_SLOTS / 4)})
+                : 0;
+            if (sC < 1 && nC > 0) sC = 1;
+
+            size_t bt_rem_B  = bt_p_avail - (size_t)sC * stride_C_max;
+            int    slot_rem_B = TOTAL_SLOTS - sC;
+            size_t sB_pool   = (stride_B_max > 0 && bt_rem_B > 0)
+                                ? (bt_rem_B / stride_B_max) : (size_t)slot_rem_B;
+            int sB = (nB > 0)
+                ? (int)std::min({sB_pool, (size_t)nB * HIDE, (size_t)slot_rem_B})
+                : 0;
+            if (sB < 1 && nB > 0) sB = 1;
+
+            size_t bt_rem_A  = bt_rem_B - (size_t)sB * stride_B_max;
+            int    slot_rem_A = TOTAL_SLOTS - sC - sB;
+            size_t sA_pool   = (stride_A_max > 0 && bt_rem_A > 0)
+                                ? (bt_rem_A / stride_A_max) : (size_t)slot_rem_A;
+            int sA = (nA > 0)
+                ? (int)std::min({sA_pool, (size_t)nA * HIDE, (size_t)slot_rem_A})
+                : 0;
+            if (sA < 1 && nA > 0) sA = 1;
+
+            if (!deferred_short_log.empty()) {
+                fprintf(stderr, "%s", deferred_short_log.c_str());
+                deferred_short_log.clear();
+            }
+            PLOG_INFO(stderr,
+                "[Info::MultiClass] nA=%d nB=%d nC=%d  "
+                "sA=%d(%.1fMB) sB=%d(%.1fMB) sC=%d(%.1fMB)  "
+                "bt_p=%.2fGB\n",
+                nA, nB, nC,
+                sA, stride_A_max / (1024.0*1024.0),
+                sB, stride_B_max / (1024.0*1024.0),
+                sC, stride_C_max / (1024.0*1024.0),
+                bt_p_avail / (1024.0*1024.0*1024.0));
+
+            // --- Sub-pool pointers ---
+            // bt_p layout: [C slots][B slots][A slots]
+            uint8_t *bt_p_C = bt_p_base;
+            uint8_t *bt_p_B = bt_p_C + (size_t)sC * stride_C_max;
+            uint8_t *bt_p_A = bt_p_B + (size_t)sB * stride_B_max;
+
+            // bt_off layout: [C slots][B slots][A slots] × max_antidiag_long each
+            size_t max_ad_long = 2 * dev_mem->max_align_task_len;
+            int *bt_off_C     = dev_mem->d_align_backtrack_off_long;
+            int *bt_off_B     = bt_off_C + (size_t)sC * max_ad_long;
+            int *bt_off_A     = bt_off_B + (size_t)sB * max_ad_long;
+            int *bt_off_end_C = dev_mem->d_align_backtrack_off_end_long;
+            int *bt_off_end_B = bt_off_end_C + (size_t)sC * max_ad_long;
+            int *bt_off_end_A = bt_off_end_B + (size_t)sB * max_ad_long;
+
+            // ksw_temp layout: [C slots][B slots][A slots] × ksw_temp_per_task each
+            void *ksw_temp_C = d_ksw_temp_buffer;
+            void *ksw_temp_B = (char*)d_ksw_temp_buffer + (size_t)sC * ksw_temp_per_task;
+            void *ksw_temp_A = (char*)ksw_temp_B + (size_t)sB * ksw_temp_per_task;
+
+            // --- Static extra streams + counters (created once) ---
+            static cudaStream_t s_stream_B = nullptr, s_stream_C = nullptr;
+            static int *d_counter_B = nullptr, *d_counter_C = nullptr;
+            if (!s_stream_B) {
+                cudaStreamCreate(&s_stream_B);
+                cudaStreamCreate(&s_stream_C);
+                cudaMalloc(&d_counter_B, sizeof(int));
+                cudaMalloc(&d_counter_C, sizeof(int));
+            }
+
+            // --- Batch loop: process all long tasks in CIGAR-buffer-sized windows ---
+            int MAX_LONG_BATCH_SLOTS = (int)long_batch_persistent;
+            int a_done = 0, b_done = 0, c_done = 0;
+            int ml_batch_num = 0;
+
+            while (a_done < nA || b_done < nB || c_done < nC) {
+                int nA_rem = nA - a_done, nB_rem = nB - b_done, nC_rem = nC - c_done;
+                int total_rem = nA_rem + nB_rem + nC_rem;
+                int window = (total_rem < MAX_LONG_BATCH_SLOTS) ? total_rem : MAX_LONG_BATCH_SLOTS;
+
+                // Proportional split of window across remaining classes
+                int nA_b = (total_rem > 0) ? (int)((int64_t)nA_rem * window / total_rem) : 0;
+                int nB_b = (total_rem > 0) ? (int)((int64_t)nB_rem * window / total_rem) : 0;
+                int nC_b = window - nA_b - nB_b;
+                if (nA_b > nA_rem) nA_b = nA_rem;
+                if (nB_b > nB_rem) nB_b = nB_rem;
+                if (nC_b > nC_rem) nC_b = nC_rem;
+                // Fill remaining window slots C→B→A
+                int rem = window - (nA_b + nB_b + nC_b);
+                if (rem > 0 && nC_b < nC_rem) { int x = std::min(rem, nC_rem - nC_b); nC_b += x; rem -= x; }
+                if (rem > 0 && nB_b < nB_rem) { int x = std::min(rem, nB_rem - nB_b); nB_b += x; rem -= x; }
+                if (rem > 0 && nA_b < nA_rem) { int x = std::min(rem, nA_rem - nA_b); nA_b += x; rem -= x; }
+                int batch_total = nA_b + nB_b + nC_b;
+                if (batch_total == 0) break;
+
+                ml_batch_num++;
+                batch_num++;
+
+                // --- Pack sequences H2D in [A|B|C] order ---
+                uint8_t *h_uq = dev_mem->h_align_unpacked_query;
+                uint8_t *h_ut = dev_mem->h_align_unpacked_target;
+                size_t total_query_bytes = 0, total_target_bytes = 0;
+                const uint8_t N_BASE = 4;
+
+                auto mc_pack = [&](const std::vector<int>& vidx, int start, int count, int base_i) {
+                    for (int i = 0; i < count; i++) {
+                        int tidx = vidx[start + i];
+                        int ql = tasks[tidx].qlen, tl = tasks[tidx].tlen;
+                        size_t qa = ((size_t)(ql + 7) / 8) * 8;
+                        size_t ta = ((size_t)(tl + 7) / 8) * 8;
+                        h_query_offsets[base_i + i]  = (uint32_t)total_query_bytes;
+                        h_target_offsets[base_i + i] = (uint32_t)total_target_bytes;
+                        h_query_lens[base_i + i]     = (uint32_t)ql;
+                        h_target_lens[base_i + i]    = (uint32_t)tl;
+                        h_flag[base_i + i]           = tasks[tidx].flag;
+                        h_bw[base_i + i]             = tasks[tidx].w;
+                        memcpy(h_uq + total_query_bytes,
+                               seq_buffer + tasks[tidx].qseq_offset, ql);
+                        memcpy(h_ut + total_target_bytes,
+                               seq_buffer + tasks[tidx].tseq_offset, tl);
+                        for (int j = ql; j < (int)qa; j++) h_uq[total_query_bytes + j] = N_BASE;
+                        for (int j = tl; j < (int)ta; j++) h_ut[total_target_bytes + j] = N_BASE;
+                        total_query_bytes  += qa;
+                        total_target_bytes += ta;
+                    }
+                };
+                mc_pack(idx_A, a_done, nA_b, 0);
+                mc_pack(idx_B, b_done, nB_b, nA_b);
+                mc_pack(idx_C, c_done, nC_b, nA_b + nB_b);
+
+                // H2D sequences + metadata (on align_stream)
+                cudaMemcpyAsync(d_unpacked_query,  h_uq,
+                                total_query_bytes,  cudaMemcpyHostToDevice, align_stream);
+                cudaMemcpyAsync(d_unpacked_target, h_ut,
+                                total_target_bytes, cudaMemcpyHostToDevice, align_stream);
+                cudaMemcpyAsync(d_query_offsets, h_query_offsets,
+                                batch_total * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+                cudaMemcpyAsync(d_target_offsets, h_target_offsets,
+                                batch_total * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+                cudaMemcpyAsync(d_query_lens, h_query_lens,
+                                batch_total * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+                cudaMemcpyAsync(d_target_lens, h_target_lens,
+                                batch_total * sizeof(uint32_t), cudaMemcpyHostToDevice, align_stream);
+                cudaMemcpyAsync(d_flag, h_flag,
+                                batch_total * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
+                cudaMemcpyAsync(d_bw, h_bw,
+                                batch_total * sizeof(int32_t), cudaMemcpyHostToDevice, align_stream);
+
+                // Pack sequences on GPU
+                {
+                    int qt = (int)ceil(total_query_bytes  / (8.0 * kernel_threads * kernel_blocks));
+                    int tt = (int)ceil(total_target_bytes / (8.0 * kernel_threads * kernel_blocks));
+                    gasal_pack_kernel<<<kernel_blocks, kernel_threads, 0, align_stream>>>(
+                        (uint32_t*)d_unpacked_query, (uint32_t*)d_unpacked_target,
+                        d_packed_query, d_packed_target,
+                        qt, tt,
+                        total_query_bytes / 4, total_target_bytes / 4);
+                }
+
+                // Signal H2D+pack done → B and C streams can start
+                cudaEvent_t ev_h2d;
+                cudaEventCreateWithFlags(&ev_h2d, cudaEventDisableTiming);
+                cudaEventRecord(ev_h2d, align_stream);
+                if (nB_b > 0) cudaStreamWaitEvent(s_stream_B, ev_h2d, 0);
+                if (nC_b > 0) cudaStreamWaitEvent(s_stream_C, ev_h2d, 0);
+
+                // Reset task counters
+                cudaMemsetAsync(d_task_counter, 0, sizeof(int), align_stream);
+                if (nB_b > 0) cudaMemsetAsync(d_counter_B, 0, sizeof(int), s_stream_B);
+                if (nC_b > 0) cudaMemsetAsync(d_counter_C, 0, sizeof(int), s_stream_C);
+
+                auto t_start = std::chrono::steady_clock::now();
+                const int par_threads = 32;
+
+                // Effective slot counts (capped to actual task count)
+                int sA_eff = (nA_b > 0) ? std::min(sA, nA_b) : 0;
+                int sB_eff = (nB_b > 0) ? std::min(sB, nB_b) : 0;
+                int sC_eff = (nC_b > 0) ? std::min(sC, nC_b) : 0;
+                if (sA_eff < 1 && nA_b > 0) sA_eff = 1;
+                if (sB_eff < 1 && nB_b > 0) sB_eff = 1;
+                if (sC_eff < 1 && nC_b > 0) sC_eff = 1;
+
+                // Launch class A on align_stream (task_id_base = 0)
+                if (nA_b > 0) {
+                    ksw_fused_persistent_kernel<<<sA_eff, par_threads, 0, align_stream>>>(
+                        d_task_counter,
+                        d_packed_query, d_packed_target,
+                        d_query_lens, d_target_lens,
+                        d_query_offsets, d_target_offsets,
+                        (gasal_res_t*)device_res, d_mat,
+                        bt_p_A, bt_off_A, bt_off_end_A,
+                        (int)stride_A_max, (int)max_ad_long,
+                        ksw_temp_A, d_flag, d_bw,
+                        ksw_temp_per_task, nA_b, 5,
+                        opt->zdrop, opt->end_bonus,
+                        cigar_buffer ? d_cigar_buffer  : NULL,
+                        cigar_buffer ? d_cigar_lengths : NULL,
+                        (int)current_max_cigar_len,
+                        0  // task_id_base
+                    );
+                }
+
+                // Launch class B on s_stream_B (task_id_base = nA_b)
+                if (nB_b > 0) {
+                    ksw_fused_persistent_kernel<<<sB_eff, par_threads, 0, s_stream_B>>>(
+                        d_counter_B,
+                        d_packed_query, d_packed_target,
+                        d_query_lens  + nA_b, d_target_lens  + nA_b,
+                        d_query_offsets + nA_b, d_target_offsets + nA_b,
+                        (gasal_res_t*)device_res, d_mat,
+                        bt_p_B, bt_off_B, bt_off_end_B,
+                        (int)stride_B_max, (int)max_ad_long,
+                        ksw_temp_B, d_flag + nA_b, d_bw + nA_b,
+                        ksw_temp_per_task, nB_b, 5,
+                        opt->zdrop, opt->end_bonus,
+                        cigar_buffer ? d_cigar_buffer  : NULL,
+                        cigar_buffer ? d_cigar_lengths : NULL,
+                        (int)current_max_cigar_len,
+                        nA_b  // task_id_base
+                    );
+                }
+
+                // Launch class C on s_stream_C (task_id_base = nA_b + nB_b)
+                if (nC_b > 0) {
+                    ksw_fused_persistent_kernel<<<sC_eff, par_threads, 0, s_stream_C>>>(
+                        d_counter_C,
+                        d_packed_query, d_packed_target,
+                        d_query_lens   + nA_b + nB_b, d_target_lens   + nA_b + nB_b,
+                        d_query_offsets + nA_b + nB_b, d_target_offsets + nA_b + nB_b,
+                        (gasal_res_t*)device_res, d_mat,
+                        bt_p_C, bt_off_C, bt_off_end_C,
+                        (int)stride_C_max, (int)max_ad_long,
+                        ksw_temp_C, d_flag + nA_b + nB_b, d_bw + nA_b + nB_b,
+                        ksw_temp_per_task, nC_b, 5,
+                        opt->zdrop, opt->end_bonus,
+                        cigar_buffer ? d_cigar_buffer  : NULL,
+                        cigar_buffer ? d_cigar_lengths : NULL,
+                        (int)current_max_cigar_len,
+                        nA_b + nB_b  // task_id_base
+                    );
+                }
+
+                // Sync B and C back to align_stream
+                if (nB_b > 0) {
+                    cudaEvent_t ev_B;
+                    cudaEventCreateWithFlags(&ev_B, cudaEventDisableTiming);
+                    cudaEventRecord(ev_B, s_stream_B);
+                    cudaStreamWaitEvent(align_stream, ev_B, 0);
+                    cudaEventDestroy(ev_B);
+                }
+                if (nC_b > 0) {
+                    cudaEvent_t ev_C;
+                    cudaEventCreateWithFlags(&ev_C, cudaEventDisableTiming);
+                    cudaEventRecord(ev_C, s_stream_C);
+                    cudaStreamWaitEvent(align_stream, ev_C, 0);
+                    cudaEventDestroy(ev_C);
+                }
+                cudaEventDestroy(ev_h2d);
+
+                cudaError_t ml_kerr = cudaGetLastError();
+                if (ml_kerr != cudaSuccess)
+                    fprintf(stderr, "[ERROR] Multi-class KSW kernel launch: %s\n",
+                            cudaGetErrorString(ml_kerr));
+
+                // Post-process CIGAR for all batch_total tasks (on align_stream after sync)
+                if (cigar_buffer) {
+                    cub::DeviceScan::ExclusiveSum(d_cub_tmp, cub_tmp_size,
+                                                  d_cigar_lengths, (int*)d_compact_offsets,
+                                                  batch_total, align_stream);
+                    compact_cigar_kernel<<<batch_total, 256, 0, align_stream>>>(
+                        d_cigar_buffer, d_compact_cigar, d_compact_offsets,
+                        d_cigar_lengths, (int)current_max_cigar_len);
+                    gpu_fix_cigar_and_stats<<<batch_total, 1, 0, align_stream>>>(
+                        d_compact_cigar, d_compact_offsets, d_cigar_lengths,
+                        d_unpacked_query, d_unpacked_target,
+                        d_query_offsets, d_target_offsets,
+                        d_mat, opt->q, opt->e, !(opt->flag & MM_F_SR),
+                        d_blen, d_mlen, d_n_ambi, d_dp_max, d_gpu_stats_valid,
+                        batch_total);
+                }
+
+                cudaStreamSynchronize(align_stream);
+                auto t_end = std::chrono::steady_clock::now();
+                double ml_gpu_ms = std::chrono::duration<double>(t_end - t_start).count() * 1000.0;
+                s_ksw_wall_total_sec += ml_gpu_ms / 1000.0;
+
+                ml_kerr = cudaGetLastError();
+                if (ml_kerr != cudaSuccess)
+                    fprintf(stderr, "[ERROR] Multi-class kernel execution: %s\n",
+                            cudaGetErrorString(ml_kerr));
+                cudaCheck();
+
+                // D2H results
+                if (cigar_buffer) {
+                    cudaMemcpyAsync(h_cigar_lengths, d_cigar_lengths,
+                                    batch_total * sizeof(int), cudaMemcpyDeviceToHost, align_stream);
+                    cudaMemcpyAsync(h_blen,   d_blen,   batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                    cudaMemcpyAsync(h_mlen,   d_mlen,   batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                    cudaMemcpyAsync(h_n_ambi, d_n_ambi, batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                    cudaMemcpyAsync(h_dp_max, d_dp_max, batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                    cudaMemcpyAsync(h_gpu_stats_valid, d_gpu_stats_valid,
+                                    batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                }
+                cudaMemcpyAsync(h_scores,      d_scores,      batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_query_ends,  d_query_ends,  batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_target_ends, d_target_ends, batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_mqe,   d_mqe,   batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_mqe_t, d_mqe_t, batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_mte,   d_mte,   batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_mte_q, d_mte_q, batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaMemcpyAsync(h_zdropped, d_zdropped, batch_total * sizeof(int32_t), cudaMemcpyDeviceToHost, align_stream);
+                cudaStreamSynchronize(align_stream);
+
+                // D2H compact CIGAR
+                int ml_total_cigar = 0;
+                if (cigar_buffer) {
+                    for (int i = 0; i < batch_total; i++) {
+                        if (h_cigar_lengths[i] < 0 || h_cigar_lengths[i] > (int)current_max_cigar_len)
+                            h_cigar_lengths[i] = 0;
+                    }
+                    cudaMemcpyAsync(h_compact_offsets, d_compact_offsets,
+                                    batch_total * sizeof(uint32_t), cudaMemcpyDeviceToHost, align_stream);
+                    cudaStreamSynchronize(align_stream);
+                    uint32_t ml_max_ext = 0;
+                    for (int i = 0; i < batch_total; i++) {
+                        uint32_t end = h_compact_offsets[i] + (uint32_t)h_cigar_lengths[i];
+                        if (end > ml_max_ext) ml_max_ext = end;
+                    }
+                    ml_total_cigar = (int)ml_max_ext;
+                    if (ml_total_cigar > 0) {
+                        cudaMemcpyAsync(h_compact_cigar, d_compact_cigar,
+                                        ml_total_cigar * sizeof(uint32_t), cudaMemcpyDeviceToHost, align_stream);
+                        cudaStreamSynchronize(align_stream);
+                    }
+                }
+
+                // CPU result mapping — iterate [A|B|C] pack order
+                auto mc_map = [&](const std::vector<int>& vidx, int start, int count, int base_i) {
+                    for (int i = 0; i < count; i++) {
+                        int tidx = vidx[start + i];
+                        int gi   = base_i + i;
+
+                        tasks[tidx].score = h_scores[gi];
+                        if (tasks[tidx].flag & KSW_EZ_APPROX_MAX) {
+                            tasks[tidx].max_q = -1;
+                            tasks[tidx].max_t = -1;
+                        } else {
+                            tasks[tidx].max_q = h_query_ends[gi];
+                            tasks[tidx].max_t = h_target_ends[gi];
+                        }
+                        tasks[tidx].mqe   = h_mqe[gi];
+                        tasks[tidx].mqe_t = h_mqe_t[gi];
+                        tasks[tidx].mte   = h_mte[gi];
+                        tasks[tidx].mte_q = h_mte_q[gi];
+
+                        if (cigar_buffer) {
+                            int nc = h_cigar_lengths[gi];
+                            tasks[tidx].n_cigar = nc;
+                            if (nc > 0 && nc <= tasks[tidx].max_cigar) {
+                                memcpy(cigar_buffer + tasks[tidx].cigar_offset,
+                                       h_compact_cigar + h_compact_offsets[gi],
+                                       nc * sizeof(uint32_t));
+                            } else if (nc > tasks[tidx].max_cigar) {
+                                tasks[tidx].n_cigar = 0;
+                            }
+                        } else {
+                            tasks[tidx].n_cigar = 0;
+                        }
+
+                        tasks[tidx].blen            = h_blen[gi];
+                        tasks[tidx].mlen            = h_mlen[gi];
+                        tasks[tidx].n_ambi          = h_n_ambi[gi];
+                        tasks[tidx].dp_max          = h_dp_max[gi];
+                        tasks[tidx].gpu_stats_valid = h_gpu_stats_valid[gi];
+
+                        if (tasks[tidx].flag & KSW_EZ_RIGHT) {
+                            int mq = (tasks[tidx].flag & KSW_EZ_APPROX_MAX)
+                                   ? h_query_ends[gi] : tasks[tidx].max_q;
+                            tasks[tidx].reach_end = (mq == tasks[tidx].qlen - 1);
+                        } else if (tasks[tidx].flag & KSW_EZ_APPROX_MAX) {
+                            tasks[tidx].reach_end =
+                                (h_query_ends[gi]  == tasks[tidx].qlen - 1) &&
+                                (h_target_ends[gi] == tasks[tidx].tlen - 1);
+                        } else {
+                            tasks[tidx].reach_end =
+                                (tasks[tidx].max_q == tasks[tidx].qlen - 1) &&
+                                (tasks[tidx].max_t == tasks[tidx].tlen - 1);
+                        }
+                        tasks[tidx].zdropped = h_zdropped[gi] ? 1 : 0;
+                    }
+                };
+                mc_map(idx_A, a_done, nA_b, 0);
+                mc_map(idx_B, b_done, nB_b, nA_b);
+                mc_map(idx_C, c_done, nC_b, nA_b + nB_b);
+
+                PLOG_INFO(stderr,
+                    "[Info::MLong %d]: A=%d B=%d C=%d  "
+                    "sA=%d sB=%d sC=%d  (gpu_ms=%.1f)\n",
+                    ml_batch_num, nA_b, nB_b, nC_b, sA_eff, sB_eff, sC_eff, ml_gpu_ms);
+
+                a_done += nA_b; b_done += nB_b; c_done += nC_b;
+                total_tasks_processed += batch_total;
+            } // end multi-class batch loop
+
+            continue;  // skip the while loop below; phase 0 uses it exclusively
+        }
+        // ===== END MULTI-CLASS LONG-PHASE =====
 
         int tasks_processed_in_phase = 0;
         int phase_batch_num = 0;
@@ -1001,7 +1453,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         opt->end_bonus,
                         cigar_buffer ? d_cigar_buffer  : NULL,
                         cigar_buffer ? d_cigar_lengths : NULL,
-                        (int)current_max_cigar_len
+                        (int)current_max_cigar_len,
+                        0  // task_id_base: short phase always starts at 0
                     );
                 }
             }

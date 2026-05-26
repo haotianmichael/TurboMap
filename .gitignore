@@ -18,3 +18,4 @@ nsys
 workloads
 .cmake/**
 .depend
+.claude/

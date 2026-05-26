@@ -323,6 +323,55 @@ typedef struct {
     uint8_t *h_align_unpacked_target;   // pinned, max_seq_staging_bytes
     size_t   h_align_seq_staging_bytes; // capacity of each staging buffer
 
+    // ========== Concurrent Long-C Context ==========
+    // Fixed device buffers for class-C long tasks, carved from the dedicated
+    // bt_p pool (d_align_backtrack_p_long) at init time.  Allows C-class kernels
+    // to launch on s_stream_C DURING the Short phase, overlapping with align_stream.
+    // All fields are NULL/0 if the dedicated pool is too small for this layout.
+    uint8_t  *d_long_c_unpacked_query;
+    uint8_t  *d_long_c_unpacked_target;
+    uint32_t *d_long_c_packed_query;
+    uint32_t *d_long_c_packed_target;
+    uint32_t *d_long_c_query_offsets;
+    uint32_t *d_long_c_target_offsets;
+    uint32_t *d_long_c_query_lens;
+    uint32_t *d_long_c_target_lens;
+    int32_t  *d_long_c_flag;
+    int32_t  *d_long_c_bw;
+    uint32_t *d_long_c_cigar_buffer;
+    int      *d_long_c_cigar_lengths;
+    uint32_t *d_long_c_compact_cigar;
+    uint32_t *d_long_c_compact_offsets;
+    void     *d_long_c_cub_tmp;
+    size_t    d_long_c_cub_tmp_size;
+    int32_t  *d_long_c_blen;
+    int32_t  *d_long_c_mlen;
+    int32_t  *d_long_c_n_ambi;
+    int32_t  *d_long_c_dp_max;
+    int32_t  *d_long_c_gpu_stats_valid;
+    void     *d_long_c_device_res;
+    int32_t  *d_long_c_scores;
+    int32_t  *d_long_c_query_ends;
+    int32_t  *d_long_c_target_ends;
+    int32_t  *d_long_c_mqe;
+    int32_t  *d_long_c_mqe_t;
+    int32_t  *d_long_c_mte;
+    int32_t  *d_long_c_mte_q;
+    int32_t  *d_long_c_zdropped;
+    int8_t   *d_long_c_mat;
+    int      *d_long_c_task_counter;
+    int      *d_long_c_bt_off;
+    int      *d_long_c_bt_off_end;
+    void     *d_long_c_ksw_temp;
+    uint8_t  *d_long_c_bt_p;        // C bt_p pool (dedicated pool after fixed buffers)
+    size_t    d_long_c_bt_p_avail;  // bytes available for C bt_p
+    size_t    d_long_c_max_tasks;   // LONG_C_BATCH_MAX if context allocated, else 0
+    size_t    d_long_c_n_slots;     // LONG_C_SLOTS_MAX if context allocated, else 0
+    // Pinned host staging buffers for C H2D (separate from h_align_unpacked_*
+    // since both Short and C H2D may be in flight simultaneously)
+    uint8_t  *h_long_c_unpacked_query;
+    uint8_t  *h_long_c_unpacked_target;
+
 } deviceMemPtr;
 
 typedef struct stream_ptr_t{

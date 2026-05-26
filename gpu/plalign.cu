@@ -493,6 +493,36 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     }
     // ---- end bt_stride distribution ----
 
+    // ===== Pre-classify long tasks into A/B/C before phase loop =====
+    const size_t THRESH_B_PRE = (size_t)5  << 20;
+    const size_t THRESH_C_PRE = (size_t)20 << 20;
+    std::vector<int> idx_A_pre, idx_B_pre, idx_C_pre;
+    size_t stride_A_max_pre = 8, stride_B_max_pre = 8, stride_C_max_pre = 8;
+    for (int i = 0; i < n_long_tasks; i++) {
+        int tidx = task_indices_long[i];
+        int ql = tasks[tidx].qlen, tl = tasks[tidx].tlen, w = tasks[tidx].w;
+        int nc = (ql < tl) ? ql : tl;
+        if (w >= 0 && w + 1 < nc) nc = w + 1;
+        size_t bt = ((size_t)(ql + tl) * (size_t)nc + 7) & ~(size_t)7;
+        if (bt < THRESH_B_PRE) { idx_A_pre.push_back(tidx); if (bt > stride_A_max_pre) stride_A_max_pre = bt; }
+        else if (bt < THRESH_C_PRE) { idx_B_pre.push_back(tidx); if (bt > stride_B_max_pre) stride_B_max_pre = bt; }
+        else { idx_C_pre.push_back(tidx); if (bt > stride_C_max_pre) stride_C_max_pre = bt; }
+    }
+    int nA_pre = (int)idx_A_pre.size(), nB_pre = (int)idx_B_pre.size(), nC_pre = (int)idx_C_pre.size();
+
+    // ===== Concurrent C dispatch: start C on s_stream_C_conc BEFORE Short =====
+    static cudaStream_t s_stream_C_conc = nullptr;
+    static int *d_counter_C_conc = nullptr;
+    if (!s_stream_C_conc) {
+        cudaStreamCreate(&s_stream_C_conc);
+        cudaMalloc(&d_counter_C_conc, sizeof(int));
+    }
+
+    bool c_concurrent = (dev_mem->d_long_c_unpacked_query != nullptr
+                         && nC_pre > 0
+                         && nC_pre <= (int)dev_mem->d_long_c_max_tasks);
+    int c_conc_done = 0;  // tracks how many C tasks processed concurrently
+
     int kernel_threads = 256;
     uint8_t  *d_unpacked_query  = dev_mem->d_align_unpacked_query;
     uint8_t  *d_unpacked_target = dev_mem->d_align_unpacked_target;
@@ -578,6 +608,118 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     int total_tasks_processed = 0;
     std::string deferred_short_log;
 
+    // ===== Concurrent C dispatch: launch C-class tasks on s_stream_C_conc BEFORE Short =====
+    if (c_concurrent) {
+        int nC_b = nC_pre;  // all C in one batch (nC_pre ≤ d_long_c_max_tasks)
+
+        // Upload scoring matrix and init gasal_res for C context on s_stream_C_conc
+        cudaMemcpyAsync(dev_mem->d_long_c_mat, h_scoring_matrix, 25 * sizeof(int8_t),
+                        cudaMemcpyHostToDevice, s_stream_C_conc);
+        init_gasal_res<<<1, 1, 0, s_stream_C_conc>>>(
+            (gasal_res_t*)dev_mem->d_long_c_device_res,
+            dev_mem->d_long_c_scores, dev_mem->d_long_c_query_ends,
+            dev_mem->d_long_c_target_ends,
+            dev_mem->d_long_c_mqe, dev_mem->d_long_c_mqe_t,
+            dev_mem->d_long_c_mte, dev_mem->d_long_c_mte_q,
+            dev_mem->d_long_c_zdropped);
+
+        // Pack C sequences into separate pinned staging buffers
+        uint8_t *h_cq = dev_mem->h_long_c_unpacked_query;
+        uint8_t *h_ct = dev_mem->h_long_c_unpacked_target;
+        size_t c_query_bytes = 0, c_target_bytes = 0;
+        const uint8_t N_BASE_C = 4;
+        for (int i = 0; i < nC_b; i++) {
+            int tidx = idx_C_pre[i];
+            int ql = tasks[tidx].qlen, tl = tasks[tidx].tlen;
+            size_t qa = ((size_t)(ql + 7) / 8) * 8;
+            size_t ta = ((size_t)(tl + 7) / 8) * 8;
+            h_query_offsets[i]  = (uint32_t)c_query_bytes;
+            h_target_offsets[i] = (uint32_t)c_target_bytes;
+            h_query_lens[i]     = (uint32_t)ql;
+            h_target_lens[i]    = (uint32_t)tl;
+            h_flag[i]           = tasks[tidx].flag;
+            h_bw[i]             = tasks[tidx].w;
+            memcpy(h_cq + c_query_bytes,  seq_buffer + tasks[tidx].qseq_offset, ql);
+            memcpy(h_ct + c_target_bytes, seq_buffer + tasks[tidx].tseq_offset, tl);
+            for (int j = ql; j < (int)qa; j++) h_cq[c_query_bytes  + j] = N_BASE_C;
+            for (int j = tl; j < (int)ta; j++) h_ct[c_target_bytes + j] = N_BASE_C;
+            c_query_bytes  += qa;
+            c_target_bytes += ta;
+        }
+
+        // H2D C seq to separate pinned buffers, metadata to d_long_c_* device arrays
+        cudaMemcpyAsync(dev_mem->d_long_c_unpacked_query,  h_cq, c_query_bytes,
+                        cudaMemcpyHostToDevice, s_stream_C_conc);
+        cudaMemcpyAsync(dev_mem->d_long_c_unpacked_target, h_ct, c_target_bytes,
+                        cudaMemcpyHostToDevice, s_stream_C_conc);
+        cudaMemcpyAsync(dev_mem->d_long_c_query_offsets,  h_query_offsets,
+                        nC_b * sizeof(uint32_t), cudaMemcpyHostToDevice, s_stream_C_conc);
+        cudaMemcpyAsync(dev_mem->d_long_c_target_offsets, h_target_offsets,
+                        nC_b * sizeof(uint32_t), cudaMemcpyHostToDevice, s_stream_C_conc);
+        cudaMemcpyAsync(dev_mem->d_long_c_query_lens,     h_query_lens,
+                        nC_b * sizeof(uint32_t), cudaMemcpyHostToDevice, s_stream_C_conc);
+        cudaMemcpyAsync(dev_mem->d_long_c_target_lens,    h_target_lens,
+                        nC_b * sizeof(uint32_t), cudaMemcpyHostToDevice, s_stream_C_conc);
+        cudaMemcpyAsync(dev_mem->d_long_c_flag, h_flag,
+                        nC_b * sizeof(int32_t), cudaMemcpyHostToDevice, s_stream_C_conc);
+        cudaMemcpyAsync(dev_mem->d_long_c_bw, h_bw,
+                        nC_b * sizeof(int32_t), cudaMemcpyHostToDevice, s_stream_C_conc);
+
+        // Sync metadata H2D before Short CPU packing overwrites h_query_offsets etc.
+        // (C seq uses separate h_long_c_* buffers so those are fine.)
+        // This is fast: metadata is a few KB and transfers in microseconds.
+        cudaStreamSynchronize(s_stream_C_conc);
+
+        // Pack seqs on GPU (s_stream_C_conc)
+        {
+            int qt = (int)ceil(c_query_bytes  / (8.0 * kernel_threads * kernel_blocks));
+            int tt = (int)ceil(c_target_bytes / (8.0 * kernel_threads * kernel_blocks));
+            gasal_pack_kernel<<<kernel_blocks, kernel_threads, 0, s_stream_C_conc>>>(
+                (uint32_t*)dev_mem->d_long_c_unpacked_query,
+                (uint32_t*)dev_mem->d_long_c_unpacked_target,
+                dev_mem->d_long_c_packed_query, dev_mem->d_long_c_packed_target,
+                qt, tt,
+                c_query_bytes / 4, c_target_bytes / 4);
+        }
+
+        // Compute C slot count from C bt_p pool
+        size_t c_bt_p_avail = dev_mem->d_long_c_bt_p_avail;
+        int sC_conc = (stride_C_max_pre > 0) ? (int)(c_bt_p_avail / stride_C_max_pre) : 1;
+        if (sC_conc < 1) sC_conc = 1;
+        int sC_slots_cap = (int)dev_mem->d_long_c_n_slots;
+        if (sC_conc > sC_slots_cap) sC_conc = sC_slots_cap;
+        sC_conc = std::min(sC_conc, nC_b);
+
+        size_t max_ad_c = 2 * dev_mem->max_align_task_len;
+        size_t conc_cigar_len = 2 * dev_mem->max_align_task_len;
+
+        // Reset counter and launch C kernel
+        cudaMemsetAsync(d_counter_C_conc, 0, sizeof(int), s_stream_C_conc);
+        ksw_fused_persistent_kernel<<<sC_conc, 32, 0, s_stream_C_conc>>>(
+            d_counter_C_conc,
+            dev_mem->d_long_c_packed_query, dev_mem->d_long_c_packed_target,
+            dev_mem->d_long_c_query_lens, dev_mem->d_long_c_target_lens,
+            dev_mem->d_long_c_query_offsets, dev_mem->d_long_c_target_offsets,
+            (gasal_res_t*)dev_mem->d_long_c_device_res, dev_mem->d_long_c_mat,
+            dev_mem->d_long_c_bt_p, dev_mem->d_long_c_bt_off, dev_mem->d_long_c_bt_off_end,
+            (int)stride_C_max_pre, (int)max_ad_c,
+            dev_mem->d_long_c_ksw_temp, dev_mem->d_long_c_flag, dev_mem->d_long_c_bw,
+            dev_mem->align_ksw_temp_per_task, nC_b, 5,
+            opt->zdrop, opt->end_bonus,
+            cigar_buffer ? dev_mem->d_long_c_cigar_buffer : NULL,
+            cigar_buffer ? dev_mem->d_long_c_cigar_lengths : NULL,
+            (int)conc_cigar_len,
+            0  // task_id_base = 0 for concurrent C (uses own result arrays)
+        );
+        c_conc_done = nC_b;
+        PLOG_INFO(stderr, "[Info::CConc] Launched %d C tasks on s_stream_C_conc concurrently "
+                  "(sC=%d stride=%.1fMB bt_p=%.2fGB)\n",
+                  nC_b, sC_conc,
+                  stride_C_max_pre / (1024.0*1024.0),
+                  c_bt_p_avail / (1024.0*1024.0*1024.0));
+    }
+    // ===== END Concurrent C dispatch =====
+
     for (int phase = 0; phase < 2; phase++) {
         int  *current_task_indices  = (phase == 0) ? task_indices_short : task_indices_long;
         int   n_tasks_in_phase      = (phase == 0) ? n_short_tasks : n_long_tasks;
@@ -658,31 +800,20 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         // allocates separate bt_p/bt_off/ksw_temp sub-pools for each class,
         // and launches 3 concurrent kernels so all 3456 GPU slots stay active
         // instead of collapsing to ~432 slots for the largest-stride class.
+        // When c_concurrent==true, class C was already launched on s_stream_C_conc
+        // before the Short phase; this block only processes A+B.
         if (phase == 1) {
-            const size_t THRESH_B = (size_t)5  << 20;   // 5 MB
-            const size_t THRESH_C = (size_t)20 << 20;   // 20 MB
-
-            // --- Classify ---
-            std::vector<int> idx_A, idx_B, idx_C;
-            size_t stride_A_max = 8, stride_B_max = 8, stride_C_max = 8;
-            for (int i = 0; i < n_long_tasks; i++) {
-                int tidx = task_indices_long[i];
-                int ql = tasks[tidx].qlen, tl = tasks[tidx].tlen, w = tasks[tidx].w;
-                int nc = (ql < tl) ? ql : tl;
-                if (w >= 0 && w + 1 < nc) nc = w + 1;
-                size_t bt = ((size_t)(ql + tl) * (size_t)nc + 7) & ~(size_t)7;
-                if (bt < THRESH_B) {
-                    idx_A.push_back(tidx);
-                    if (bt > stride_A_max) stride_A_max = bt;
-                } else if (bt < THRESH_C) {
-                    idx_B.push_back(tidx);
-                    if (bt > stride_B_max) stride_B_max = bt;
-                } else {
-                    idx_C.push_back(tidx);
-                    if (bt > stride_C_max) stride_C_max = bt;
-                }
-            }
-            int nA = (int)idx_A.size(), nB = (int)idx_B.size(), nC = (int)idx_C.size();
+            // --- Use pre-classified vectors from before the phase loop ---
+            const std::vector<int>& idx_A = idx_A_pre;
+            const std::vector<int>& idx_B = idx_B_pre;
+            const std::vector<int>& idx_C = idx_C_pre;
+            size_t stride_A_max = stride_A_max_pre;
+            size_t stride_B_max = stride_B_max_pre;
+            size_t stride_C_max = stride_C_max_pre;
+            int nA = nA_pre, nB = nB_pre;
+            // If C was dispatched concurrently, skip it in this phase.
+            int nC_for_this_phase = c_concurrent ? 0 : nC_pre;
+            int nC = nC_for_this_phase;  // local alias used throughout block
 
             // --- Two bt_p pools: arena (A+B) + dedicated (C) ---
             // The dedicated d_align_backtrack_p_long pool (~12GB carved from VRAM the
@@ -695,9 +826,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
             size_t arena_pool = dev_mem->long_arena_bt_p_bytes;
             uint8_t *arena_base_p = d_backtrack_p;
-            size_t dedi_pool = (dev_mem->d_align_backtrack_p_long != nullptr)
+            // When c_concurrent==true the dedicated pool's start is carved for C's fixed
+            // context buffers; A+B must NOT use dedi_base_p as their bt_p pool.
+            // Setting dedi_pool=0 forces the single-pool path to use the arena pool.
+            size_t dedi_pool = (dev_mem->d_align_backtrack_p_long != nullptr && !c_concurrent)
                                ? dev_mem->long_bt_p_pool_bytes : 0;
-            uint8_t *dedi_base_p = dev_mem->d_align_backtrack_p_long;
+            uint8_t *dedi_base_p = c_concurrent ? nullptr : dev_mem->d_align_backtrack_p_long;
 
             // Use two pools only if the dedicated pool can hold ≥1 class-C task.
             bool two_pools = (nC > 0 && dedi_pool >= stride_C_max);
@@ -1693,6 +1827,111 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
         }
     }
+
+    // ===== Collect concurrent C results =====
+    if (c_concurrent && c_conc_done > 0) {
+        int nC_b = c_conc_done;
+        size_t long_cigar_len2 = 2 * dev_mem->max_align_task_len;
+
+        // Post-process CIGAR on s_stream_C_conc (C kernel may still be running or done)
+        if (cigar_buffer) {
+            cub::DeviceScan::ExclusiveSum(
+                dev_mem->d_long_c_cub_tmp, dev_mem->d_long_c_cub_tmp_size,
+                dev_mem->d_long_c_cigar_lengths, (int*)dev_mem->d_long_c_compact_offsets,
+                nC_b, s_stream_C_conc);
+            compact_cigar_kernel<<<nC_b, 256, 0, s_stream_C_conc>>>(
+                dev_mem->d_long_c_cigar_buffer, dev_mem->d_long_c_compact_cigar,
+                dev_mem->d_long_c_compact_offsets,
+                dev_mem->d_long_c_cigar_lengths, (int)long_cigar_len2);
+            gpu_fix_cigar_and_stats<<<nC_b, 1, 0, s_stream_C_conc>>>(
+                dev_mem->d_long_c_compact_cigar, dev_mem->d_long_c_compact_offsets,
+                dev_mem->d_long_c_cigar_lengths,
+                dev_mem->d_long_c_unpacked_query, dev_mem->d_long_c_unpacked_target,
+                dev_mem->d_long_c_query_offsets, dev_mem->d_long_c_target_offsets,
+                dev_mem->d_long_c_mat, opt->q, opt->e, !(opt->flag & MM_F_SR),
+                dev_mem->d_long_c_blen, dev_mem->d_long_c_mlen,
+                dev_mem->d_long_c_n_ambi, dev_mem->d_long_c_dp_max,
+                dev_mem->d_long_c_gpu_stats_valid, nC_b);
+        }
+        cudaStreamSynchronize(s_stream_C_conc);
+
+        // D2H C results (reuse h_align_* arrays — A+B collection is done at this point)
+        if (cigar_buffer) {
+            cudaMemcpyAsync(h_cigar_lengths, dev_mem->d_long_c_cigar_lengths,
+                            nC_b * sizeof(int), cudaMemcpyDeviceToHost, s_stream_C_conc);
+            cudaMemcpyAsync(h_blen,   dev_mem->d_long_c_blen,   nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+            cudaMemcpyAsync(h_mlen,   dev_mem->d_long_c_mlen,   nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+            cudaMemcpyAsync(h_n_ambi, dev_mem->d_long_c_n_ambi, nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+            cudaMemcpyAsync(h_dp_max, dev_mem->d_long_c_dp_max, nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+            cudaMemcpyAsync(h_gpu_stats_valid, dev_mem->d_long_c_gpu_stats_valid,
+                            nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+        }
+        cudaMemcpyAsync(h_scores,      dev_mem->d_long_c_scores,       nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+        cudaMemcpyAsync(h_query_ends,  dev_mem->d_long_c_query_ends,   nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+        cudaMemcpyAsync(h_target_ends, dev_mem->d_long_c_target_ends,  nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+        cudaMemcpyAsync(h_mqe,   dev_mem->d_long_c_mqe,   nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+        cudaMemcpyAsync(h_mqe_t, dev_mem->d_long_c_mqe_t, nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+        cudaMemcpyAsync(h_mte,   dev_mem->d_long_c_mte,   nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+        cudaMemcpyAsync(h_mte_q, dev_mem->d_long_c_mte_q, nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+        cudaMemcpyAsync(h_zdropped, dev_mem->d_long_c_zdropped, nC_b * sizeof(int32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+        cudaStreamSynchronize(s_stream_C_conc);
+
+        // D2H compact CIGAR for C
+        int c_total_cigar = 0;
+        if (cigar_buffer) {
+            for (int i = 0; i < nC_b; i++)
+                if (h_cigar_lengths[i] < 0 || h_cigar_lengths[i] > (int)long_cigar_len2) h_cigar_lengths[i] = 0;
+            cudaMemcpyAsync(h_compact_offsets, dev_mem->d_long_c_compact_offsets,
+                            nC_b * sizeof(uint32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+            cudaStreamSynchronize(s_stream_C_conc);
+            uint32_t mx = 0;
+            for (int i = 0; i < nC_b; i++) {
+                uint32_t end = h_compact_offsets[i] + (uint32_t)h_cigar_lengths[i];
+                if (end > mx) mx = end;
+            }
+            c_total_cigar = (int)mx;
+            if (c_total_cigar > 0) {
+                cudaMemcpyAsync(h_compact_cigar, dev_mem->d_long_c_compact_cigar,
+                                c_total_cigar * sizeof(uint32_t), cudaMemcpyDeviceToHost, s_stream_C_conc);
+                cudaStreamSynchronize(s_stream_C_conc);
+            }
+        }
+
+        // Map C results to tasks[]
+        for (int i = 0; i < nC_b; i++) {
+            int tidx = idx_C_pre[i];
+            tasks[tidx].score = h_scores[i];
+            if (tasks[tidx].flag & KSW_EZ_APPROX_MAX) { tasks[tidx].max_q = -1; tasks[tidx].max_t = -1; }
+            else { tasks[tidx].max_q = h_query_ends[i]; tasks[tidx].max_t = h_target_ends[i]; }
+            tasks[tidx].mqe   = h_mqe[i];  tasks[tidx].mqe_t = h_mqe_t[i];
+            tasks[tidx].mte   = h_mte[i];  tasks[tidx].mte_q = h_mte_q[i];
+            if (cigar_buffer) {
+                int nc = h_cigar_lengths[i];
+                tasks[tidx].n_cigar = nc;
+                if (nc > 0 && nc <= tasks[tidx].max_cigar)
+                    memcpy(cigar_buffer + tasks[tidx].cigar_offset,
+                           h_compact_cigar + h_compact_offsets[i], nc * sizeof(uint32_t));
+                else if (nc > tasks[tidx].max_cigar) tasks[tidx].n_cigar = 0;
+            } else { tasks[tidx].n_cigar = 0; }
+            tasks[tidx].blen            = h_blen[i];
+            tasks[tidx].mlen            = h_mlen[i];
+            tasks[tidx].n_ambi          = h_n_ambi[i];
+            tasks[tidx].dp_max          = h_dp_max[i];
+            tasks[tidx].gpu_stats_valid = h_gpu_stats_valid[i];
+            if (tasks[tidx].flag & KSW_EZ_RIGHT) {
+                int mq = (tasks[tidx].flag & KSW_EZ_APPROX_MAX) ? h_query_ends[i] : tasks[tidx].max_q;
+                tasks[tidx].reach_end = (mq == tasks[tidx].qlen - 1);
+            } else if (tasks[tidx].flag & KSW_EZ_APPROX_MAX) {
+                tasks[tidx].reach_end = (h_query_ends[i] == tasks[tidx].qlen-1) && (h_target_ends[i] == tasks[tidx].tlen-1);
+            } else {
+                tasks[tidx].reach_end = (tasks[tidx].max_q == tasks[tidx].qlen-1) && (tasks[tidx].max_t == tasks[tidx].tlen-1);
+            }
+            tasks[tidx].zdropped = h_zdropped[i] ? 1 : 0;
+        }
+        total_tasks_processed += nC_b;
+        PLOG_INFO(stderr, "[Info::CConc] Collected %d concurrent C results\n", nC_b);
+    }
+    // ===== END Collect concurrent C results =====
 
     PLOG_INFO(stderr, "[Info] Alignment complete: %d tasks in %d batches\n",
             n_tasks, batch_num);

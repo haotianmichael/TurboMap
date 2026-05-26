@@ -115,6 +115,12 @@ static size_t cub_scan_tmp_size(size_t n) {
     return tmp_bytes;
 }
 
+// 256-byte alignment helper used when carving the concurrent Long-C context.
+static size_t a256(size_t x) { return (x + 255) & ~(size_t)255; }
+
+#define LONG_C_BATCH_MAX 512   // max C tasks per concurrent batch
+#define LONG_C_SLOTS_MAX 512   // max C concurrent slots (bt_off/ksw_temp pre-alloc)
+
 // ======== Module-level configuration globals ========
 // Set by plmem_config_batch() (JSON config) before any arena allocation.
 // Declared here so all static setup_*_phase() helpers can see them.
@@ -679,6 +685,126 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
         // skip the allocation entirely — long tasks fall back to the shared arena bt_p pool.
     }
 
+    // ---- Set up concurrent Long-C context in dedicated pool ----
+    // Carve fixed buffers from the start of d_align_backtrack_p_long.
+    // The remaining pool bytes become d_long_c_bt_p for C-class backtrack.
+    // align_ksw_temp_per_task was set by the earlier setup_align_phase dry run.
+    {
+        const size_t CMBT = LONG_C_BATCH_MAX;
+        const size_t CSLT = LONG_C_SLOTS_MAX;
+        dev_mem->d_long_c_unpacked_query = nullptr;
+        dev_mem->d_long_c_max_tasks      = 0;
+        dev_mem->d_long_c_n_slots        = 0;
+        dev_mem->d_long_c_bt_p           = nullptr;
+        dev_mem->d_long_c_bt_p_avail     = 0;
+        dev_mem->h_long_c_unpacked_query  = nullptr;
+        dev_mem->h_long_c_unpacked_target = nullptr;
+
+        if (dev_mem->d_align_backtrack_p_long != nullptr) {
+            size_t max_len      = dev_mem->max_align_task_len;
+            size_t max_antidiag = 2 * max_len;
+            size_t cigar_len    = 2 * max_len;
+            size_t ksw_sz       = dev_mem->align_ksw_temp_per_task;
+            size_t cub_sz       = 0;
+            cub::DeviceScan::ExclusiveSum(nullptr, cub_sz,
+                                          (int*)nullptr, (int*)nullptr, (int)CMBT);
+
+            size_t fixed = 0;
+            fixed += a256(CMBT * max_len);                               // unp_q
+            fixed += a256(CMBT * max_len);                               // unp_t
+            fixed += a256(CMBT * (max_len / 8) * sizeof(uint32_t));      // pack_q
+            fixed += a256(CMBT * (max_len / 8) * sizeof(uint32_t));      // pack_t
+            fixed += a256(CMBT * sizeof(uint32_t));                      // q_offsets
+            fixed += a256(CMBT * sizeof(uint32_t));                      // t_offsets
+            fixed += a256(CMBT * sizeof(uint32_t));                      // q_lens
+            fixed += a256(CMBT * sizeof(uint32_t));                      // t_lens
+            fixed += a256(CMBT * sizeof(int32_t));                       // flag
+            fixed += a256(CMBT * sizeof(int32_t));                       // bw
+            fixed += a256(CMBT * cigar_len * sizeof(uint32_t));          // cigar_raw
+            fixed += a256(CMBT * sizeof(int));                           // cigar_lengths
+            fixed += a256(CMBT * cigar_len * sizeof(uint32_t));          // cigar_compact
+            fixed += a256((CMBT + 1) * sizeof(uint32_t));                // compact_offsets
+            fixed += a256(cub_sz);                                       // cub_tmp
+            fixed += a256(CMBT * sizeof(int32_t));                       // blen
+            fixed += a256(CMBT * sizeof(int32_t));                       // mlen
+            fixed += a256(CMBT * sizeof(int32_t));                       // n_ambi
+            fixed += a256(CMBT * sizeof(int32_t));                       // dp_max
+            fixed += a256(CMBT * sizeof(int32_t));                       // gpu_stats_valid
+            fixed += a256(CMBT * sizeof(int32_t));                       // scores
+            fixed += a256(CMBT * sizeof(int32_t));                       // query_ends
+            fixed += a256(CMBT * sizeof(int32_t));                       // target_ends
+            fixed += a256(CMBT * sizeof(int32_t));                       // mqe
+            fixed += a256(CMBT * sizeof(int32_t));                       // mqe_t
+            fixed += a256(CMBT * sizeof(int32_t));                       // mte
+            fixed += a256(CMBT * sizeof(int32_t));                       // mte_q
+            fixed += a256(CMBT * sizeof(int32_t));                       // zdropped
+            fixed += a256(sizeof(uint64_t) * 12);                        // gasal_res_t
+            fixed += a256(25);                                           // mat
+            fixed += a256(sizeof(int));                                  // task_counter
+            fixed += a256(CSLT * max_antidiag * sizeof(int));            // bt_off
+            fixed += a256(CSLT * max_antidiag * sizeof(int));            // bt_off_end
+            fixed += a256(CSLT * ksw_sz);                               // ksw_temp
+
+            const size_t MIN_C_BT_P = (size_t)256 * 1024 * 1024;
+            if (fixed + MIN_C_BT_P <= dev_mem->long_bt_p_pool_bytes) {
+                uint8_t *base = dev_mem->d_align_backtrack_p_long;
+                size_t  pool  = dev_mem->long_bt_p_pool_bytes;
+                size_t  off   = 0;
+#define CNEXT(sz) ({ void *_p = base + off; off += a256(sz); _p; })
+                dev_mem->d_long_c_unpacked_query  = (uint8_t*)CNEXT(CMBT * max_len);
+                dev_mem->d_long_c_unpacked_target = (uint8_t*)CNEXT(CMBT * max_len);
+                dev_mem->d_long_c_packed_query    = (uint32_t*)CNEXT(CMBT * (max_len / 8) * sizeof(uint32_t));
+                dev_mem->d_long_c_packed_target   = (uint32_t*)CNEXT(CMBT * (max_len / 8) * sizeof(uint32_t));
+                dev_mem->d_long_c_query_offsets   = (uint32_t*)CNEXT(CMBT * sizeof(uint32_t));
+                dev_mem->d_long_c_target_offsets  = (uint32_t*)CNEXT(CMBT * sizeof(uint32_t));
+                dev_mem->d_long_c_query_lens      = (uint32_t*)CNEXT(CMBT * sizeof(uint32_t));
+                dev_mem->d_long_c_target_lens     = (uint32_t*)CNEXT(CMBT * sizeof(uint32_t));
+                dev_mem->d_long_c_flag            = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_bw              = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_cigar_buffer    = (uint32_t*)CNEXT(CMBT * cigar_len * sizeof(uint32_t));
+                dev_mem->d_long_c_cigar_lengths   = (int*)CNEXT(CMBT * sizeof(int));
+                dev_mem->d_long_c_compact_cigar   = (uint32_t*)CNEXT(CMBT * cigar_len * sizeof(uint32_t));
+                dev_mem->d_long_c_compact_offsets = (uint32_t*)CNEXT((CMBT + 1) * sizeof(uint32_t));
+                dev_mem->d_long_c_cub_tmp         = CNEXT(cub_sz);
+                dev_mem->d_long_c_cub_tmp_size    = cub_sz;
+                dev_mem->d_long_c_blen            = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_mlen            = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_n_ambi          = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_dp_max          = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_gpu_stats_valid = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_scores          = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_query_ends      = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_target_ends     = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_mqe             = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_mqe_t           = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_mte             = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_mte_q           = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_zdropped        = (int32_t*)CNEXT(CMBT * sizeof(int32_t));
+                dev_mem->d_long_c_device_res      = CNEXT(sizeof(uint64_t) * 12);
+                dev_mem->d_long_c_mat             = (int8_t*)CNEXT(25);
+                dev_mem->d_long_c_task_counter    = (int*)CNEXT(sizeof(int));
+                dev_mem->d_long_c_bt_off          = (int*)CNEXT(CSLT * max_antidiag * sizeof(int));
+                dev_mem->d_long_c_bt_off_end      = (int*)CNEXT(CSLT * max_antidiag * sizeof(int));
+                dev_mem->d_long_c_ksw_temp        = CNEXT(CSLT * ksw_sz);
+#undef CNEXT
+                dev_mem->d_long_c_bt_p       = base + off;
+                dev_mem->d_long_c_bt_p_avail = pool - off;
+                dev_mem->d_long_c_max_tasks  = CMBT;
+                dev_mem->d_long_c_n_slots    = CSLT;
+                PLOG_INFO(stderr, "[Info::LongC] Concurrent C context: fixed=%.2fGB "
+                          "bt_p=%.2fGB max_tasks=%zu slots=%zu\n",
+                          off / (1024.0*1024.0*1024.0),
+                          dev_mem->d_long_c_bt_p_avail / (1024.0*1024.0*1024.0),
+                          CMBT, CSLT);
+            } else {
+                PLOG_INFO(stderr, "[Info::LongC] Dedicated pool too small for concurrent C context "
+                          "(need %.2fGB + 256MB, have %.2fGB); C runs after Short.\n",
+                          fixed / (1024.0*1024.0*1024.0),
+                          dev_mem->long_bt_p_pool_bytes / (1024.0*1024.0*1024.0));
+            }
+        }
+    }
+
     // Compute long_batch_max here (outside the pinned-buffer block) so it is visible
     // to the print_info log below as well as the cudaMallocHost calls that follow.
     size_t long_batch_max = long_batch_size(arena_size, dev_mem->max_align_task_len);
@@ -751,6 +877,14 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
             cudaMallocHost(&dev_mem->h_align_unpacked_target, seq_staging);
         }
 
+        // Separate pinned staging for concurrent C H2D
+        // (h_align_unpacked_* can't be shared when C and Short H2D overlap)
+        {
+            size_t c_staging = (size_t)LONG_C_BATCH_MAX * dev_mem->max_align_task_len;
+            cudaMallocHost(&dev_mem->h_long_c_unpacked_query,  c_staging);
+            cudaMallocHost(&dev_mem->h_long_c_unpacked_target, c_staging);
+        }
+
     }
 
     cudaCheck();
@@ -794,6 +928,8 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFreeHost(dev_mem->h_align_bw);
     cudaFreeHost(dev_mem->h_align_unpacked_query);
     cudaFreeHost(dev_mem->h_align_unpacked_target);
+    cudaFreeHost(dev_mem->h_long_c_unpacked_query);
+    cudaFreeHost(dev_mem->h_long_c_unpacked_target);
     // BT anchor D2H staging buffers are per-batch cudaMallocHost (not pre-allocated).
     cudaCheck();
 }

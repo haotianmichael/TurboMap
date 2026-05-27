@@ -518,7 +518,14 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         cudaMalloc(&d_counter_C_conc, sizeof(int));
     }
 
-    bool c_concurrent = (dev_mem->d_long_c_unpacked_query != nullptr
+    // Small-batch fast path: skip CConc setup and λ slot calculation overhead.
+    // Each task gets its own slot (n_tasks << TOTAL_SLOTS), so λ would just be
+    // capped to nX anyway — computing it is wasted CPU work.
+    const int SMALL_BATCH_THRESHOLD = 500;
+    const bool is_small_batch = (n_tasks < SMALL_BATCH_THRESHOLD);
+
+    bool c_concurrent = (!is_small_batch
+                         && dev_mem->d_long_c_unpacked_query != nullptr
                          && nC_pre > 0
                          && nC_pre <= (int)dev_mem->d_long_c_max_tasks);
     int c_conc_done = 0;  // tracks how many C tasks processed concurrently
@@ -853,7 +860,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             // Slot allocation. Within each pool, minimize max(nX*strideX/sX) via
             //   sX = nX*strideX / λ,  λ = Σ(nX*strideX²) / pool_avail.
             int sA = 0, sB = 0, sC = 0;
-            if (two_pools) {
+            if (is_small_batch) {
+                // Fast path: n_tasks < SMALL_BATCH_THRESHOLD, so n{A,B,C} << TOTAL_SLOTS.
+                // Give each task its own slot — λ calculation would just be capped to nX.
+                sA = nA; sB = nB; sC = nC;
+            } else if (two_pools) {
                 // C alone in dedicated pool
                 sC = (int)((double)dedi_pool / (double)stride_C_max);
                 if (sC < 1) sC = 1;

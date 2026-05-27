@@ -2083,10 +2083,12 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     NVTX_PUSH("prepare_align_batch");
     gpu_align_batch_t *gpu_batch = gpu_align_batch_init(batch->count, batch->km);
 
+    NVTX_PUSH("prepare_align/pre_align");
     for (int iread = 0; iread < batch->count; iread++) {
         pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
                              batch->km, gpu_batch, iread);
     }
+    NVTX_POP(); // prepare_align/pre_align
 
     // Submit all GPU tasks and process results
     gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km, stream_id);
@@ -2148,10 +2150,12 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
         }
     }
 
+    NVTX_PUSH("prepare_align/post_align");
     for (int iread = 0; iread < batch->count; iread++) {
         post_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
                          		gpu_batch, batch->km, iread);
     }
+    NVTX_POP(); // prepare_align/post_align
 
 	// After Align
 	int pe_ori = s->p->opt->pe_ori;
@@ -2278,7 +2282,9 @@ static void worker_for(void *_data, long i_in, int tid) {
         }
         
         // Perform seeding
+        NVTX_PUSH("seed");
         mm_map_seed(s->p->mi, s->p->opt, &read, b, km);
+        NVTX_POP(); // seed
         
         if (mm_dbg_flag & MM_DBG_PRINT_QNAME) {
             fprintf(stderr, "SEED\t%s\t%d\t%d_anchors\n", read.seq.name, tid, read.n);
@@ -2437,7 +2443,9 @@ static void* drain_worker_fn(void *arg) {
                              bt_n, sid, slot->batch.km);
 
         slot->batch.count = bt_n;
+        NVTX_PUSH("copy_rep_frag");
         copy_rep_frag(s, &slot->batch);
+        NVTX_POP(); // copy_rep_frag
 
 #ifdef DEBUG_CHAIN_COMPARE
         /* Skip KSW alignment — free chain data and emit empty (unmapped) regs.
@@ -2730,7 +2738,9 @@ static void* gpu_batch_consumer(void *data) {
 
             // If this stream is still busy, wait for its drain to finish
             if (sl->busy) {
+                NVTX_PUSH("consumer/wait_drain");
                 WAIT_DRAIN(sl);
+                NVTX_POP(); // consumer/wait_drain
             }
 
             // Load-balance: when the queue is exhausted and idle streams remain,
@@ -2758,7 +2768,9 @@ static void* gpu_batch_consumer(void *data) {
                         cur_stream, acc_batch.count, acc_batch.total_n);
 
             // Launch chain on stream[cur_stream] (async)
+            NVTX_PUSH("consumer/launch_chain");
             int overflow = launch_chain_gpu(acc_batch.reads, acc_batch.count, cur_stream);
+            NVTX_POP(); // consumer/launch_chain
 
             int fit = acc_batch.count - overflow;
 
@@ -2814,11 +2826,13 @@ static void* gpu_batch_consumer(void *data) {
 
         // Step 3: Queue done and no pending reads, drain all busy streams
         if (queue_finished && acc_batch.count == 0) {
+            NVTX_PUSH("consumer/wait_drain_all");
             for (int i = 0; i < NUM_GPU_STREAMS; i++) {
                 if (slots[i].busy) {
                     WAIT_DRAIN(&slots[i]);
                 }
             }
+            NVTX_POP(); // consumer/wait_drain_all
             break;
         }
     }

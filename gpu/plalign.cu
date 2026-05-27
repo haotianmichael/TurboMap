@@ -389,6 +389,11 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     size_t short_task_max_len = dev_mem->short_task_max_len;
     size_t short_batch_size   = dev_mem->short_task_batch_size;
 
+    // Defined early so it can gate both the merge-short-into-long block below and
+    // the c_concurrent / slot-allocation fast paths later in this function.
+    const int  SMALL_BATCH_THRESHOLD = 500;
+    const bool is_small_batch        = (n_tasks < SMALL_BATCH_THRESHOLD);
+
     int *task_indices_short = (int*)malloc(n_tasks * sizeof(int));
     int *task_indices_long  = (int*)malloc(n_tasks * sizeof(int));
     int n_short_tasks = 0;
@@ -424,7 +429,9 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     // Small-batch fast path: merge short tasks into long so we skip the short-phase
     // kernel launch + arena transition entirely.  Short tasks fall into class A
     // (bt_stride < 5MB) and are handled correctly by the long kernel.
-    if (is_small_batch && n_short_tasks > 0) {
+    // Guard: only merge if the combined count stays within long-phase H2D capacity.
+    if (is_small_batch && n_short_tasks > 0 &&
+        (n_long_tasks + n_short_tasks) <= (int)dev_mem->long_task_batch_size) {
         for (int i = 0; i < n_short_tasks; i++)
             task_indices_long[n_long_tasks++] = task_indices_short[i];
         n_short_tasks = 0;
@@ -526,12 +533,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         cudaStreamCreate(&s_stream_C_conc);
         cudaMalloc(&d_counter_C_conc, sizeof(int));
     }
-
-    // Small-batch fast path: skip CConc setup and λ slot calculation overhead.
-    // Each task gets its own slot (n_tasks << TOTAL_SLOTS), so λ would just be
-    // capped to nX anyway — computing it is wasted CPU work.
-    const int SMALL_BATCH_THRESHOLD = 500;
-    const bool is_small_batch = (n_tasks < SMALL_BATCH_THRESHOLD);
 
     bool c_concurrent = (!is_small_batch
                          && dev_mem->d_long_c_unpacked_query != nullptr

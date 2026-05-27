@@ -928,7 +928,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             }
 
             if (!deferred_short_log.empty()) {
-                fprintf(stderr, "%s", deferred_short_log.c_str());
+                PLOG_INFO(stderr, "%s", deferred_short_log.c_str());
                 deferred_short_log.clear();
             }
             PLOG_INFO(stderr,

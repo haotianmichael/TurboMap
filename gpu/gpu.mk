@@ -4,10 +4,6 @@ CONFIG			+= $(if $(MAX_MICRO_BATCH),-DMICRO_BATCH=\($(MAX_MICRO_BATCH)\))
 # See gpu/pllog.h.  Default OFF.
 CONFIG			+= $(if $(PRINT),-DPRINT=1)
 
-# Enable shared-memory long-task kernel (V100 super-long bottleneck batches): make SHARED=1
-# See gpu/plksw_shared_kernel.cuh.  Default OFF (legacy global-mem kernel).
-CONFIG			+= $(if $(SHARED),-DUSE_SHARED_LONG_KERNEL=1)
-
 ###################################################
 ############  	CPU Compile 	###################
 ###################################################

@@ -822,14 +822,6 @@ void plmem_malloc_device_mem(deviceMemPtr *dev_mem, size_t anchor_per_batch,
     // Set up chain phase initially
     setup_chain_phase(dev_mem, anchor_per_batch, range_grid_size, num_cut);
 
-    // ---- Pre-allocate pinned host buffers for backtrack D2H ----
-    // Eliminates 4× cudaMallocHost/cudaFreeHost per chain batch (~4.65s on large batches).
-    dev_mem->h_bt_staging_cap = anchor_per_batch;
-    cudaMallocHost(&dev_mem->h_bt_ax_staging,   anchor_per_batch * sizeof(int32_t));
-    cudaMallocHost(&dev_mem->h_bt_ay_staging,   anchor_per_batch * sizeof(int32_t));
-    cudaMallocHost(&dev_mem->h_bt_xrev_staging, anchor_per_batch * sizeof(int32_t));
-    cudaMallocHost(&dev_mem->h_bt_yrev_staging, anchor_per_batch * sizeof(int32_t));
-
     // ---- Pre-allocate pinned host buffers for alignment D2H/H2D ----
     // These were previously allocated/freed inside every gpu_align_batch_execute call
     // (22× cudaMallocHost + 22× cudaFreeHost per batch = expensive mlock syscalls).
@@ -938,10 +930,7 @@ void plmem_free_device_mem(deviceMemPtr *dev_mem) {
     cudaFreeHost(dev_mem->h_align_unpacked_target);
     cudaFreeHost(dev_mem->h_long_c_unpacked_query);
     cudaFreeHost(dev_mem->h_long_c_unpacked_target);
-    if (dev_mem->h_bt_ax_staging)   { cudaFreeHost(dev_mem->h_bt_ax_staging);   dev_mem->h_bt_ax_staging   = nullptr; }
-    if (dev_mem->h_bt_ay_staging)   { cudaFreeHost(dev_mem->h_bt_ay_staging);   dev_mem->h_bt_ay_staging   = nullptr; }
-    if (dev_mem->h_bt_xrev_staging) { cudaFreeHost(dev_mem->h_bt_xrev_staging); dev_mem->h_bt_xrev_staging = nullptr; }
-    if (dev_mem->h_bt_yrev_staging) { cudaFreeHost(dev_mem->h_bt_yrev_staging); dev_mem->h_bt_yrev_staging = nullptr; }
+    // BT anchor D2H staging buffers are per-batch cudaMallocHost (not pre-allocated).
     cudaCheck();
 }
 

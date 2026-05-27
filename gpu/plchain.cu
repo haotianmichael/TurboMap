@@ -394,8 +394,12 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
     cudaStream_t stream   = sp->cudastream;
 
     /* Bulk D2H: copy all 4 compacted anchor arrays in one shot (4 transfers + 1 sync).
-     * Uses pre-allocated pinned staging buffers (sized to anchor_per_batch) to avoid
-     * 4× cudaMallocHost/cudaFreeHost per batch (~4.65s overhead on large batches). */
+     * Replaces n_read separate per-read D2H calls, each with its own non-pinned malloc
+     * and cudaStreamSynchronize (O(n_read) GPU stalls → O(1)).
+     *
+     * Buffers are allocated per-batch with cudaMallocHost (pinned → truly async D2H).
+     * Pre-allocating at d_bt_max_total_n would lock ~600 MB per stream (38M anchors ×
+     * 4 arrays × 4 bytes) — grossly wasteful.  Per-batch cost: 8 mlock/unlock total. */
     {
         int *h_offset = (int*)dev_mem->bt_h_offset;
         int *h_n_u    = (int*)dev_mem->bt_h_n_u;
@@ -411,18 +415,10 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
         if (compacted_total > 0) {
             int32_t *h_ax, *h_ay, *h_xrev, *h_yrev;
-            bool staging_ok = (compacted_total <= dev_mem->h_bt_staging_cap);
-            if (staging_ok) {
-                h_ax   = dev_mem->h_bt_ax_staging;
-                h_ay   = dev_mem->h_bt_ay_staging;
-                h_xrev = dev_mem->h_bt_xrev_staging;
-                h_yrev = dev_mem->h_bt_yrev_staging;
-            } else {
-                cudaMallocHost(&h_ax,   compacted_total * sizeof(int32_t));
-                cudaMallocHost(&h_ay,   compacted_total * sizeof(int32_t));
-                cudaMallocHost(&h_xrev, compacted_total * sizeof(int32_t));
-                cudaMallocHost(&h_yrev, compacted_total * sizeof(int32_t));
-            }
+            cudaMallocHost(&h_ax,   compacted_total * sizeof(int32_t));
+            cudaMallocHost(&h_ay,   compacted_total * sizeof(int32_t));
+            cudaMallocHost(&h_xrev, compacted_total * sizeof(int32_t));
+            cudaMallocHost(&h_yrev, compacted_total * sizeof(int32_t));
 
             cudaMemcpyAsync(h_ax,   dev_mem->d_bt_ax_out,   compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
             cudaMemcpyAsync(h_ay,   dev_mem->d_bt_ay_out,   compacted_total * sizeof(int32_t), cudaMemcpyDeviceToHost, stream);
@@ -448,12 +444,10 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
                 reads[i].a = new_a;
             }
 
-            if (!staging_ok) {
-                cudaFreeHost(h_ax);
-                cudaFreeHost(h_ay);
-                cudaFreeHost(h_xrev);
-                cudaFreeHost(h_yrev);
-            }
+            cudaFreeHost(h_ax);
+            cudaFreeHost(h_ay);
+            cudaFreeHost(h_xrev);
+            cudaFreeHost(h_yrev);
         }
     }
     plbacktrack_d2h_finish(dev_mem);

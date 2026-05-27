@@ -359,6 +359,7 @@ extern "C" void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                             uint8_t *seq_buffer, uint32_t *cigar_buffer, int stream_id) {
     if (n_tasks <= 0) return;
+    auto _t0 = std::chrono::steady_clock::now();
 
 #if USE_SHARED_LONG_KERNEL
     static bool s_shared_announced = false;
@@ -1204,7 +1205,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 cudaStreamSynchronize(align_stream);
                 auto t_end = std::chrono::steady_clock::now();
                 double ml_gpu_ms = std::chrono::duration<double>(t_end - t_start).count() * 1000.0;
-                s_ksw_wall_total_sec += ml_gpu_ms / 1000.0;
 
                 ml_kerr = cudaGetLastError();
                 if (ml_kerr != cudaSuccess)
@@ -1714,7 +1714,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cudaStreamSynchronize(align_stream);
             auto t_end = std::chrono::steady_clock::now();
             double wall_sec = std::chrono::duration<double>(t_end - t_start).count();
-            s_ksw_wall_total_sec += wall_sec;
             double gpu_ms = wall_sec * 1000.0;
 
             if (cigar_buffer) {
@@ -1954,8 +1953,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     }
     // ===== END Collect concurrent C results =====
 
-    PLOG_INFO(stderr, "[Info] Alignment complete: %d tasks in %d batches\n",
-            n_tasks, batch_num);
+    double _e2e_ms = std::chrono::duration<double>(std::chrono::steady_clock::now() - _t0).count() * 1000.0;
+    s_ksw_wall_total_sec += _e2e_ms / 1000.0;
+    PLOG_INFO(stderr, "[Info] Alignment complete: %d tasks in %d batches  %.1f ms\n",
+            n_tasks, batch_num, _e2e_ms);
 
     free(task_indices_short);
     free(task_indices_long);

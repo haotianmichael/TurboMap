@@ -11,6 +11,7 @@
 #include "bseq.h"
 #include "khash.h"
 #include "gpu/plalign.cuh"
+#include "gpu/plnvtx.h"
 #include "ksw2.h"
 
 // Exposed from align.c (made non-static) for post-GPU APPROX_MAX z-drop check
@@ -2079,6 +2080,7 @@ static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
 static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s, int stream_id)
 {
+    NVTX_PUSH("prepare_align_batch");
     gpu_align_batch_t *gpu_batch = gpu_align_batch_init(batch->count, batch->km);
 
     for (int iread = 0; iread < batch->count; iread++) {
@@ -2092,6 +2094,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     // Re-align z-drop split remainders (p==NULL) on the GPU: feed each back through
     // mm_align1_batched -> the same kernel and iterate to a fixpoint (a remainder may
     // split again). mm_test_zdrop and inversion stay on CPU.
+    NVTX_PUSH("realign_waves");
     {
         const int MAX_REALIGN_WAVES = 16; // each split shrinks the remainder; cap is a guard
         for (int wave = 0; wave < MAX_REALIGN_WAVES; ++wave) {
@@ -2120,6 +2123,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
                                          batch->km, stream_id);
         }
     }
+    NVTX_POP(); // realign_waves
 
     // Inversion alignment stays on CPU (mm_align1_inv uses ksw_ll_i16, a different DP);
     // run after the GPU re-align waves when every remainder is aligned.
@@ -2205,6 +2209,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     kfree(batch->km, gpu_batch->cigar_buffer);
     kfree(batch->km, gpu_batch->read_ctxs);
     kfree(batch->km, gpu_batch);
+    NVTX_POP(); // prepare_align_batch
 }
 
 static seeded_queue_t *g_seeded_queue = NULL;

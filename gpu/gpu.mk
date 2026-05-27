@@ -3,6 +3,9 @@ CONFIG			+= $(if $(MAX_MICRO_BATCH),-DMICRO_BATCH=\($(MAX_MICRO_BATCH)\))
 # Enable verbose [Info...] logging from plmem.cu / plalign.cu:  make PRINT=1
 # See gpu/pllog.h.  Default OFF.
 CONFIG			+= $(if $(PRINT),-DPRINT=1)
+# Enable NVTX range markers for nsys profiling: make NVTX=1
+CONFIG			+= $(if $(NVTX),-DNVTX_ENABLE)
+LDFLAGS			+= $(if $(NVTX),-lnvToolsExt)
 
 ###################################################
 ############  	CPU Compile 	###################

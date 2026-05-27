@@ -11,6 +11,7 @@
 #include "plscore.cuh"
 #include "plbacktrack.cuh"
 #include "plchain.h"
+#include "plnvtx.h"
 #include <utility>
 #include <algorithm>
 
@@ -199,6 +200,7 @@ int plchain_schedule_stream(const streamSetup_t stream_setup, const int batchid)
  */
 static int launch_chain_impl(chain_read_t *reads, int n_read,
                               stream_ptr_t *sp) {
+    NVTX_PUSH("launch_chain");
     deviceMemPtr *dev_mem = &sp->dev_mem;
     cudaStream_t cudastream = sp->cudastream;
 
@@ -263,6 +265,7 @@ static int launch_chain_impl(chain_read_t *reads, int n_read,
                 read_start, n_read - 1);
     }
     sp->busy = true;
+    NVTX_POP(); // launch_chain
     return overflow;
 }
 
@@ -272,11 +275,14 @@ static int launch_chain_impl(chain_read_t *reads, int n_read,
  *   After return, host_mems[] has final f[]/p[] with long-seg merged.
  */
 static void sync_chain_impl(stream_ptr_t *sp) {
+    NVTX_PUSH("sync_chain");
     deviceMemPtr *dev_mem = &sp->dev_mem;
     cudaStream_t cudastream = sp->cudastream;
 
     // Sync short+mid micro-batches
+    NVTX_PUSH("sync_chain/wait_short_mid");
     cudaStreamSynchronize(cudastream);
+    NVTX_POP();
 
     // Long-seg sort on CPU
     unsigned int num_long_seg;
@@ -303,9 +309,11 @@ static void sync_chain_impl(stream_ptr_t *sp) {
     free(map);
 
     // Launch long-seg kernel + D2H
+    NVTX_PUSH("sync_chain/long_kernel+d2h");
     plscore_async_long_forward_dp(&sp->dev_mem, &sp->cudastream);
     plmem_async_d2h_long_memcpy(sp);
     cudaStreamSynchronize(cudastream);
+    NVTX_POP();
 
     // Merge long segment results into host f[]/p[].
     // Use long_segs_buf_idx[k].start_idx as the actual offset into f_long/p_long
@@ -329,6 +337,7 @@ static void sync_chain_impl(stream_ptr_t *sp) {
         }
     }
 
+    NVTX_POP(); // sync_chain
 }
 
 /**
@@ -340,6 +349,7 @@ static void start_backtrack_impl(stream_ptr_t *sp,
                                   chain_read_t *reads,
                                   Misc misc, void *km,
                                   int *out_n_reads, size_t *out_total_n) {
+    NVTX_PUSH("start_backtrack");
     deviceMemPtr *dev_mem = &sp->dev_mem;
     cudaStream_t bt_stream = sp->cudastream;  // unified: all ops on one stream
     size_t combined_total_n = 0;
@@ -374,6 +384,7 @@ static void start_backtrack_impl(stream_ptr_t *sp,
 
     *out_n_reads = combined_n_reads;
     *out_total_n = combined_total_n;
+    NVTX_POP(); // start_backtrack
 }
 
 /**
@@ -390,6 +401,7 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
                                    stream_ptr_t *sp,
                                    chain_read_t *reads, int n_read,
                                    Misc misc, void *km) {
+    NVTX_PUSH("finish_backtrack");
     deviceMemPtr *dev_mem = &sp->dev_mem;
     cudaStream_t stream   = sp->cudastream;
 
@@ -454,15 +466,16 @@ static void finish_backtrack_impl(const mm_idx_t *mi, const mm_mapopt_t *opt,
 
     /* Post-chaining on host (long-read rescue via mg_lchain_dp(bw_long)
      * happens inside post_chaining_helper). */
+    NVTX_PUSH("finish_backtrack/post_chaining");
     for (int i = 0; i < n_read; i++)
         post_chaining_helper(mi, opt, &reads[i], misc, km);
+    NVTX_POP(); // post_chaining
 
-    // Free full anchor arrays saved for rescue (post_chaining_helper NULLs
-    // a_full if it consumed the array; free any that were not used).
     for (int i = 0; i < n_read; i++) {
         if (reads[i].a_full) { kfree(km, reads[i].a_full); reads[i].a_full = NULL; }
     }
 
+    NVTX_POP(); // finish_backtrack
     sp->busy = false;
 }
 

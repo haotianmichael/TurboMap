@@ -7,6 +7,7 @@
 #include "plksw_kernel.cuh"
 #include "plksw_shared_kernel.cuh"
 #include "pllog.h"
+#include "plnvtx.h"
 #include <cub/device/device_scan.cuh>
 #include <cerrno>
 #include <cstring>
@@ -356,6 +357,7 @@ extern "C" void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t
 void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, int n_tasks,
                             uint8_t *seq_buffer, uint32_t *cigar_buffer, int stream_id) {
     if (n_tasks <= 0) return;
+    NVTX_PUSH("gpu_align_batch_execute");
     auto _t0 = std::chrono::steady_clock::now();
 
     cudaSetDevice(0);
@@ -1873,4 +1875,5 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     free(task_indices_long);
 
     plmem_phase_to_chain(dev_mem);
+    NVTX_POP(); // gpu_align_batch_execute
 }

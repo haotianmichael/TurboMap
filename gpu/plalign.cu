@@ -421,6 +421,15 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             task_indices_long[n_long_tasks++] = i;
     }
 
+    // Small-batch fast path: merge short tasks into long so we skip the short-phase
+    // kernel launch + arena transition entirely.  Short tasks fall into class A
+    // (bt_stride < 5MB) and are handled correctly by the long kernel.
+    if (is_small_batch && n_short_tasks > 0) {
+        for (int i = 0; i < n_short_tasks; i++)
+            task_indices_long[n_long_tasks++] = task_indices_short[i];
+        n_short_tasks = 0;
+    }
+
     // Sort long tasks descending by estimated bt_stride = (qlen+tlen) × n_col.
     // Largest bt_stride first so per-batch dynamic sizing gives smallest batches to hardest tasks,
     // preventing one oversized task from collapsing pool_cap for an entire large batch.

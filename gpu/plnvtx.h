@@ -3,7 +3,7 @@
  * Compile with NVTX=1 to enable: make NVTX=1
  * Link flag -lnvToolsExt is added automatically by gpu.mk when NVTX=1. */
 #ifdef NVTX_ENABLE
-#include <nvToolsExt.h>
+#include <nvtx3/nvToolsExt.h>
 #define NVTX_PUSH(name)  nvtxRangePushA(name)
 #define NVTX_POP()       nvtxRangePop()
 #define NVTX_MARK(name)  nvtxMarkA(name)

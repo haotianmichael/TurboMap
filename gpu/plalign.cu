@@ -1,3 +1,4 @@
+#include "plnvtx.h"
 #include <algorithm>
 #include <chrono>
 #include <string>
@@ -7,7 +8,6 @@
 #include "plksw_kernel.cuh"
 #include "plksw_shared_kernel.cuh"
 #include "pllog.h"
-#include "plnvtx.h"
 #include <cub/device/device_scan.cuh>
 #include <cerrno>
 #include <cstring>

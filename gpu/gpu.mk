@@ -4,8 +4,8 @@ CONFIG			+= $(if $(MAX_MICRO_BATCH),-DMICRO_BATCH=\($(MAX_MICRO_BATCH)\))
 # See gpu/pllog.h.  Default OFF.
 CONFIG			+= $(if $(PRINT),-DPRINT=1)
 # Enable NVTX range markers for nsys profiling: make NVTX=1
+# nvtx3 is header-only (bundled with CUDA via CUB) — no link flag needed.
 CONFIG			+= $(if $(NVTX),-DNVTX_ENABLE)
-LDFLAGS			+= $(if $(NVTX),-lnvToolsExt)
 
 ###################################################
 ############  	CPU Compile 	###################

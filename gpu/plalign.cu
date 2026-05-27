@@ -26,9 +26,6 @@ static FILE *btdist_log_open(void) {
     return g_btdist_log;
 }
 
-#ifndef USE_SHARED_LONG_KERNEL
-#define USE_SHARED_LONG_KERNEL 0
-#endif
 
 static double s_ksw_wall_total_sec = 0.0;
 struct KswTimingPrinter {
@@ -360,14 +357,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                             uint8_t *seq_buffer, uint32_t *cigar_buffer, int stream_id) {
     if (n_tasks <= 0) return;
     auto _t0 = std::chrono::steady_clock::now();
-
-#if USE_SHARED_LONG_KERNEL
-    static bool s_shared_announced = false;
-    if (!s_shared_announced) {
-        s_shared_announced = true;
-        PLOG_INFO(stderr, "[Info] Shared-mem long kernel ENABLED (USE_SHARED_LONG_KERNEL=1)\n");
-    }
-#endif
 
     cudaSetDevice(0);
     gpu_align_copy_param();
@@ -1570,79 +1559,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             {
                 int parallel_threads = 32;
 
-#if USE_SHARED_LONG_KERNEL
-                /* Query device's per-block shared-mem opt-in cap once.
-                 * V100 (CC 7.0) = 96 KB; A100 (CC 8.0) = 163 KB. */
-                static int s_device_shared_cap = 0;
-                if (s_device_shared_cap == 0) {
-                    cudaDeviceGetAttribute(&s_device_shared_cap,
-                        cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
-                    if (s_device_shared_cap <= 0) s_device_shared_cap = 48 * 1024;
-                }
-                /* Shared-mem long kernel dispatch (long phase only).
-                 * Triggers when: phase==1, bt_p is the bottleneck (slots < 100),
-                 * and batch max_tlen fits a shared variant.
-                 * FULL  variant (6 deltas): needs 6*(max_tlen+1) ≤ shared cap.
-                 * PARTIAL variant (3 hottest): needs 3*(max_tlen+1) ≤ shared cap. */
-                int use_shared_variant = 0;
-                size_t shared_bytes_full    = (size_t)6 * (size_t)(batch_max_tlen + 1);
-                size_t shared_bytes_partial = (size_t)3 * (size_t)(batch_max_tlen + 1);
-                if (phase == 1 &&
-                    batch_max_tlen > 0 &&
-                    phase_concurrent_slots < 100) {
-                    if (shared_bytes_full <= (size_t)s_device_shared_cap)
-                        use_shared_variant = 1;
-                    else if (shared_bytes_partial <= (size_t)s_device_shared_cap)
-                        use_shared_variant = 2;
-                }
-                if (use_shared_variant > 0) {
-                    static bool s_shared_attr_set = false;
-                    if (!s_shared_attr_set) {
-                        cudaFuncSetAttribute(ksw_long_shared_kernel,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            s_device_shared_cap);
-                        cudaFuncSetAttribute(ksw_long_shared3_kernel,
-                            cudaFuncAttributeMaxDynamicSharedMemorySize,
-                            s_device_shared_cap);
-                        s_shared_attr_set = true;
-                    }
-                    if (use_shared_variant == 1) {
-                        ksw_long_shared_kernel<<<phase_concurrent_slots, parallel_threads,
-                                                 shared_bytes_full, align_stream>>>(
-                            d_task_counter,
-                            d_packed_query, d_packed_target,
-                            d_query_lens, d_target_lens,
-                            d_query_offsets, d_target_offsets,
-                            (gasal_res_t*)device_res, d_mat,
-                            d_bt_p_batch, d_bt_off_batch, d_bt_off_end_batch,
-                            (int)batch_max_backtrack_size, (int)batch_max_antidiag,
-                            d_ksw_temp_buffer, d_flag, d_bw,
-                            ksw_temp_per_task, batch_size, 5,
-                            opt->zdrop, opt->end_bonus,
-                            cigar_buffer ? d_cigar_buffer  : NULL,
-                            cigar_buffer ? d_cigar_lengths : NULL,
-                            (int)current_max_cigar_len,
-                            batch_max_tlen);
-                    } else {
-                        ksw_long_shared3_kernel<<<phase_concurrent_slots, parallel_threads,
-                                                  shared_bytes_partial, align_stream>>>(
-                            d_task_counter,
-                            d_packed_query, d_packed_target,
-                            d_query_lens, d_target_lens,
-                            d_query_offsets, d_target_offsets,
-                            (gasal_res_t*)device_res, d_mat,
-                            d_bt_p_batch, d_bt_off_batch, d_bt_off_end_batch,
-                            (int)batch_max_backtrack_size, (int)batch_max_antidiag,
-                            d_ksw_temp_buffer, d_flag, d_bw,
-                            ksw_temp_per_task, batch_size, 5,
-                            opt->zdrop, opt->end_bonus,
-                            cigar_buffer ? d_cigar_buffer  : NULL,
-                            cigar_buffer ? d_cigar_lengths : NULL,
-                            (int)current_max_cigar_len,
-                            batch_max_tlen);
-                    }
-                } else
-#endif
                 {
                     ksw_fused_persistent_kernel<<<phase_concurrent_slots, parallel_threads,
                                                   0, align_stream>>>(

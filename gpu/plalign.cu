@@ -1092,7 +1092,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 if (nB_b > 0) cudaMemsetAsync(d_counter_B, 0, sizeof(int), s_stream_B);
                 if (nC_b > 0) cudaMemsetAsync(d_counter_C, 0, sizeof(int), s_stream_C);
 
-                auto t_start = std::chrono::steady_clock::now();
                 const int par_threads = 32;
 
                 // Effective slot counts (capped to actual task count)
@@ -1203,9 +1202,6 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 }
 
                 cudaStreamSynchronize(align_stream);
-                auto t_end = std::chrono::steady_clock::now();
-                double ml_gpu_ms = std::chrono::duration<double>(t_end - t_start).count() * 1000.0;
-
                 ml_kerr = cudaGetLastError();
                 if (ml_kerr != cudaSuccess)
                     fprintf(stderr, "[ERROR] Multi-class kernel execution: %s\n",
@@ -1316,9 +1312,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 mc_map(idx_C, c_done, nC_b, nA_b + nB_b);
 
                 PLOG_INFO(stderr,
-                    "[Info::MLong %d]: A=%d B=%d C=%d  "
-                    "sA=%d sB=%d sC=%d  (gpu_ms=%.1f)\n",
-                    ml_batch_num, nA_b, nB_b, nC_b, sA_eff, sB_eff, sC_eff, ml_gpu_ms);
+                    "[Info::MLong %d]: A=%d B=%d C=%d  sA=%d sB=%d sC=%d\n",
+                    ml_batch_num, nA_b, nB_b, nC_b, sA_eff, sB_eff, sC_eff);
 
                 a_done += nA_b; b_done += nB_b; c_done += nC_b;
                 total_tasks_processed += batch_total;
@@ -1832,18 +1827,18 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             if (phase == 0) {
                 char tmp[256];
                 snprintf(tmp, sizeof(tmp),
-                        "[Info::Short %d]: %d tasks  slots=%d  bt_stride=%.2fMB  (gpu_ms=%.1f)\n",
+                        "[Info::Short %d]: %d tasks  slots=%d  bt_stride=%.2fMB\n",
                         phase_batch_num, batch_size, phase_concurrent_slots,
-                        batch_max_backtrack_size / (1024.0 * 1024.0), gpu_ms);
+                        batch_max_backtrack_size / (1024.0 * 1024.0));
                 deferred_short_log += tmp;
             } else {
                 if (!deferred_short_log.empty()) {
-                    fprintf(stderr, "%s", deferred_short_log.c_str());
+                    PLOG_INFO(stderr, "%s", deferred_short_log.c_str());
                     deferred_short_log.clear();
                 }
-                PLOG_INFO(stderr, "[Info::Long %d]: %d tasks  slots=%d  bt0=%.2fMB  (gpu_ms=%.1f)\n",
+                PLOG_INFO(stderr, "[Info::Long %d]: %d tasks  slots=%d  bt0=%.2fMB\n",
                         phase_batch_num, batch_size, phase_concurrent_slots,
-                        batch_max_backtrack_size / (1024.0 * 1024.0), gpu_ms);
+                        batch_max_backtrack_size / (1024.0 * 1024.0));
             }
         }
     }

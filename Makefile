@@ -57,7 +57,7 @@ endif
 .SUFFIXES:.c .o
 
 .c.o:
-		$(CC) -c $(CFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
+		$(CC) -c $(CFLAGS) $(CPPFLAGS) $(INCLUDES) $(CONFIG) $< -o $@
 
 all:$(PROG)
 

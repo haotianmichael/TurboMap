@@ -2091,9 +2091,6 @@ static void post_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
 // mm_gen_regs/mm_append_cigar) and survive batch reset on their own, so the
 // pool only has to avoid freeing them early.
 // ──────────────────────────────────────────────────────────────────────
-#ifndef R2_CARRY_FLUSH_THRESHOLD
-#define R2_CARRY_FLUSH_THRESHOLD 512   // flush once this many reads accumulate
-#endif
 
 typedef struct {
     chain_read_t     *reads;   // carried read metadata (seq, n_seg, qlens, rep_len, frag_gap)
@@ -2149,11 +2146,13 @@ static void r2_pool_carry(r2_carry_pool_t *pool, const chain_read_t *read_,
 }
 
 // Inversion (CPU) + post_align + result emit + qseq0 free, for one read.
-// gpu_batch->read_ctxs[iread] is the read's align context; reads[iread] its metadata.
-static void finalize_one_read_gpu(step_t *s, gpu_align_batch_t *gpu_batch,
-                                  chain_read_t *reads, int iread, void *km) {
+// ctx_idx indexes gpu_batch->read_ctxs[]; read_arr_idx indexes reads[].
+// They differ when pool reads (at offset 0) are combined with main-batch reads
+// (at offset n_pool) in the same gpu_batch.
+static void finalize_one_read_gpu(step_t *s, gpu_align_batch_t *gpu_batch, int ctx_idx,
+                                  chain_read_t *reads, int read_arr_idx, void *km) {
     const mm_mapopt_t *opt = s->p->opt;
-    read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
+    read_align_ctx_t *ctx = &gpu_batch->read_ctxs[ctx_idx];
 
     // Inversion alignment stays on CPU (mm_align1_inv uses ksw_ll_i16, a
     // different DP); only fires on split_inv regions left by a z-drop split.
@@ -2175,13 +2174,13 @@ static void finalize_one_read_gpu(step_t *s, gpu_align_batch_t *gpu_batch,
         }
     }
 
-    post_align_helper_gpu(s->p->mi, opt, &reads[iread], gpu_batch, km, iread);
+    post_align_helper_gpu(s->p->mi, opt, &reads[read_arr_idx], gpu_batch, km, ctx_idx);
 
     // Emit results into the step arrays + flip strand to the original frame.
     int pe_ori = opt->pe_ori;
-    int i   = reads[iread].seq.i;
+    int i   = reads[read_arr_idx].seq.i;
     int off = s->seg_off[i];
-    int j   = reads[iread].seq.seg_id;
+    int j   = reads[read_arr_idx].seq.seg_id;
     s->reg[off + j]   = ctx->regs0;
     s->n_reg[off + j] = ctx->n_regs;
     if (opt->flag & MM_F_INDEPEND_SEG) {
@@ -2191,21 +2190,21 @@ static void finalize_one_read_gpu(step_t *s, gpu_align_batch_t *gpu_batch,
             for (k = 0; k < s->n_reg[off + j]; ++k) {
                 mm_reg1_t *r = &s->reg[off + j][k];
                 t = r->qs;
-                r->qs = reads[iread].qlens[j] - r->qe;
-                r->qe = reads[iread].qlens[j] - t;
+                r->qs = reads[read_arr_idx].qlens[j] - r->qe;
+                r->qe = reads[read_arr_idx].qlens[j] - t;
                 r->rev = !r->rev;
             }
         }
     } else {
-        for (j = 0; j < reads[iread].n_seg; ++j) {
+        for (j = 0; j < reads[read_arr_idx].n_seg; ++j) {
             if (s->n_seg[i] == 2 && ((j == 0 && (pe_ori >> 1 & 1)) || (j == 1 && (pe_ori & 1)))) {
                 int k, t;
                 mm_revcomp_bseq(&s->seq[off + j]);
                 for (k = 0; k < s->n_reg[off + j]; ++k) {
                     mm_reg1_t *r = &s->reg[off + j][k];
                     t = r->qs;
-                    r->qs = reads[iread].qlens[j] - r->qe;
-                    r->qe = reads[iread].qlens[j] - t;
+                    r->qs = reads[read_arr_idx].qlens[j] - r->qe;
+                    r->qe = reads[read_arr_idx].qlens[j] - t;
                     r->rev = !r->rev;
                 }
             }
@@ -2215,9 +2214,10 @@ static void finalize_one_read_gpu(step_t *s, gpu_align_batch_t *gpu_batch,
     kfree(km, ctx->qseq0[0]);
 }
 
-// Re-align all carried r2 remainders together (one large GPU batch) and
-// finalize the reads.  Mirrors the per-batch realign-wave fixpoint, but over
-// the whole pool so the GPU sees a big batch instead of many tiny ones.
+// Re-align pool r2 remainders in one GPU pass and finalize.  Called only at
+// stream shutdown for reads that were not merged into a main batch.  A single
+// pass is sufficient: any further p==NULL after this pass fall through to the
+// mm_align1 backstop in post_align_helper_gpu.
 static void flush_r2_carry_pool(r2_carry_pool_t *pool, step_t *s, int stream_id) {
     if (pool->count == 0) return;
     NVTX_PUSH("r2_carry_flush");
@@ -2228,32 +2228,26 @@ static void flush_r2_carry_pool(r2_carry_pool_t *pool, step_t *s, int stream_id)
     for (int i = 0; i < n; i++)
         gpu_batch->read_ctxs[i] = pool->ctxs[i];
 
-    const int MAX_REALIGN_WAVES = 16; // each split shrinks the remainder; cap is a guard
-    for (int wave = 0; wave < MAX_REALIGN_WAVES; ++wave) {
-        gpu_batch->n_tasks = 0;
-        gpu_batch->seq_buffer_used = 0;
-        gpu_batch->cigar_buffer_used = 0;
-        for (int iread = 0; iread < n; iread++) {
-            read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
-            if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a)
-                continue;
-            for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
-                mm_reg1_t *reg = &ctx->regs0[ireg];
-                if (reg->cnt > 0 && reg->p == NULL) {
-                    mm_reg1_t r2_unused;
-                    memset(&r2_unused, 0, sizeof(mm_reg1_t));
-                    mm_align1_batched(gpu_batch, km, s->p->opt, s->p->mi,
-                                      ctx->qlen, ctx->qseq0, reg, &r2_unused,
-                                      ctx->n_a, ctx->a, iread, ireg);
-                }
+    for (int i = 0; i < n; i++) {
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[i];
+        if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a)
+            continue;
+        for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
+            mm_reg1_t *reg = &ctx->regs0[ireg];
+            if (reg->cnt > 0 && reg->p == NULL) {
+                mm_reg1_t r2_unused;
+                memset(&r2_unused, 0, sizeof(mm_reg1_t));
+                mm_align1_batched(gpu_batch, km, s->p->opt, s->p->mi,
+                                  ctx->qlen, ctx->qseq0, reg, &r2_unused,
+                                  ctx->n_a, ctx->a, i, ireg);
             }
         }
-        if (gpu_batch->n_tasks == 0) break;
-        gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, km, stream_id);
     }
+    if (gpu_batch->n_tasks > 0)
+        gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, km, stream_id);
 
-    for (int iread = 0; iread < n; iread++)
-        finalize_one_read_gpu(s, gpu_batch, pool->reads, iread, km);
+    for (int i = 0; i < n; i++)
+        finalize_one_read_gpu(s, gpu_batch, i, pool->reads, i, km);
 
     kfree(km, gpu_batch->tasks);
     kfree(km, gpu_batch->seq_buffer);
@@ -2268,27 +2262,56 @@ static void flush_r2_carry_pool(r2_carry_pool_t *pool, step_t *s, int stream_id)
 static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s, int stream_id, r2_carry_pool_t *pool)
 {
     NVTX_PUSH("prepare_align_batch");
-    gpu_align_batch_t *gpu_batch = gpu_align_batch_init(batch->count, batch->km);
 
+    int n_pool = pool->count;
+    int n_main = batch->count;
+    int n_total = n_pool + n_main;
+
+    // Allocate combined batch: pool reads at [0..n_pool-1], main reads at [n_pool..n_total-1].
+    // This merges the pool's pending r2 tasks with the current main batch into a single
+    // GPU launch, eliminating the separate small-batch flush and its fixed launch overhead.
+    gpu_align_batch_t *gpu_batch = gpu_align_batch_init(n_total, batch->km);
+
+    // ── Pool reads: copy ctxs and enqueue their p==NULL tasks ───────────
+    for (int pi = 0; pi < n_pool; pi++)
+        gpu_batch->read_ctxs[pi] = pool->ctxs[pi];
+
+    for (int pi = 0; pi < n_pool; pi++) {
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[pi];
+        if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a)
+            continue;
+        for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
+            mm_reg1_t *reg = &ctx->regs0[ireg];
+            if (reg->cnt > 0 && reg->p == NULL) {
+                mm_reg1_t r2_unused;
+                memset(&r2_unused, 0, sizeof(mm_reg1_t));
+                mm_align1_batched(gpu_batch, pool->km, s->p->opt, s->p->mi,
+                                  ctx->qlen, ctx->qseq0, reg, &r2_unused,
+                                  ctx->n_a, ctx->a, pi, ireg);
+            }
+        }
+    }
+
+    // ── Main batch reads: pre-align into [n_pool..n_total-1] ────────────
     NVTX_PUSH("prepare_align/pre_align");
-    for (int iread = 0; iread < batch->count; iread++) {
+    for (int iread = 0; iread < n_main; iread++) {
         pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
-                             batch->km, gpu_batch, iread);
+                             batch->km, gpu_batch, n_pool + iread);
     }
     NVTX_POP(); // prepare_align/pre_align
 
-    // Submit all GPU tasks and process results
+    // ── Single combined GPU submit ───────────────────────────────────────
     gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km, stream_id);
 
-    // ── Cross-batch r2 handling ──────────────────────────────────────────
-    // Reads whose z-drop split left a remainder (a region with cnt>0 but
-    // p==NULL) are deferred into the per-stream carry pool and re-aligned
-    // later in one large batch; every other read is finalized now.  This
-    // replaces the per-batch realign-wave loop, whose tiny task counts
-    // (z-drop is sparse) badly underutilize the GPU.
+    // ── Finalize pool reads (one pass only; backstop handles any residual p==NULL) ──
+    for (int pi = 0; pi < n_pool; pi++)
+        finalize_one_read_gpu(s, gpu_batch, pi, pool->reads, pi, pool->km);
+    r2_pool_reset(pool);
+
+    // ── Classify and finalize main reads ────────────────────────────────
     NVTX_PUSH("classify_finalize");
-    for (int iread = 0; iread < batch->count; iread++) {
-        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[iread];
+    for (int iread = 0; iread < n_main; iread++) {
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[n_pool + iread];
         int has_pending = 0;
         if (!(s->p->opt->flag & MM_F_SR) && ctx->qseq0[0] && ctx->a) {
             for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
@@ -2301,22 +2324,15 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
         if (has_pending)
             r2_pool_carry(pool, &batch->reads[iread], ctx);
         else
-            finalize_one_read_gpu(s, gpu_batch, batch->reads, iread, batch->km);
+            finalize_one_read_gpu(s, gpu_batch, n_pool + iread, batch->reads, iread, batch->km);
     }
     NVTX_POP(); // classify_finalize
 
-    // gpu_batch shell can go: carried reads keep their own deep copies, and
-    // regs0 / r->p are heap-owned (transferred to s->reg by finalize).
     kfree(batch->km, gpu_batch->tasks);
     kfree(batch->km, gpu_batch->seq_buffer);
     kfree(batch->km, gpu_batch->cigar_buffer);
     kfree(batch->km, gpu_batch->read_ctxs);
     kfree(batch->km, gpu_batch);
-
-    // Drain the pool once it is large enough to fill the GPU well; the
-    // remainder is flushed at stream shutdown (see drain_worker_fn).
-    if (pool->count >= R2_CARRY_FLUSH_THRESHOLD)
-        flush_r2_carry_pool(pool, s, stream_id);
 
     NVTX_POP(); // prepare_align_batch
 }

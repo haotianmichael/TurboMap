@@ -1381,7 +1381,8 @@ static int task_compare(const void *a, const void *b) {
 
 static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
                                        const mm_mapopt_t *opt,
-                                       const mm_idx_t *mi, void *km)
+                                       const mm_idx_t *mi, void *km,
+                                       const char *skip_reads)
 {
     if (gpu_batch->n_tasks == 0) return;
     qsort(gpu_batch->tasks, gpu_batch->n_tasks,
@@ -1403,6 +1404,10 @@ static void gpu_batch_process_results(gpu_align_batch_t *gpu_batch,
     
     for (int i = 0; i < gpu_batch->n_tasks; i++) {
         gpu_align_task_t *task = &gpu_batch->tasks[i];
+
+        if (skip_reads && task->read_idx >= 0 && task->read_idx < gpu_batch->n_reads
+                && skip_reads[task->read_idx])
+            continue;
 
 		//int has_valid_alignment = (task->n_cigar > 0 && task->max_q >= 0 && task->max_t >= 0);
 		int has_valid_alignment = (task->n_cigar > 0);
@@ -1796,8 +1801,15 @@ void mm_append_cigar(mm_reg1_t *r, uint32_t n_cigar, uint32_t *cigar);
 
 
 
-static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch_t *gpu_batch, const mm_idx_t *mi, void *km, int stream_id)
+// retry_reads_out: if non-NULL, defers retry to next batch instead of running a
+// second gpu_align_batch_execute immediately.  The caller receives a heap-allocated
+// char[n_reads] mask (1 = that read needs retry) via *retry_reads_out; it must
+// free() it.  When NULL (flush path), the old two-pass behavior is used.
+static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch_t *gpu_batch,
+                                          const mm_idx_t *mi, void *km, int stream_id,
+                                          char **retry_reads_out)
 {
+    if (retry_reads_out) *retry_reads_out = NULL;
     if (gpu_batch->n_tasks == 0) return;
 
     // First GPU pass: GAP_FILL tasks use KSW_EZ_APPROX_MAX (no zdrop in kernel).
@@ -1872,41 +1884,49 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
             }
         }
 
-        if (n_retry > 0) {
-            // Run second GPU pass.  Retry tasks share the same seq_buffer and
-            // cigar_buffer as the originals (same offsets): the GPU overwrites
-            // the first-pass CIGARs with second-pass CIGARs in place.
-            gpu_align_batch_execute(opt, retry_tasks, n_retry,
-                                   gpu_batch->seq_buffer, gpu_batch->cigar_buffer, stream_id);
+        char *skip_reads = NULL;
 
-            // Apply second-pass metadata back to the original task slots.
-            for (int k = 0; k < n_retry; k++) {
-                gpu_align_task_t *orig  = &gpu_batch->tasks[retry_orig_idx[k]];
-                gpu_align_task_t *retry = &retry_tasks[k];
-                // CIGAR data is already in orig->cigar_offset (overwritten in place).
-                orig->n_cigar    = retry->n_cigar;
-                orig->zdropped   = retry->zdropped;
-                orig->score      = retry->score;
-                orig->max_q      = retry->max_q;
-                orig->max_t      = retry->max_t;
-                orig->mqe        = retry->mqe;
-                orig->mqe_t      = retry->mqe_t;
-                orig->mte        = retry->mte;
-                orig->mte_q      = retry->mte_q;
-                orig->reach_end  = retry->reach_end;
-                // Propagate the effective zdrop so is_inv_zdrop detection works.
-                orig->zdrop      = retry->zdrop;
+        if (n_retry > 0) {
+            if (retry_reads_out) {
+                // Deferred retry path: mark the affected reads and hand the mask
+                // back to the caller; they will carry those reads to retry_pool
+                // and re-submit them as FULL DP in the next batch's combined launch.
+                skip_reads = (char*)calloc(gpu_batch->n_reads, 1);
+                for (int k = 0; k < n_retry; k++)
+                    skip_reads[retry_tasks[k].read_idx] = 1;
+                *retry_reads_out = skip_reads;
+            } else {
+                // Immediate retry path (flush): run second GPU pass in place.
+                // Retry tasks share seq_buffer/cigar_buffer; GPU overwrites CIGARs.
+                gpu_align_batch_execute(opt, retry_tasks, n_retry,
+                                       gpu_batch->seq_buffer, gpu_batch->cigar_buffer, stream_id);
+
+                for (int k = 0; k < n_retry; k++) {
+                    gpu_align_task_t *orig  = &gpu_batch->tasks[retry_orig_idx[k]];
+                    gpu_align_task_t *retry = &retry_tasks[k];
+                    orig->n_cigar    = retry->n_cigar;
+                    orig->zdropped   = retry->zdropped;
+                    orig->score      = retry->score;
+                    orig->max_q      = retry->max_q;
+                    orig->max_t      = retry->max_t;
+                    orig->mqe        = retry->mqe;
+                    orig->mqe_t      = retry->mqe_t;
+                    orig->mte        = retry->mte;
+                    orig->mte_q      = retry->mte_q;
+                    orig->reach_end  = retry->reach_end;
+                    orig->zdrop      = retry->zdrop;
+                }
             }
         }
 
         free(retry_tasks);
         free(retry_orig_idx);
-    }
 
-    // process_results sees finalized CIGARs (first-pass where no zdrop, second-pass
-    // where zdrop was detected).  APPROX_MAX has been cleared from all GAP_FILL
-    // tasks, so the mm_test_zdrop guard inside process_results never re-fires.
-    gpu_batch_process_results(gpu_batch, opt, mi, km);
+        // process_results sees finalized CIGARs.  skip_reads != NULL causes
+        // deferred-retry reads to be skipped; their regs0 stay in pre-alignment
+        // state so the retry_pool can re-submit all tasks in the next batch.
+        gpu_batch_process_results(gpu_batch, opt, mi, km, skip_reads);
+    }
 }
 
 static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,
@@ -2116,6 +2136,58 @@ static void r2_pool_destroy(r2_carry_pool_t *p) {
     p->reads = NULL; p->ctxs = NULL; p->count = 0; p->cap = 0; p->km = NULL;
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// Retry pool: carries reads whose GAP_FILL tasks triggered mm_test_zdrop
+// into the next batch, where they are re-submitted as FULL DP (APPROX_MAX
+// cleared) merged into the combined GPU launch — eliminating the separate
+// small second-pass execute and its fixed launch overhead (~200 ms/call).
+// ──────────────────────────────────────────────────────────────────────
+typedef struct {
+    chain_read_t     *reads;
+    read_align_ctx_t *ctxs;
+    int               count;
+    int               cap;
+    void             *km;
+} retry_pool_t;
+
+static void retry_pool_init(retry_pool_t *p) {
+    p->reads = NULL; p->ctxs = NULL; p->count = 0; p->cap = 0; p->km = km_init();
+}
+static void retry_pool_reset(retry_pool_t *p) {
+    km_destroy(p->km); p->km = km_init();
+    p->count = 0;
+}
+static void retry_pool_destroy(retry_pool_t *p) {
+    free(p->reads); free(p->ctxs);
+    if (p->km) km_destroy(p->km);
+    p->reads = NULL; p->ctxs = NULL; p->count = 0; p->cap = 0; p->km = NULL;
+}
+// Deep-copy is identical to r2_pool_carry: qseq0/a/qlens into pool->km.
+static void retry_pool_carry(retry_pool_t *pool, const chain_read_t *read_,
+                              const read_align_ctx_t *ctx) {
+    if (pool->count == pool->cap) {
+        pool->cap = pool->cap ? pool->cap * 2 : 256;
+        pool->reads = (chain_read_t*)realloc(pool->reads, (size_t)pool->cap * sizeof(chain_read_t));
+        pool->ctxs  = (read_align_ctx_t*)realloc(pool->ctxs, (size_t)pool->cap * sizeof(read_align_ctx_t));
+    }
+    chain_read_t     *dr = &pool->reads[pool->count];
+    read_align_ctx_t *dc = &pool->ctxs[pool->count];
+    *dr = *read_;
+    *dc = *ctx;
+    dr->qlens = (int*)kmalloc(pool->km, sizeof(int) * read_->n_seg);
+    memcpy(dr->qlens, read_->qlens, sizeof(int) * read_->n_seg);
+    dr->qseqs = NULL; dr->u = NULL; dr->mini_pos = NULL;
+    dr->a_full = NULL; dr->n_full = 0;
+    dc->a = (mm128_t*)kmalloc(pool->km, (size_t)ctx->n_a * sizeof(mm128_t));
+    memcpy(dc->a, ctx->a, (size_t)ctx->n_a * sizeof(mm128_t));
+    uint8_t *qbuf = (uint8_t*)kmalloc(pool->km, (size_t)ctx->qlen * 2);
+    memcpy(qbuf, ctx->qseq0[0], (size_t)ctx->qlen * 2);
+    dc->qseq0[0] = qbuf;
+    dc->qseq0[1] = qbuf + ctx->qlen;
+    dr->a = dc->a;
+    pool->count++;
+}
+
 // Deep-copy the minimal state needed to re-align and finalize one read later.
 static void r2_pool_carry(r2_carry_pool_t *pool, const chain_read_t *read_,
                           const read_align_ctx_t *ctx) {
@@ -2244,7 +2316,7 @@ static void flush_r2_carry_pool(r2_carry_pool_t *pool, step_t *s, int stream_id)
         }
     }
     if (gpu_batch->n_tasks > 0)
-        gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, km, stream_id);
+        gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, km, stream_id, NULL);
 
     for (int i = 0; i < n; i++)
         finalize_one_read_gpu(s, gpu_batch, i, pool->reads, i, km);
@@ -2259,74 +2331,164 @@ static void flush_r2_carry_pool(r2_carry_pool_t *pool, step_t *s, int stream_id)
     NVTX_POP(); // r2_carry_flush
 }
 
-static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s, int stream_id, r2_carry_pool_t *pool)
+// Flush any reads deferred in the retry pool.  Enqueues ALL their regions as
+// FULL DP (APPROX_MAX cleared) in a single GPU launch.  Called at shutdown only;
+// any further zdrop splits fall through to the post_align backstop.
+static void flush_retry_pool(retry_pool_t *pool, step_t *s, int stream_id) {
+    if (pool->count == 0) return;
+    NVTX_PUSH("retry_pool_flush");
+    int n = pool->count;
+    void *km = pool->km;
+
+    gpu_align_batch_t *gpu_batch = gpu_align_batch_init(n, km);
+    for (int i = 0; i < n; i++)
+        gpu_batch->read_ctxs[i] = pool->ctxs[i];
+
+    for (int i = 0; i < n; i++) {
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[i];
+        if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a) continue;
+        for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
+            mm_reg1_t *reg = &ctx->regs0[ireg];
+            if (reg->cnt > 0) {
+                mm_reg1_t r2_unused;
+                memset(&r2_unused, 0, sizeof(mm_reg1_t));
+                mm_align1_batched(gpu_batch, km, s->p->opt, s->p->mi,
+                                  ctx->qlen, ctx->qseq0, reg, &r2_unused,
+                                  ctx->n_a, ctx->a, i, ireg);
+            }
+        }
+    }
+    // Clear APPROX_MAX so these run as FULL DP — no second pass triggered.
+    for (int ti = 0; ti < gpu_batch->n_tasks; ti++)
+        gpu_batch->tasks[ti].flag &= ~KSW_EZ_APPROX_MAX;
+
+    if (gpu_batch->n_tasks > 0)
+        gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, km, stream_id, NULL);
+
+    for (int i = 0; i < n; i++)
+        finalize_one_read_gpu(s, gpu_batch, i, pool->reads, i, km);
+
+    kfree(km, gpu_batch->tasks);
+    kfree(km, gpu_batch->seq_buffer);
+    kfree(km, gpu_batch->cigar_buffer);
+    kfree(km, gpu_batch->read_ctxs);
+    kfree(km, gpu_batch);
+
+    retry_pool_reset(pool);
+    NVTX_POP(); // retry_pool_flush
+}
+
+// Combined GPU launch layout: [r2_pool | retry_pool | main]
+// r2_pool: z-drop remainder reads from previous batches (p==NULL regions only).
+// retry_pool: reads deferred from previous batch's mm_test_zdrop (FULL DP, no APPROX_MAX).
+// main: new reads from current batch (APPROX first pass).
+static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_t *s,
+                                     int stream_id, r2_carry_pool_t *r2_pool,
+                                     retry_pool_t *retry_pool)
 {
     NVTX_PUSH("prepare_align_batch");
 
-    int n_pool = pool->count;
-    int n_main = batch->count;
-    int n_total = n_pool + n_main;
+    int n_r2    = r2_pool->count;
+    int n_retry = retry_pool->count;
+    int n_main  = batch->count;
+    int n_total = n_r2 + n_retry + n_main;
 
-    // Allocate combined batch: pool reads at [0..n_pool-1], main reads at [n_pool..n_total-1].
-    // This merges the pool's pending r2 tasks with the current main batch into a single
-    // GPU launch, eliminating the separate small-batch flush and its fixed launch overhead.
     gpu_align_batch_t *gpu_batch = gpu_align_batch_init(n_total, batch->km);
 
-    // ── Pool reads: copy ctxs and enqueue their p==NULL tasks ───────────
-    for (int pi = 0; pi < n_pool; pi++)
-        gpu_batch->read_ctxs[pi] = pool->ctxs[pi];
-
-    for (int pi = 0; pi < n_pool; pi++) {
+    // ── r2_pool reads [0..n_r2-1]: enqueue p==NULL regions ─────────────
+    for (int pi = 0; pi < n_r2; pi++)
+        gpu_batch->read_ctxs[pi] = r2_pool->ctxs[pi];
+    for (int pi = 0; pi < n_r2; pi++) {
         read_align_ctx_t *ctx = &gpu_batch->read_ctxs[pi];
-        if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a)
-            continue;
+        if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a) continue;
         for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
             mm_reg1_t *reg = &ctx->regs0[ireg];
             if (reg->cnt > 0 && reg->p == NULL) {
                 mm_reg1_t r2_unused;
                 memset(&r2_unused, 0, sizeof(mm_reg1_t));
-                mm_align1_batched(gpu_batch, pool->km, s->p->opt, s->p->mi,
+                mm_align1_batched(gpu_batch, r2_pool->km, s->p->opt, s->p->mi,
                                   ctx->qlen, ctx->qseq0, reg, &r2_unused,
                                   ctx->n_a, ctx->a, pi, ireg);
             }
         }
     }
 
-    // ── Main batch reads: pre-align into [n_pool..n_total-1] ────────────
-    NVTX_PUSH("prepare_align/pre_align");
-    for (int iread = 0; iread < n_main; iread++) {
-        pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
-                             batch->km, gpu_batch, n_pool + iread);
+    // ── retry_pool reads [n_r2..n_r2+n_retry-1]: enqueue ALL regions FULL DP ──
+    for (int ri = 0; ri < n_retry; ri++)
+        gpu_batch->read_ctxs[n_r2 + ri] = retry_pool->ctxs[ri];
+    int retry_task_start = gpu_batch->n_tasks;
+    for (int ri = 0; ri < n_retry; ri++) {
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[n_r2 + ri];
+        if ((s->p->opt->flag & MM_F_SR) || !ctx->qseq0[0] || !ctx->a) continue;
+        for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
+            mm_reg1_t *reg = &ctx->regs0[ireg];
+            if (reg->cnt > 0) {
+                mm_reg1_t r2_unused;
+                memset(&r2_unused, 0, sizeof(mm_reg1_t));
+                mm_align1_batched(gpu_batch, retry_pool->km, s->p->opt, s->p->mi,
+                                  ctx->qlen, ctx->qseq0, reg, &r2_unused,
+                                  ctx->n_a, ctx->a, n_r2 + ri, ireg);
+            }
+        }
     }
+    // Clear APPROX_MAX so retry reads run as FULL DP — no second pass triggered.
+    for (int ti = retry_task_start; ti < gpu_batch->n_tasks; ti++)
+        gpu_batch->tasks[ti].flag &= ~KSW_EZ_APPROX_MAX;
+
+    // ── Main reads [n_r2+n_retry..n_total-1]: pre-align (APPROX first pass) ──
+    NVTX_PUSH("prepare_align/pre_align");
+    for (int iread = 0; iread < n_main; iread++)
+        pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
+                             batch->km, gpu_batch, n_r2 + n_retry + iread);
     NVTX_POP(); // prepare_align/pre_align
 
-    // ── Single combined GPU submit ───────────────────────────────────────
-    gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km, stream_id);
+    // ── Single combined GPU launch ───────────────────────────────────────
+    // retry_reads_out receives a heap-allocated char[n_total] mask for reads
+    // whose GAP_FILL triggered mm_test_zdrop; those reads are deferred to
+    // the NEXT batch's retry_pool instead of getting a separate GPU execute.
+    char *has_retry = NULL;
+    gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km,
+                                  stream_id, &has_retry);
 
-    // ── Finalize pool reads (one pass only; backstop handles any residual p==NULL) ──
-    for (int pi = 0; pi < n_pool; pi++)
-        finalize_one_read_gpu(s, gpu_batch, pi, pool->reads, pi, pool->km);
-    r2_pool_reset(pool);
+    // ── Finalize r2_pool reads ──────────────────────────────────────────
+    for (int pi = 0; pi < n_r2; pi++)
+        finalize_one_read_gpu(s, gpu_batch, pi, r2_pool->reads, pi, r2_pool->km);
+    r2_pool_reset(r2_pool);
+
+    // ── Finalize retry_pool reads (ran FULL DP; no further retry expected) ──
+    for (int ri = 0; ri < n_retry; ri++)
+        finalize_one_read_gpu(s, gpu_batch, n_r2 + ri, retry_pool->reads, ri, retry_pool->km);
+    retry_pool_reset(retry_pool);
 
     // ── Classify and finalize main reads ────────────────────────────────
     NVTX_PUSH("classify_finalize");
     for (int iread = 0; iread < n_main; iread++) {
-        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[n_pool + iread];
+        int gidx = n_r2 + n_retry + iread;
+        read_align_ctx_t *ctx = &gpu_batch->read_ctxs[gidx];
+
+        // Retry: carry to retry_pool; process_results already skipped this read.
+        if (has_retry && has_retry[gidx]) {
+            retry_pool_carry(retry_pool, &batch->reads[iread], ctx);
+            continue;
+        }
+
+        // r2 remainder: any region where zdrop split left p==NULL.
         int has_pending = 0;
         if (!(s->p->opt->flag & MM_F_SR) && ctx->qseq0[0] && ctx->a) {
             for (int ireg = 0; ireg < ctx->n_regs; ireg++) {
                 if (ctx->regs0[ireg].cnt > 0 && ctx->regs0[ireg].p == NULL) {
-                    has_pending = 1;
-                    break;
+                    has_pending = 1; break;
                 }
             }
         }
         if (has_pending)
-            r2_pool_carry(pool, &batch->reads[iread], ctx);
+            r2_pool_carry(r2_pool, &batch->reads[iread], ctx);
         else
-            finalize_one_read_gpu(s, gpu_batch, n_pool + iread, batch->reads, iread, batch->km);
+            finalize_one_read_gpu(s, gpu_batch, gidx, batch->reads, iread, batch->km);
     }
     NVTX_POP(); // classify_finalize
+
+    if (has_retry) free(has_retry);
 
     kfree(batch->km, gpu_batch->tasks);
     kfree(batch->km, gpu_batch->seq_buffer);
@@ -2504,7 +2666,8 @@ typedef struct {
     gpu_stream_slot_t *slot;
     int stream_id;
     mm_tbuf_t *wb;  // dedicated tbuf (avoids conflict with seeding threads)
-    r2_carry_pool_t r2_pool;  // per-stream cross-batch z-drop remainder pool
+    r2_carry_pool_t r2_pool;    // per-stream cross-batch z-drop remainder pool
+    retry_pool_t    retry_pool; // per-stream deferred mm_test_zdrop retry reads
 } drain_worker_ctx_t;
 
 // Helper: copy rep_len/frag_gap from batch reads back to step arrays
@@ -2547,6 +2710,7 @@ static void* drain_worker_fn(void *arg) {
             // this stream's pool.  Streams are idle here (consumer drained all
             // before signalling shutdown), so GPU ops on sid are safe; the join
             // that follows guarantees s->reg is written before output runs.
+            flush_retry_pool(&ctx->retry_pool, s, sid);
             flush_r2_carry_pool(&ctx->r2_pool, s, sid);
             break;
         }
@@ -2592,7 +2756,7 @@ static void* drain_worker_fn(void *arg) {
             dbg_r->a = NULL; dbg_r->u = NULL; dbg_r->mini_pos = NULL;
         }
 #else
-        prepare_align_batch_gpu(&slot->batch, wb, s, sid, &ctx->r2_pool);
+        prepare_align_batch_gpu(&slot->batch, wb, s, sid, &ctx->r2_pool, &ctx->retry_pool);
 #endif /* DEBUG_CHAIN_COMPARE */
 
         mm_trbuf_batch_reset(&slot->batch, slot->batch_max_reads, s->p->opt);
@@ -2785,6 +2949,7 @@ static void* gpu_batch_consumer(void *data) {
         worker_ctxs[i].stream_id = i;
         worker_ctxs[i].wb = mm_tbuf_init();  // dedicated tbuf per drain worker
         r2_pool_init(&worker_ctxs[i].r2_pool);
+        retry_pool_init(&worker_ctxs[i].retry_pool);
     }
 
     mm_batch_trbuf_t acc_batch;
@@ -2991,6 +3156,7 @@ static void* gpu_batch_consumer(void *data) {
         pthread_cond_destroy(&slots[i].cond_done);
         mm_tbuf_destroy(worker_ctxs[i].wb);
         r2_pool_destroy(&worker_ctxs[i].r2_pool);
+        retry_pool_destroy(&worker_ctxs[i].retry_pool);
     }
 
 #ifdef DEBUG_CHAIN_COMPARE

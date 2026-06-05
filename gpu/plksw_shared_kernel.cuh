@@ -1221,3 +1221,5 @@ __global__ void ksw_long_shared3_kernel(
 }
 
 #endif /* __PLKSW_SHARED_KERNEL_CUH__ */
+
+#include "ksw_double_buffer_kernel.cuh"

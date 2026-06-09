@@ -28,13 +28,29 @@ static FILE *btdist_log_open(void) {
 }
 
 
+// (1) Raw extension kernel wall time: sum of all gpu_align_batch_execute() calls
+//     (forward scan + traceback + CIGAR). This is the G3SA-comparable
+//     "no task-level scheduling" configuration.
 static double s_ksw_wall_total_sec = 0.0;
+// (2) Full-pipeline wall time: sum of all prepare_align_batch_gpu() calls, i.e.
+//     the complete three-level scheduler (task-level Z-drop split + batch-level
+//     + kernel-level). Accumulated from map.c via gpu_pipeline_timing_add().
+static double s_pipeline_wall_total_sec = 0.0;
 struct KswTimingPrinter {
     ~KswTimingPrinter() {
         if (s_ksw_wall_total_sec > 0.0)
-            fprintf(stderr, "\n[KSW timing] total wall time: %.3f ms\n", s_ksw_wall_total_sec * 1000.0);
+            fprintf(stderr, "\n[KSW timing] (1) raw extension kernel (no task-level scheduling, G3SA-comparable): %.3f ms\n",
+                    s_ksw_wall_total_sec * 1000.0);
+        if (s_pipeline_wall_total_sec > 0.0)
+            fprintf(stderr, "[KSW timing] (2) full pipeline (3-level scheduling, exact Z-drop split): %.3f ms\n",
+                    s_pipeline_wall_total_sec * 1000.0);
     }
 } s_ksw_timing_printer;
+
+// Accumulate full-pipeline (prepare_align_batch_gpu) wall time, called from map.c.
+extern "C" void gpu_pipeline_timing_add(double sec) {
+    s_pipeline_wall_total_sec += sec;
+}
 
 #define CHECKCUDAERROR(error) \
         do{\

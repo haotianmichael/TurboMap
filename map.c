@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
+#include <time.h>
 #include "kthread.h"
 #include "kvec.h"
 #include "kalloc.h"
@@ -1334,6 +1335,9 @@ extern void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
 extern void mm_append_cigar(mm_reg1_t *r, uint32_t n_cigar, uint32_t *cigar);
 extern void mm_update_extra(mm_reg1_t *r, const uint8_t *qseq, const uint8_t *tseq, const int8_t *mat, int8_t q, int8_t e, int is_eqx, int log_gap);
 extern void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi);
+// Accumulate full-pipeline (prepare_align_batch_gpu) wall time into the GPU-side
+// timing printer so config (1) raw-kernel and (2) full-pipeline totals print together.
+extern void gpu_pipeline_timing_add(double sec);
 
 static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
 {
@@ -2388,6 +2392,12 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
 {
     NVTX_PUSH("prepare_align_batch");
 
+    // (2) Full-pipeline timing: wall time of the entire three-level scheduler for
+    //     this batch (task-level Z-drop split + batch-level + kernel-level). This
+    //     includes the gpu_align_batch_execute() time already counted in (1).
+    struct timespec _pipe_t0;
+    clock_gettime(CLOCK_MONOTONIC, &_pipe_t0);
+
     int n_r2    = r2_pool->count;
     int n_retry = retry_pool->count;
     int n_main  = batch->count;
@@ -2495,6 +2505,11 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     kfree(batch->km, gpu_batch->cigar_buffer);
     kfree(batch->km, gpu_batch->read_ctxs);
     kfree(batch->km, gpu_batch);
+
+    struct timespec _pipe_t1;
+    clock_gettime(CLOCK_MONOTONIC, &_pipe_t1);
+    gpu_pipeline_timing_add((_pipe_t1.tv_sec  - _pipe_t0.tv_sec) +
+                            (_pipe_t1.tv_nsec - _pipe_t0.tv_nsec) / 1e9);
 
     NVTX_POP(); // prepare_align_batch
 }

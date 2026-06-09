@@ -43,50 +43,29 @@ static FILE *btdist_log_open(void) {
 
 
 // (1) Raw extension kernel wall time: sum of all gpu_align_batch_execute() calls
-//     (forward scan + traceback + CIGAR). This is the G3SA-comparable
-//     "no task-level scheduling" configuration.
+//     (forward scan + traceback + CIGAR). G3SA-comparable "no task-level
+//     scheduling" configuration.
 static double s_ksw_wall_total_sec = 0.0;
-// (2) Full-pipeline wall time: sum of all prepare_align_batch_gpu() calls, i.e.
-//     the complete three-level scheduler (task-level Z-drop split + batch-level
-//     + kernel-level). Accumulated from map.c via gpu_pipeline_timing_add().
+// (2) Full-alignment pipeline wall time: sum of all gpu_batch_submit_and_process()
+//     calls — GPU kernel execution + exact Z-drop split handling (CPU mm_test_zdrop
+//     + second-pass retry) + result processing.  Excludes the single-threaded host
+//     task assembly (pre_align) and stats finalization (post_align), which are
+//     parallelizable and not part of the scheduling being evaluated.
 static double s_pipeline_wall_total_sec = 0.0;
-// Per-phase breakdown of (2) so we can see where the time actually goes.
-// 0=init(alloc) 1=enqueue+pre_align 2=submit(GPU+CPU zdrop) 3=finalize 4=free
-static double s_pipe_phase_sec[5] = {0,0,0,0,0};
-static long   s_pipe_calls        = 0;
-static const char *s_pipe_phase_name[5] = {
-    "init (gpu_align_batch_init alloc/zero)",
-    "enqueue + pre_align (mm_align1_batched, getseq)",
-    "submit_and_process (GPU exec + CPU mm_test_zdrop)",
-    "finalize (post_align, mm_update_extra)",
-    "free (kfree batch buffers)"
-};
 struct KswTimingPrinter {
     ~KswTimingPrinter() {
         if (s_ksw_wall_total_sec > 0.0)
             fprintf(stderr, "\n[KSW timing] (1) raw extension kernel (no task-level scheduling, G3SA-comparable): %.3f ms\n",
                     s_ksw_wall_total_sec * 1000.0);
-        if (s_pipeline_wall_total_sec > 0.0) {
-            fprintf(stderr, "[KSW timing] (2) full pipeline (3-level scheduling, exact Z-drop split): %.3f ms"
-                            "  [summed over %ld calls across all stream threads]\n",
-                    s_pipeline_wall_total_sec * 1000.0, s_pipe_calls);
-            for (int p = 0; p < 5; p++)
-                fprintf(stderr, "[KSW timing]     phase %d %-48s %12.3f ms (%5.1f%%)\n",
-                        p, s_pipe_phase_name[p], s_pipe_phase_sec[p] * 1000.0,
-                        s_pipeline_wall_total_sec > 0.0 ?
-                            100.0 * s_pipe_phase_sec[p] / s_pipeline_wall_total_sec : 0.0);
-        }
+        if (s_pipeline_wall_total_sec > 0.0)
+            fprintf(stderr, "[KSW timing] (2) full pipeline (GPU exec + exact Z-drop split handling): %.3f ms\n",
+                    s_pipeline_wall_total_sec * 1000.0);
     }
 } s_ksw_timing_printer;
 
-// Accumulate full-pipeline (prepare_align_batch_gpu) wall time, called from map.c.
+// Accumulate full-alignment (gpu_batch_submit_and_process) wall time, called from map.c.
 extern "C" void gpu_pipeline_timing_add(double sec) {
     s_pipeline_wall_total_sec += sec;
-    s_pipe_calls++;
-}
-// Accumulate one phase's wall time within prepare_align_batch_gpu.
-extern "C" void gpu_pipeline_phase_add(int phase, double sec) {
-    if (phase >= 0 && phase < 5) s_pipe_phase_sec[phase] += sec;
 }
 
 #define CHECKCUDAERROR(error) \

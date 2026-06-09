@@ -6,11 +6,25 @@
 #include "gasal_kernels.h"
 #include "plmem.cuh"
 #include "plksw_kernel.cuh"
-#include "plksw_shared_kernel.cuh"
+#ifdef SHARED
+// cp.async double-buffered long-task kernel (opt-in: make SHARED=1).
+#include "ksw_double_buffer_kernel.cuh"
+#endif
 #include "pllog.h"
 #include <cub/device/device_scan.cuh>
 #include <cerrno>
 #include <cstring>
+
+// Long-task kernel selection.  Default: the legacy ksw_fused_persistent_kernel
+// (no dynamic shared memory).  With -DSHARED: the cp.async double-buffer kernel,
+// which needs 2*6*512 bytes of dynamic shared memory per block.
+#ifdef SHARED
+  #define KSW_LONG_KERNEL ksw_double_buffer_kernel
+  #define KSW_LONG_SMEM   (2*6*512)
+#else
+  #define KSW_LONG_KERNEL ksw_fused_persistent_kernel
+  #define KSW_LONG_SMEM   0
+#endif
 
 // Log file for long-task bt_stride distribution (diagnostic).
 // Opened on first batch, appended thereafter, never explicitly closed
@@ -720,7 +734,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
         // Reset counter and launch C kernel
         cudaMemsetAsync(d_counter_C_conc, 0, sizeof(int), s_stream_C_conc);
-        ksw_double_buffer_kernel<<<sC_conc, 32, 2*6*512, s_stream_C_conc>>>(
+        KSW_LONG_KERNEL<<<sC_conc, 32, KSW_LONG_SMEM, s_stream_C_conc>>>(
             d_counter_C_conc,
             dev_mem->d_long_c_packed_query, dev_mem->d_long_c_packed_target,
             dev_mem->d_long_c_query_lens, dev_mem->d_long_c_target_lens,
@@ -1112,7 +1126,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 // Launch class A on align_stream (task_id_base = 0)
                 if (nA_b > 0) {
 
-                    ksw_double_buffer_kernel<<<sA_eff, par_threads, 2*6*512, align_stream>>>(
+                    KSW_LONG_KERNEL<<<sA_eff, par_threads, KSW_LONG_SMEM, align_stream>>>(
                         d_task_counter,
                         d_packed_query, d_packed_target,
                         d_query_lens, d_target_lens,
@@ -1132,7 +1146,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
                 // Launch class B on s_stream_B (task_id_base = nA_b)
                 if (nB_b > 0) {
-                    ksw_double_buffer_kernel<<<sB_eff, par_threads, 2*6*512, s_stream_B>>>(
+                    KSW_LONG_KERNEL<<<sB_eff, par_threads, KSW_LONG_SMEM, s_stream_B>>>(
                         d_counter_B,
                         d_packed_query, d_packed_target,
                         d_query_lens  + nA_b, d_target_lens  + nA_b,
@@ -1152,7 +1166,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
                 // Launch class C on s_stream_C (task_id_base = nA_b + nB_b)
                 if (nC_b > 0) {
-                    ksw_double_buffer_kernel<<<sC_eff, par_threads, 2*6*512, s_stream_C>>>(
+                    KSW_LONG_KERNEL<<<sC_eff, par_threads, KSW_LONG_SMEM, s_stream_C>>>(
                         d_counter_C,
                         d_packed_query, d_packed_target,
                         d_query_lens   + nA_b + nB_b, d_target_lens   + nA_b + nB_b,
@@ -1579,8 +1593,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 int parallel_threads = 32;
 
                 {
-                    ksw_double_buffer_kernel<<<phase_concurrent_slots, parallel_threads,
-                                                  2*6*512, align_stream>>>(
+                    KSW_LONG_KERNEL<<<phase_concurrent_slots, parallel_threads,
+                                                  KSW_LONG_SMEM, align_stream>>>(
                         d_task_counter,
                         d_packed_query,
                         d_packed_target,

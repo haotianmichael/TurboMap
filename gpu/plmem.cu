@@ -160,9 +160,13 @@ static size_t compute_long_batch_size(size_t arena_bytes, size_t max_len) {
 
     // per_slot_var: ksw_temp + bt_off_long × 2 (per concurrent slot)
     size_t h_arr  = max_len * sizeof(int32_t);
-    //size_t sk_arr = (max_len + 1) * 6 * sizeof(int8_t);
+#ifdef SHARED
+    // Double-buffer kernel needs each delta sub-array 4-byte aligned for cp.async.
     size_t delta_stride = ((max_len + 1) + 3) & ~(size_t)3;
     size_t sk_arr       = delta_stride * 6 * sizeof(int8_t);
+#else
+    size_t sk_arr = (max_len + 1) * 6 * sizeof(int8_t);
+#endif
     size_t sq_arr = max_len * 2 * sizeof(uint8_t);
     size_t ksw_temp = ((h_arr + sk_arr + sq_arr) + 7) & ~(size_t)7;
     size_t per_slot_var = ksw_temp + 2 * max_antidiag * sizeof(int);
@@ -313,9 +317,13 @@ static void setup_long_align_phase(deviceMemPtr *dev_mem) {
 
     // ---- Per-task KSW temp size (arithmetic only; arena alloc deferred below) ----
     size_t h_arr  = max_len * sizeof(int32_t);
-    //size_t sk_arr = (max_len + 1) * 6 * sizeof(int8_t);
+#ifdef SHARED
+    // Double-buffer kernel needs each delta sub-array 4-byte aligned for cp.async.
     size_t delta_stride = ((max_len + 1) + 3) & ~(size_t)3;
     size_t sk_arr       = delta_stride * 6 * sizeof(int8_t);
+#else
+    size_t sk_arr = (max_len + 1) * 6 * sizeof(int8_t);
+#endif
     size_t sq_arr = max_len * 2 * sizeof(uint8_t);
     dev_mem->align_ksw_temp_per_task = ((h_arr + sk_arr + sq_arr) + 7) & ~7ULL;
 
@@ -447,9 +455,13 @@ static void setup_align_phase(deviceMemPtr *dev_mem) {
     // Layout: H[tlen]*int32 (max tracking) + u/v/x/y/x2/y2[(tlen+1)]*int8 + qr + target (uint8)
     size_t max_len = dev_mem->max_align_task_len;
     size_t h_array_size = max_len * sizeof(int32_t);                 // H for max tracking
-    //size_t sk_arrays_size = (max_len + 1) * 6 * sizeof(int8_t);     // u,v,x,y,x2,y2
+#ifdef SHARED
+    // Double-buffer kernel needs each delta sub-array 4-byte aligned for cp.async.
     size_t delta_stride   = ((max_len + 1) + 3) & ~(size_t)3;
     size_t sk_arrays_size = delta_stride * 6 * sizeof(int8_t);
+#else
+    size_t sk_arrays_size = (max_len + 1) * 6 * sizeof(int8_t);     // u,v,x,y,x2,y2
+#endif
     size_t seq_size = max_len * 2 * sizeof(uint8_t);                 // qr + target
     size_t raw_size = h_array_size + sk_arrays_size + seq_size;
     dev_mem->align_ksw_temp_per_task = (raw_size + 7) & ~7ULL;

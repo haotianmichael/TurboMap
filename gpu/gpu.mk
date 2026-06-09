@@ -6,6 +6,9 @@ CONFIG			+= $(if $(PRINT),-DPRINT=1)
 # Enable NVTX range markers for nsys profiling: make NVTX=1
 # nvtx3 is header-only (bundled with CUDA via CUB) — no link flag needed.
 CONFIG			+= $(if $(NVTX),-DNVTX_ENABLE)
+# Use the cp.async double-buffered long-task kernel (ksw_double_buffer_kernel):
+# make SHARED=1.  Default OFF → legacy ksw_fused_persistent_kernel.
+CONFIG			+= $(if $(SHARED),-DSHARED)
 
 ###################################################
 ############  	CPU Compile 	###################

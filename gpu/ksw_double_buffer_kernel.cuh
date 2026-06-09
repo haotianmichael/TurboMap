@@ -28,9 +28,12 @@
  *
  * Launch: <<<n_slots, 32, 2*6*(WINDOW_SIZE+4), stream>>>
  *
- * plmem.cu change: same as v2 (delta_stride padded to 4 bytes, 3 places).
+ * plmem.cu change: same as v2 (delta_stride padded to 4 bytes, 3 places),
+ * gated under -DSHARED.
  *
- * Append to plksw_shared_kernel.cuh.
+ * Selected at build time with `make SHARED=1` (see gpu/gpu.mk).  Included by
+ * plalign.cu only when SHARED is defined; the default build uses the legacy
+ * ksw_fused_persistent_kernel instead.
  */
 
 #ifndef __PLKSW_DOUBLE_BUFFER_KERNEL_V3_CUH__
@@ -41,6 +44,34 @@
 #include <cuda/barrier>
 
 namespace cg = cooperative_groups;
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Device helpers (relocated from the now-deleted plksw_shared_kernel.cuh, the
+ * only other consumer of which was this kernel).  KSW_CIGAR_* / KSW_EZ_* macros
+ * come from plksw_kernel.cuh, which plalign.cu includes before this file.
+ * ────────────────────────────────────────────────────────────────────────── */
+__device__ static inline uint32_t* sh_push_cigar(
+    int *n_cigar, int max_cigar_len,
+    uint32_t *cigar, uint32_t op, int len)
+{
+    if (op > 3) op = 0;
+    if (len <= 0) return cigar;
+    if (*n_cigar == 0 || op != (cigar[(*n_cigar) - 1] & 0xf)) {
+        if (*n_cigar < max_cigar_len)
+            cigar[(*n_cigar)++] = (len << 4) | op;
+    } else {
+        cigar[(*n_cigar) - 1] += len << 4;
+    }
+    return cigar;
+}
+
+__device__ __forceinline__ int8_t sh_dp_score(
+    uint8_t a, uint8_t b, const int8_t *mat, int m, int8_t sc_N)
+{
+    // Mirror CPU ksw2_extd2_sse: an ambiguous base (value m-1, i.e. 'N') scores sc_N
+    // (= mat[m*m-1]==0 ? -e2 : mat[m*m-1]); every other pair uses the matrix.
+    return (a >= (uint8_t)(m - 1) || b >= (uint8_t)(m - 1)) ? sc_N : mat[a * m + b];
+}
 
 template<int WINDOW_SIZE = 512>
 __global__

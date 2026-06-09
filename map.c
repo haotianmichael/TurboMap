@@ -1338,6 +1338,10 @@ extern void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc
 // Accumulate full-pipeline (prepare_align_batch_gpu) wall time into the GPU-side
 // timing printer so config (1) raw-kernel and (2) full-pipeline totals print together.
 extern void gpu_pipeline_timing_add(double sec);
+extern void gpu_pipeline_phase_add(int phase, double sec);
+static inline double pipe_elapsed(struct timespec a, struct timespec b) {
+    return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+}
 
 static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
 {
@@ -2395,8 +2399,9 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     // (2) Full-pipeline timing: wall time of the entire three-level scheduler for
     //     this batch (task-level Z-drop split + batch-level + kernel-level). This
     //     includes the gpu_align_batch_execute() time already counted in (1).
-    struct timespec _pipe_t0;
+    struct timespec _pipe_t0, _ta, _tb;
     clock_gettime(CLOCK_MONOTONIC, &_pipe_t0);
+    _ta = _pipe_t0;
 
     int n_r2    = r2_pool->count;
     int n_retry = retry_pool->count;
@@ -2404,6 +2409,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     int n_total = n_r2 + n_retry + n_main;
 
     gpu_align_batch_t *gpu_batch = gpu_align_batch_init(n_total, batch->km);
+    clock_gettime(CLOCK_MONOTONIC, &_tb); gpu_pipeline_phase_add(0, pipe_elapsed(_ta, _tb)); _ta = _tb;
 
     // ── r2_pool reads [0..n_r2-1]: enqueue p==NULL regions ─────────────
     for (int pi = 0; pi < n_r2; pi++)
@@ -2451,6 +2457,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
         pre_align_helper_gpu(s->p->mi, s->p->opt, &batch->reads[iread],
                              batch->km, gpu_batch, n_r2 + n_retry + iread);
     NVTX_POP(); // prepare_align/pre_align
+    clock_gettime(CLOCK_MONOTONIC, &_tb); gpu_pipeline_phase_add(1, pipe_elapsed(_ta, _tb)); _ta = _tb;
 
     // ── Single combined GPU launch ───────────────────────────────────────
     // retry_reads_out receives a heap-allocated char[n_total] mask for reads
@@ -2459,6 +2466,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
     char *has_retry = NULL;
     gpu_batch_submit_and_process(s->p->opt, gpu_batch, s->p->mi, batch->km,
                                   stream_id, &has_retry);
+    clock_gettime(CLOCK_MONOTONIC, &_tb); gpu_pipeline_phase_add(2, pipe_elapsed(_ta, _tb)); _ta = _tb;
 
     // ── Finalize r2_pool reads ──────────────────────────────────────────
     for (int pi = 0; pi < n_r2; pi++)
@@ -2497,6 +2505,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
             finalize_one_read_gpu(s, gpu_batch, gidx, batch->reads, iread, batch->km);
     }
     NVTX_POP(); // classify_finalize
+    clock_gettime(CLOCK_MONOTONIC, &_tb); gpu_pipeline_phase_add(3, pipe_elapsed(_ta, _tb)); _ta = _tb;
 
     if (has_retry) free(has_retry);
 
@@ -2508,6 +2517,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
 
     struct timespec _pipe_t1;
     clock_gettime(CLOCK_MONOTONIC, &_pipe_t1);
+    gpu_pipeline_phase_add(4, pipe_elapsed(_ta, _pipe_t1));
     gpu_pipeline_timing_add((_pipe_t1.tv_sec  - _pipe_t0.tv_sec) +
                             (_pipe_t1.tv_nsec - _pipe_t0.tv_nsec) / 1e9);
 

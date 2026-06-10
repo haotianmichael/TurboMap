@@ -141,6 +141,114 @@ def parse_sam(path):
     return primaries
 
 
+# ─── SV-sensitive accuracy (z-drop split / supplementary signals) ───────────
+# The VC-usable metric above is deliberately SV-insensitive (primaries only,
+# CIGAR ignored). z-drop split changes exactly the things it skips: split-read
+# (supplementary) records and large CIGAR indels at SV sites. These metrics use
+# CPU/minimap2 as truth and measure how many of those SV signals the GPU keeps,
+# restricted to the reads that actually carry them — so full (z-drop on) and raw
+# (z-drop off) separate clearly instead of averaging to ~99%.
+SV_INDEL_MIN = 50      # bp: a CIGAR I/D >= this is an SV-scale event
+SV_POS_TOL   = 100     # bp: ref-position tolerance when matching an event
+SV_LEN_FRAC  = 0.30    # event length must match within this fraction
+
+
+def parse_all_mapped(path):
+    """All mapped primary+supplementary records (skip unmapped + secondary)."""
+    recs = []
+    with open(path) as f:
+        for line in f:
+            if not line or line[0] == '@':
+                continue
+            ff = line.rstrip('\n').split('\t')
+            if len(ff) < 11:
+                continue
+            flag = int(ff[1])
+            if flag & 0x4:      # unmapped
+                continue
+            if flag & 0x100:    # secondary (multi-mapper, not a split part)
+                continue
+            recs.append((ff[0], flag, ff[2], int(ff[3]), ff[5]))
+    return recs
+
+
+def sv_indel_events(recs):
+    """(qname, rname, ref_pos, op, length) for every I/D >= SV_INDEL_MIN."""
+    ev = []
+    for qname, flag, rname, pos, cigar in recs:
+        ref = pos
+        for n, op in parse_cigar(cigar):
+            if op in REF_OPS:
+                if op == 'D' and n >= SV_INDEL_MIN:
+                    ev.append((qname, rname, ref, 'D', n))
+                ref += n
+            elif op == 'I' and n >= SV_INDEL_MIN:
+                ev.append((qname, rname, ref, 'I', n))
+    return ev
+
+
+def supplementary_reads(recs):
+    """Set of read names that have at least one supplementary (0x800) record."""
+    return set(q for q, flag, _r, _p, _c in recs if flag & 0x800)
+
+
+def event_recall(ref_events, qry_events):
+    """How many ref_events have a matching qry_event (same read/chrom/op,
+    position within SV_POS_TOL, length within SV_LEN_FRAC)."""
+    by_read = defaultdict(list)
+    for e in qry_events:
+        by_read[e[0]].append(e)
+    matched = 0
+    for (qn, rn, pos, op, ln) in ref_events:
+        for (_gqn, grn, gpos, gop, gln) in by_read.get(qn, ()):
+            if (grn == rn and gop == op and abs(gpos - pos) <= SV_POS_TOL
+                    and abs(gln - ln) <= SV_LEN_FRAC * ln):
+                matched += 1
+                break
+    return matched
+
+
+def sv_report(cpu_path, gpu_path):
+    cpu_recs = parse_all_mapped(cpu_path)
+    gpu_recs = parse_all_mapped(gpu_path)
+    cpu_ev,  gpu_ev  = sv_indel_events(cpu_recs), sv_indel_events(gpu_recs)
+    cpu_sup, gpu_sup = supplementary_reads(cpu_recs), supplementary_reads(gpu_recs)
+
+    n_cpu_sup = sum(1 for _q, f, _r, _p, _c in cpu_recs if f & 0x800)
+    n_gpu_sup = sum(1 for _q, f, _r, _p, _c in gpu_recs if f & 0x800)
+
+    ind_match = event_recall(cpu_ev, gpu_ev)
+    ind_recall = ind_match / len(cpu_ev) if cpu_ev else 0.0
+    ind_prec   = event_recall(gpu_ev, cpu_ev) / len(gpu_ev) if gpu_ev else 0.0
+    sup_match  = len(cpu_sup & gpu_sup)
+    sup_recall = sup_match / len(cpu_sup) if cpu_sup else 0.0
+
+    total_ref   = len(cpu_sup) + len(cpu_ev)
+    total_match = sup_match + ind_match
+    sv_rate = total_match / total_ref if total_ref else 0.0
+
+    W = 72
+    print()
+    print('=' * W)
+    print('  SV-SENSITIVE ACCURACY  (z-drop split / split-read signals)')
+    print(f'  CPU(truth): {cpu_path}')
+    print(f'  GPU:        {gpu_path}')
+    print(f'  indel>={SV_INDEL_MIN}bp  pos_tol={SV_POS_TOL}bp  len_tol={int(SV_LEN_FRAC*100)}%')
+    print('=' * W)
+    print(f'  Supplementary (split-read) records:   CPU {n_cpu_sup:8d}   GPU {n_gpu_sup:8d}')
+    print(f'  Reads with a supplementary aln:       CPU {len(cpu_sup):8d}   GPU {len(gpu_sup):8d}')
+    print(f'  Split-read RECALL vs CPU:             {sup_recall*100:6.1f}%   ({sup_match}/{len(cpu_sup)})')
+    print(f'  ─────────────────────────────────────────────────────────────')
+    print(f'  Large-indel (>={SV_INDEL_MIN}bp) events:        CPU {len(cpu_ev):8d}   GPU {len(gpu_ev):8d}')
+    print(f'  Large-indel RECALL vs CPU:            {ind_recall*100:6.1f}%   ({ind_match}/{len(cpu_ev)})')
+    print(f'  Large-indel PRECISION vs CPU:         {ind_prec*100:6.1f}%')
+    print('=' * W)
+    print(f'  SV-SIGNAL RECALL (suppl + large indel vs CPU):  {sv_rate*100:.1f}%'
+          f'   ({total_match}/{total_ref})')
+    print('  → compare this between full.sam and raw.sam: full should be much higher')
+    print('=' * W)
+
+
 def classify(cpu, gpu):
     """
     Return (category, detail_flags) for a CPU/GPU primary alignment pair.
@@ -402,6 +510,9 @@ def main(argv):
         bordr_rate = (vc_usable + counts['borderline']) / vc_denom if vc_denom else 0
         print(f'  With borderline: {bordr_rate*100:.1f}%')
     print('=' * W)
+
+    # ── SV-sensitive accuracy (the section that separates full vs raw) ───────
+    sv_report(cpu_path, gpu_path)
 
     # ── Per-category examples ────────────────────────────────────────────────
     def show_examples(cat, label):

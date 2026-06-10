@@ -3,7 +3,6 @@
 #include <assert.h>
 #include <errno.h>
 #include <pthread.h>
-#include <time.h>
 #include "kthread.h"
 #include "kvec.h"
 #include "kalloc.h"
@@ -1335,13 +1334,6 @@ extern void mm_align1_batched(gpu_align_batch_t *gpu_batch, void *km,
 extern void mm_append_cigar(mm_reg1_t *r, uint32_t n_cigar, uint32_t *cigar);
 extern void mm_update_extra(mm_reg1_t *r, const uint8_t *qseq, const uint8_t *tseq, const int8_t *mat, int8_t q, int8_t e, int is_eqx, int log_gap);
 extern void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi);
-// Accumulate full-alignment (gpu_batch_submit_and_process) wall time into the
-// GPU-side timing printer, so config (1) raw-kernel and (2) full-pipeline totals
-// print together. (2) = GPU exec + exact Z-drop split handling + result processing.
-extern void gpu_pipeline_timing_add(double sec);
-static inline double pipe_elapsed(struct timespec a, struct timespec b) {
-    return (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
-}
 
 static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
 {
@@ -1820,11 +1812,6 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
     if (retry_reads_out) *retry_reads_out = NULL;
     if (gpu_batch->n_tasks == 0) return;
 
-    // (2) Full-alignment pipeline timing: GPU kernel exec + exact Z-drop split
-    //     handling (CPU mm_test_zdrop + second pass) + result processing.
-    struct timespec _sap_t0;
-    clock_gettime(CLOCK_MONOTONIC, &_sap_t0);
-
     // First GPU pass: GAP_FILL tasks use KSW_EZ_APPROX_MAX (no zdrop in kernel).
     gpu_align_batch_execute(opt, gpu_batch->tasks, gpu_batch->n_tasks,
                            gpu_batch->seq_buffer, gpu_batch->cigar_buffer, stream_id);
@@ -1950,10 +1937,6 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
         gpu_batch_process_results(gpu_batch, opt, mi, km, skip_reads);
 #endif /* RAW_EXT_ONLY */
     }
-
-    struct timespec _sap_t1;
-    clock_gettime(CLOCK_MONOTONIC, &_sap_t1);
-    gpu_pipeline_timing_add(pipe_elapsed(_sap_t0, _sap_t1));
 }
 
 static void pre_align_helper_gpu(const mm_idx_t *mi, const mm_mapopt_t *opt,

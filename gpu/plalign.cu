@@ -44,10 +44,11 @@ static FILE *btdist_log_open(void) {
 }
 
 
-// Single extension timer: sum of all gpu_batch_submit_and_process() wall times
-// (GPU kernel exec + result processing, plus the Z-drop split re-extension when
-// it is enabled). With -DRAW_EXT_ONLY the re-extension paths are compiled out, so
-// this measures a pure single forward pass (G3SA-comparable raw extension).
+// Single extension timer: sum of all gpu_align_batch_execute() wall times (each
+// GPU batch's kernel execution + its H2D/D2H + result copy). Every pass that runs
+// is one execute call, so the default build sums first + Z-drop second passes,
+// while -DRAW_EXT_ONLY runs only the single forward pass — same measurement, fewer
+// passes. (Closest single-pass number to mm2-fast's per-ksw timing.)
 static double s_pipeline_wall_total_sec = 0.0;
 struct KswTimingPrinter {
     ~KswTimingPrinter() {
@@ -61,11 +62,6 @@ struct KswTimingPrinter {
 #endif
     }
 } s_ksw_timing_printer;
-
-// Accumulate extension (gpu_batch_submit_and_process) wall time, called from map.c.
-extern "C" void gpu_pipeline_timing_add(double sec) {
-    s_pipeline_wall_total_sec += sec;
-}
 
 #define CHECKCUDAERROR(error) \
         do{\
@@ -1899,6 +1895,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     // ===== END Collect concurrent C results =====
 
     double _e2e_ms = std::chrono::duration<double>(std::chrono::steady_clock::now() - _t0).count() * 1000.0;
+    s_pipeline_wall_total_sec += _e2e_ms / 1000.0;
     PLOG_INFO(stderr, "[Info] Alignment complete: %d tasks in %d batches  %.1f ms\n",
             n_tasks, batch_num, _e2e_ms);
 

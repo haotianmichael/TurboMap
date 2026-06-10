@@ -222,30 +222,46 @@ def sv_report(cpu_path, gpu_path):
     ind_prec   = event_recall(gpu_ev, cpu_ev) / len(gpu_ev) if gpu_ev else 0.0
     sup_match  = len(cpu_sup & gpu_sup)
     sup_recall = sup_match / len(cpu_sup) if cpu_sup else 0.0
+    missed     = len(cpu_sup) - sup_match
 
-    total_ref   = len(cpu_sup) + len(cpu_ev)
-    total_match = sup_match + ind_match
-    sv_rate = total_match / total_ref if total_ref else 0.0
+    # Over-extension: GPU primary runs THROUGH a point where CPU z-drop-split
+    # (so CPU's primary is truncated there). Signature: same chrom+start, GPU
+    # primary ref_span >= OVEREXT_FRAC × CPU primary ref_span. This is exactly
+    # what the no-z-drop (raw) build does at an SV breakpoint.
+    OVEREXT_FRAC = 1.30
+    cpu_pri, gpu_pri = parse_sam(cpu_path), parse_sam(gpu_path)
+    overext = 0
+    for q, c in cpu_pri.items():
+        g = gpu_pri.get(q)
+        if (not g or c['unmapped'] or g['unmapped'] or c['ref_span'] <= 0
+                or c['rname'] != g['rname'] or abs(c['pos'] - g['pos']) > POSITION_TOL):
+            continue
+        if g['ref_span'] >= OVEREXT_FRAC * c['ref_span']:
+            overext += 1
 
     W = 72
     print()
     print('=' * W)
-    print('  SV-SENSITIVE ACCURACY  (z-drop split / split-read signals)')
+    print('  SV-SENSITIVE ACCURACY  (z-drop split signal — compares full vs raw)')
     print(f'  CPU(truth): {cpu_path}')
     print(f'  GPU:        {gpu_path}')
-    print(f'  indel>={SV_INDEL_MIN}bp  pos_tol={SV_POS_TOL}bp  len_tol={int(SV_LEN_FRAC*100)}%')
     print('=' * W)
-    print(f'  Supplementary (split-read) records:   CPU {n_cpu_sup:8d}   GPU {n_gpu_sup:8d}')
-    print(f'  Reads with a supplementary aln:       CPU {len(cpu_sup):8d}   GPU {len(gpu_sup):8d}')
-    print(f'  Split-read RECALL vs CPU:             {sup_recall*100:6.1f}%   ({sup_match}/{len(cpu_sup)})')
-    print(f'  ─────────────────────────────────────────────────────────────')
-    print(f'  Large-indel (>={SV_INDEL_MIN}bp) events:        CPU {len(cpu_ev):8d}   GPU {len(gpu_ev):8d}')
-    print(f'  Large-indel RECALL vs CPU:            {ind_recall*100:6.1f}%   ({ind_match}/{len(cpu_ev)})')
-    print(f'  Large-indel PRECISION vs CPU:         {ind_prec*100:6.1f}%')
+    print('  ── Z-DROP DISCRIMINATORS (these separate full from raw) ──────')
+    print(f'  Split-read (supplementary) RECALL vs CPU:   {sup_recall*100:6.1f}%   ({sup_match}/{len(cpu_sup)})')
+    print(f'    supplementary records:   CPU {n_cpu_sup:7d}   GPU {n_gpu_sup:7d}')
+    print(f'    reads with supplementary:CPU {len(cpu_sup):7d}   GPU {len(gpu_sup):7d}')
+    print(f'    MISSED splits (CPU split, GPU did not):   {missed}')
+    print(f'  Over-extension (GPU primary >={OVEREXT_FRAC:.1f}x CPU, ran through')
+    print(f'    a breakpoint CPU split):                  {overext} reads')
+    print('  ──────────────────────────────────────────────────────────────')
+    print('  ── NOT a z-drop signal (GPU-vs-CPU kernel CIGAR fidelity; ─────')
+    print('     ~equal for full and raw — do NOT use to compare them) ──────')
+    print(f'  Large-indel (>={SV_INDEL_MIN}bp) recall vs CPU:        {ind_recall*100:6.1f}%   precision {ind_prec*100:.1f}%')
     print('=' * W)
-    print(f'  SV-SIGNAL RECALL (suppl + large indel vs CPU):  {sv_rate*100:.1f}%'
-          f'   ({total_match}/{total_ref})')
-    print('  → compare this between full.sam and raw.sam: full should be much higher')
+    print('  HEADLINE for full-vs-raw: split-read recall + missed splits +')
+    print('  over-extension. full should be higher recall / fewer missed /')
+    print('  fewer over-extensions. On generic reads the gap is small (SVs are')
+    print('  rare) — for a strong number run downstream SV calling (Truvari).')
     print('=' * W)
 
 

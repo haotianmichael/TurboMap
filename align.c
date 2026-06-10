@@ -2,10 +2,33 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
+#include <pthread.h>
 #include "minimap.h"
 #include "mmpriv.h"
 #include "ksw2.h"
 #include "gpu/plutils.h"
+
+// mm2-fast-style CPU ksw extension timer: clock_gettime tightly around the
+// ksw_ext{d,z,s}2_sse call in mm_align_pair (no seeding/chaining). Summed across
+// all worker threads via a lock-free atomic add on a global double; printed once
+// at program exit. Only nonzero when the CPU extension path runs (e.g. no
+// --gpu-chain, or CPU fallbacks).
+static double g_cpu_ksw_total_sec = 0.0;
+static pthread_once_t g_cpu_ksw_once = PTHREAD_ONCE_INIT;
+static void mm_cpu_ksw_print(void) {
+	if (g_cpu_ksw_total_sec > 0.0)
+		fprintf(stderr, "\n[KSW timing] CPU ksw extension (mm_align_pair, sum over threads): %.3f ms\n",
+		        g_cpu_ksw_total_sec * 1000.0);
+}
+static void mm_cpu_ksw_atexit_reg(void) { atexit(mm_cpu_ksw_print); }
+static inline void mm_cpu_ksw_add(double dt) {
+	double old, des;
+	__atomic_load(&g_cpu_ksw_total_sec, &old, __ATOMIC_RELAXED);
+	do { des = old + dt; }
+	while (!__atomic_compare_exchange(&g_cpu_ksw_total_sec, &old, &des, 1,
+	                                  __ATOMIC_RELAXED, __ATOMIC_RELAXED));
+}
 
 void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc_ambi)
 {
@@ -324,6 +347,8 @@ static void mm_align_pair(void *km, const mm_mapopt_t *opt, int qlen, const uint
 		for (i = 0; i < qlen; ++i) fputc("ACGTN"[qseq[i]], stderr);
 		fputc('\n', stderr);
 	}
+	pthread_once(&g_cpu_ksw_once, mm_cpu_ksw_atexit_reg);
+	struct timespec _kt0; clock_gettime(CLOCK_MONOTONIC, &_kt0);
 	if (opt->max_sw_mat > 0 && (int64_t)tlen * qlen > opt->max_sw_mat) {
 		ksw_reset_extz(ez);
 		ez->zdropped = 1;
@@ -333,6 +358,8 @@ static void mm_align_pair(void *km, const mm_mapopt_t *opt, int qlen, const uint
 		ksw_extz2_sse(km, qlen, qseq, tlen, tseq, 5, mat, opt->q, opt->e, w, zdrop, end_bonus, flag, ez);
 	else
 		ksw_extd2_sse(km, qlen, qseq, tlen, tseq, 5, mat, opt->q, opt->e, opt->q2, opt->e2, w, zdrop, end_bonus, flag, ez);
+	struct timespec _kt1; clock_gettime(CLOCK_MONOTONIC, &_kt1);
+	mm_cpu_ksw_add((_kt1.tv_sec - _kt0.tv_sec) + (_kt1.tv_nsec - _kt0.tv_nsec) / 1e9);
 	if (mm_dbg_flag & MM_DBG_PRINT_ALN_SEQ) {
 		int i;
 		fprintf(stderr, "score=%d, cigar=", ez->score);

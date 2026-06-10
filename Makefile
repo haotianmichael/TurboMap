@@ -72,6 +72,16 @@ $(CJSON_OBJ):
 # build kernel objs
 include gpu/gpu.mk
 
+# ---- Force rebuild of -D-flag-sensitive objects when CONFIG changes ----
+# Make compares file timestamps, not compile flags, so toggling RAW=1 / SHARED=1
+# would otherwise silently reuse stale .o files. Stamp the current CONFIG; the
+# stamp's timestamp only changes when CONFIG changes, and the objects that read
+# RAW_EXT_ONLY / SHARED depend on it so they rebuild exactly when needed.
+.PHONY: __config_force
+.config_sig: __config_force
+	@printf '%s' '$(CONFIG)' | cmp -s - $@ 2>/dev/null || printf '%s' '$(CONFIG)' > $@
+map.o gpu/plalign.o gpu/plmem.o: .config_sig
+
 
 # compile with nvcc
 $(PROG):main.o libminimap2.a
@@ -128,7 +138,7 @@ ksw2_exts2_neon.o:ksw2_exts2_sse.c ksw2.h kalloc.h
 # other non-file targets
 
 clean: cleangpu
-		rm -fr gmon.out *.o a.out $(PROG) $(PROG_EXTRA) *~ *.a *.dSYM build dist mappy*.so mappy.c python/mappy.c mappy.egg*
+		rm -fr gmon.out *.o a.out $(PROG) $(PROG_EXTRA) *~ *.a *.dSYM build dist mappy*.so mappy.c python/mappy.c mappy.egg* .config_sig
 
 depend:
 		(LC_ALL=C; export LC_ALL; makedepend -Y -- $(CFLAGS) $(CPPFLAGS) -- *.c)

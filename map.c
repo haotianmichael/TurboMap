@@ -1836,6 +1836,15 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
     // We pre-scan here (before process_results) so that the retry CIGAR overwrites
     // the first-pass CIGAR in-place; process_results then sees final CIGARs only.
     {
+#ifdef RAW_EXT_ONLY
+        // Raw single forward pass: no Z-drop detection (mm_test_zdrop) and no
+        // second pass. Just clear APPROX_MAX on GAP_FILL tasks so process_results
+        // treats the first-pass CIGARs as final, then process directly.
+        for (int i = 0; i < gpu_batch->n_tasks; i++)
+            if (gpu_batch->tasks[i].task_type == GPU_TASK_GAP_FILL)
+                gpu_batch->tasks[i].flag &= ~KSW_EZ_APPROX_MAX;
+        gpu_batch_process_results(gpu_batch, opt, mi, km, NULL);
+#else
         int8_t mat[25];
         ksw_gen_simple_mat(5, mat, opt->a, opt->b, opt->sc_ambi);
 
@@ -1939,6 +1948,7 @@ static void gpu_batch_submit_and_process(const mm_mapopt_t *opt, gpu_align_batch
         // deferred-retry reads to be skipped; their regs0 stay in pre-alignment
         // state so the retry_pool can re-submit all tasks in the next batch.
         gpu_batch_process_results(gpu_batch, opt, mi, km, skip_reads);
+#endif /* RAW_EXT_ONLY */
     }
 
     struct timespec _sap_t1;
@@ -2489,6 +2499,10 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
             continue;
         }
 
+#ifdef RAW_EXT_ONLY
+        // Single-pass raw extension: discard any z-drop remainder, finalize directly.
+        finalize_one_read_gpu(s, gpu_batch, gidx, batch->reads, iread, batch->km);
+#else
         // r2 remainder: any region where zdrop split left p==NULL.
         int has_pending = 0;
         if (!(s->p->opt->flag & MM_F_SR) && ctx->qseq0[0] && ctx->a) {
@@ -2502,6 +2516,7 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
             r2_pool_carry(r2_pool, &batch->reads[iread], ctx);
         else
             finalize_one_read_gpu(s, gpu_batch, gidx, batch->reads, iread, batch->km);
+#endif
     }
     NVTX_POP(); // classify_finalize
 

@@ -9,6 +9,10 @@ CONFIG			+= $(if $(NVTX),-DNVTX_ENABLE)
 # Use the cp.async double-buffered long-task kernel (ksw_double_buffer_kernel):
 # make SHARED=1.  Default OFF → legacy ksw_fused_persistent_kernel.
 CONFIG			+= $(if $(SHARED),-DSHARED)
+# Raw extension benchmark: compile out the Z-drop split re-extension so each read
+# is aligned in a single forward pass (G3SA-comparable). make RAW=1.  Default OFF
+# → full pipeline with exact Z-drop handling. NOTE: RAW output SAM is not correct.
+CONFIG			+= $(if $(RAW),-DRAW_EXT_ONLY)
 
 ###################################################
 ############  	CPU Compile 	###################

@@ -30,9 +30,9 @@
 
 // Bracket a KSW DP kernel launch with CUDA events so only its device execution
 // time is measured (metric (3): pure KSW kernel time, no H2D/D2H/pack/compaction).
-// Events are recorded on the kernel's own stream; elapsed time is drained after
-// the function's existing final sync via KSW_KERNEL_TIME_DRAIN(). _ksw_kev is a
-// std::vector<std::pair<cudaEvent_t,cudaEvent_t>> declared in the caller's scope.
+// Events are recorded on the kernel's own stream; the per-call interval UNION is
+// computed after the function's final sync by ksw_drain_kernel_union(). _ksw_kev
+// is a std::vector<std::pair<cudaEvent_t,cudaEvent_t>> in the caller's scope.
 #define KSW_TIME_KERNEL(STREAM, ...)                          \
     do {                                                      \
         cudaEvent_t _kt_s, _kt_e;                             \
@@ -42,21 +42,6 @@
         __VA_ARGS__;                                          \
         cudaEventRecord(_kt_e, (STREAM));                     \
         _ksw_kev.push_back(std::make_pair(_kt_s, _kt_e));     \
-    } while (0)
-
-#define KSW_KERNEL_TIME_DRAIN()                                          \
-    do {                                                                 \
-        double _kt_ms = 0.0;                                             \
-        for (size_t _i = 0; _i < _ksw_kev.size(); ++_i) {               \
-            float _ms = 0.f;                                             \
-            cudaEventSynchronize(_ksw_kev[_i].second);                   \
-            cudaEventElapsedTime(&_ms, _ksw_kev[_i].first,               \
-                                 _ksw_kev[_i].second);                   \
-            _kt_ms += _ms;                                               \
-            cudaEventDestroy(_ksw_kev[_i].first);                        \
-            cudaEventDestroy(_ksw_kev[_i].second);                       \
-        }                                                                \
-        s_ksw_kernel_only_sec += _kt_ms / 1000.0;                        \
     } while (0)
 
 // Log file for long-task bt_stride distribution (diagnostic).
@@ -85,11 +70,12 @@ static double s_ksw_wall_total_sec = 0.0;
 //     task assembly (pre_align) and stats finalization (post_align), which are
 //     parallelizable and not part of the scheduling being evaluated.
 static double s_pipeline_wall_total_sec = 0.0;
-// (3) Pure KSW kernel time: sum of GPU device time of the KSW DP kernels only
-//     (KSW_LONG_KERNEL launches), measured with CUDA events bracketing each
-//     launch. Excludes H2D/D2H copies, packing/CIGAR-compaction kernels, sync
-//     waits, and all host overhead. Concurrent A/B/C kernels overlap on the GPU,
-//     so this is a sum of per-kernel durations (total kernel-seconds), >= wall.
+// (3) Pure KSW kernel wall time: the wall-clock GPU-busy time inside the KSW DP
+//     kernels only (KSW_LONG_KERNEL launches), measured with CUDA events around
+//     each launch and combined as the UNION of kernel intervals (so concurrent
+//     A/B/C/conc-C kernels are NOT double-counted). Excludes H2D/D2H copies,
+//     packing/CIGAR kernels, sync waits, the per-task CPU result copy, and all
+//     other host overhead. By construction this is <= (1).
 static double s_ksw_kernel_only_sec = 0.0;
 struct KswTimingPrinter {
     ~KswTimingPrinter() {
@@ -100,7 +86,7 @@ struct KswTimingPrinter {
             fprintf(stderr, "[KSW timing] (2) full pipeline (GPU exec + exact Z-drop split handling): %.3f ms\n",
                     s_pipeline_wall_total_sec * 1000.0);
         if (s_ksw_kernel_only_sec > 0.0)
-            fprintf(stderr, "[KSW timing] (3) pure KSW kernel device time (no H2D/D2H, sum of kernel durations): %.3f ms\n",
+            fprintf(stderr, "[KSW timing] (3) pure KSW kernel wall time (no H2D/D2H, union of kernel intervals): %.3f ms\n",
                     s_ksw_kernel_only_sec * 1000.0);
     }
 } s_ksw_timing_printer;
@@ -108,6 +94,39 @@ struct KswTimingPrinter {
 // Accumulate full-alignment (gpu_batch_submit_and_process) wall time, called from map.c.
 extern "C" void gpu_pipeline_timing_add(double sec) {
     s_pipeline_wall_total_sec += sec;
+}
+
+// Drain the per-call KSW kernel event pairs into metric (3): place every kernel's
+// [start,stop] on the GPU's common clock (relative to the first start event),
+// merge overlapping intervals, and add the merged (union) length. This is the
+// wall-clock time the GPU was running a KSW kernel, with concurrent kernels on
+// different streams counted once. All kernels are already complete at call time.
+static void ksw_drain_kernel_union(std::vector<std::pair<cudaEvent_t, cudaEvent_t>> &kev) {
+    if (kev.empty()) return;
+    cudaEvent_t base = kev[0].first;  // reference point on the GPU timeline
+    std::vector<std::pair<double, double>> iv;
+    iv.reserve(kev.size());
+    for (size_t i = 0; i < kev.size(); ++i) {
+        float s = 0.f, e = 0.f;
+        cudaEventSynchronize(kev[i].second);
+        cudaEventElapsedTime(&s, base, kev[i].first);   // ms from base to kernel start
+        cudaEventElapsedTime(&e, base, kev[i].second);  // ms from base to kernel stop
+        iv.push_back(std::make_pair((double)s, (double)e));
+        cudaEventDestroy(kev[i].first);
+        cudaEventDestroy(kev[i].second);
+    }
+    std::sort(iv.begin(), iv.end());
+    double total = 0.0, cur_s = iv[0].first, cur_e = iv[0].second;
+    for (size_t i = 1; i < iv.size(); ++i) {
+        if (iv[i].first <= cur_e) {            // overlaps current merged interval
+            if (iv[i].second > cur_e) cur_e = iv[i].second;
+        } else {                               // disjoint: close current, start new
+            total += cur_e - cur_s;
+            cur_s = iv[i].first; cur_e = iv[i].second;
+        }
+    }
+    total += cur_e - cur_s;
+    s_ksw_kernel_only_sec += total / 1000.0;
 }
 
 #define CHECKCUDAERROR(error) \
@@ -1955,8 +1974,8 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     PLOG_INFO(stderr, "[Info] Alignment complete: %d tasks in %d batches  %.1f ms\n",
             n_tasks, batch_num, _e2e_ms);
 
-    // (3) Drain pure KSW kernel device times (all kernels already complete here).
-    KSW_KERNEL_TIME_DRAIN();
+    // (3) Drain pure KSW kernel wall time (union of intervals; kernels complete here).
+    ksw_drain_kernel_union(_ksw_kev);
 
     free(task_indices_short);
     free(task_indices_long);

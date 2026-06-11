@@ -175,7 +175,9 @@ typedef struct {
     // Read contexts
     int32_t n_reads;        // number of reads being processed
     read_align_ctx_t *read_ctxs; // context for each read
-    
+
+    void *km;               // kalloc handle for on-demand growth of the buffers above
+
 } gpu_align_batch_t;
 
 

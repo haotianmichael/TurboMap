@@ -1070,19 +1070,45 @@ static int gpu_batch_add_task(gpu_align_batch_t *gpu_batch,
                              int32_t read_idx, int32_t reg_idx, 
                              int32_t task_type, int32_t task_sub_idx, task_ctx_t task_ctx)
 {
+    // Grow the task array on demand.  Tasks reference sequences/CIGARs by offset
+    // (not raw pointer), so krealloc never invalidates anything already stored.
     if (gpu_batch->n_tasks >= gpu_batch->max_tasks) {
-        fprintf(stderr, "[ERROR] GPU batch task overflow\n");
-        return -1;
+        size_t new_max = gpu_batch->max_tasks > 0 ? (size_t)gpu_batch->max_tasks * 2 : 1024;
+        gpu_align_task_t *np = (gpu_align_task_t*)krealloc(gpu_batch->km, gpu_batch->tasks,
+                                                           new_max * sizeof(gpu_align_task_t));
+        if (!np) { fprintf(stderr, "[ERROR] GPU batch task realloc failed\n"); return -1; }
+        // Zero the new slots so behaviour matches the original kcalloc allocation.
+        memset(np + gpu_batch->max_tasks, 0,
+               (new_max - (size_t)gpu_batch->max_tasks) * sizeof(gpu_align_task_t));
+        gpu_batch->tasks = np;
+        gpu_batch->max_tasks = (int32_t)new_max;
     }
-    
-    // Check buffer space
+
+    // Buffer space needed for this task.
     size_t seq_needed = qlen + tlen + (junc ? tlen : 0);
     size_t cigar_needed = qlen + tlen + 100; // estimate max CIGAR ops
-    
-    if (gpu_batch->seq_buffer_used + seq_needed > gpu_batch->seq_buffer_size ||
-        gpu_batch->cigar_buffer_used + cigar_needed > gpu_batch->cigar_buffer_size) {
-        fprintf(stderr, "[ERROR] GPU batch buffer overflow\n");
-        return -1;
+
+    // Grow the sequence buffer (bytes) on demand — doubling keeps it amortized O(1).
+    if (gpu_batch->seq_buffer_used + seq_needed > gpu_batch->seq_buffer_size) {
+        size_t need = gpu_batch->seq_buffer_used + seq_needed;
+        size_t new_size = gpu_batch->seq_buffer_size > 0 ? gpu_batch->seq_buffer_size : (1ULL << 20);
+        while (new_size < need) new_size *= 2;
+        uint8_t *np = (uint8_t*)krealloc(gpu_batch->km, gpu_batch->seq_buffer, new_size);
+        if (!np) { fprintf(stderr, "[ERROR] GPU batch seq realloc failed\n"); return -1; }
+        gpu_batch->seq_buffer = np;
+        gpu_batch->seq_buffer_size = new_size;
+    }
+
+    // Grow the CIGAR buffer (counted in uint32_t units) on demand.
+    if (gpu_batch->cigar_buffer_used + cigar_needed > gpu_batch->cigar_buffer_size) {
+        size_t need = gpu_batch->cigar_buffer_used + cigar_needed;
+        size_t new_size = gpu_batch->cigar_buffer_size > 0 ? gpu_batch->cigar_buffer_size : (1ULL << 20);
+        while (new_size < need) new_size *= 2;
+        uint32_t *np = (uint32_t*)krealloc(gpu_batch->km, gpu_batch->cigar_buffer,
+                                           new_size * sizeof(uint32_t));
+        if (!np) { fprintf(stderr, "[ERROR] GPU batch cigar realloc failed\n"); return -1; }
+        gpu_batch->cigar_buffer = np;
+        gpu_batch->cigar_buffer_size = new_size;
     }
     
     gpu_align_task_t *task = &gpu_batch->tasks[gpu_batch->n_tasks];

@@ -1338,11 +1338,14 @@ extern void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc
 static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
 {
     gpu_align_batch_t *gpu_batch = (gpu_align_batch_t*)kcalloc(km, 1, sizeof(gpu_align_batch_t));
-    
-    // Conservative estimates for task and buffer requirements
-    int estimated_tasks = n_reads * 5000; // ~200 tasks per read on average
-	size_t estimated_seq_size = (size_t)n_reads * (4ULL * 1024ULL * 1024ULL); // ~4MB sequences per read
-	size_t estimated_cigar_bytes = (size_t)n_reads * (4ULL * 1024ULL * 1024ULL); // ~4MB CIGAR per read (in bytes)
+    gpu_batch->km = km;   // used by gpu_batch_add_task to grow the buffers on demand
+
+    // Initial estimates only — gpu_batch_add_task grows these buffers (krealloc) if a
+    // batch needs more, so they can start modest instead of the old 9 MB/read (which
+    // OOM-killed the host when many short reads packed into one anchor-capped batch).
+    int estimated_tasks = n_reads * 512 + 1024;            // ~200 tasks/read avg; grows if exceeded
+    size_t estimated_seq_size = (size_t)n_reads * (256ULL * 1024ULL) + (1ULL<<20);   // query+target bytes
+    size_t estimated_cigar_bytes = (size_t)n_reads * (256ULL * 1024ULL) + (1ULL<<20);// CIGAR bytes
     size_t estimated_cigar_size = estimated_cigar_bytes / sizeof(uint32_t); // Convert to uint32_t count
 
     gpu_batch->max_tasks = estimated_tasks;

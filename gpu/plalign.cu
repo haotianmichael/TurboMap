@@ -28,6 +28,20 @@
   #define KSW_LONG_SMEM   0
 #endif
 
+// Bracket a KSW DP kernel launch with CUDA events so only its device execution
+// time is captured (no H2D/D2H, no packing/CIGAR kernels, no result copy).
+// _ksw_kev is a std::vector<std::pair<cudaEvent_t,cudaEvent_t>> in the caller.
+#define KSW_TIME_KERNEL(STREAM, ...)                          \
+    do {                                                      \
+        cudaEvent_t _kt_s, _kt_e;                             \
+        cudaEventCreate(&_kt_s);                              \
+        cudaEventCreate(&_kt_e);                              \
+        cudaEventRecord(_kt_s, (STREAM));                     \
+        __VA_ARGS__;                                          \
+        cudaEventRecord(_kt_e, (STREAM));                     \
+        _ksw_kev.push_back(std::make_pair(_kt_s, _kt_e));     \
+    } while (0)
+
 // Log file for long-task bt_stride distribution (diagnostic).
 // Opened on first batch, appended thereafter, never explicitly closed
 // (flushed on exit via atexit).
@@ -44,24 +58,54 @@ static FILE *btdist_log_open(void) {
 }
 
 
-// Single extension timer: sum of all gpu_align_batch_execute() wall times (each
-// GPU batch's kernel execution + its H2D/D2H + result copy). Every pass that runs
-// is one execute call, so the default build sums first + Z-drop second passes,
-// while -DRAW_EXT_ONLY runs only the single forward pass — same measurement, fewer
-// passes. (Closest single-pass number to mm2-fast's per-ksw timing.)
+// Single extension timer: pure KSW DP kernel device time. CUDA events bracket
+// each KSW_LONG_KERNEL launch and per call we add the UNION of the kernel
+// intervals (concurrent A/B/C/conc-C kernels counted once). Excludes H2D/D2H,
+// packing/CIGAR kernels, sync waits and the single-threaded result-copy loop.
+// Default build sums first + Z-drop second passes; -DRAW_EXT_ONLY runs only the
+// single forward pass.
 static double s_pipeline_wall_total_sec = 0.0;
 struct KswTimingPrinter {
     ~KswTimingPrinter() {
         if (s_pipeline_wall_total_sec > 0.0)
 #ifdef RAW_EXT_ONLY
-            fprintf(stderr, "\n[KSW timing] raw extension, single pass (no Z-drop re-extension): %.3f ms\n",
+            fprintf(stderr, "\n[KSW timing] raw extension, single pass — pure KSW kernel device time: %.3f ms\n",
                     s_pipeline_wall_total_sec * 1000.0);
 #else
-            fprintf(stderr, "\n[KSW timing] full pipeline (with exact Z-drop split handling): %.3f ms\n",
+            fprintf(stderr, "\n[KSW timing] full pipeline (exact Z-drop) — pure KSW kernel device time: %.3f ms\n",
                     s_pipeline_wall_total_sec * 1000.0);
 #endif
     }
 } s_ksw_timing_printer;
+
+// Add the per-call union of KSW kernel intervals to the timer. Each kernel's
+// [start,stop] is placed on the GPU's common clock (relative to the first start
+// event), overlapping intervals are merged, and the merged length is added — so
+// concurrent kernels on different streams are counted once. All kernels are
+// already complete when this runs (called after the function's final sync).
+static void ksw_drain_kernel_union(std::vector<std::pair<cudaEvent_t, cudaEvent_t>> &kev) {
+    if (kev.empty()) return;
+    cudaEvent_t base = kev[0].first;
+    std::vector<std::pair<double, double>> iv;
+    iv.reserve(kev.size());
+    for (size_t i = 0; i < kev.size(); ++i) {
+        float s = 0.f, e = 0.f;
+        cudaEventSynchronize(kev[i].second);
+        cudaEventElapsedTime(&s, base, kev[i].first);
+        cudaEventElapsedTime(&e, base, kev[i].second);
+        iv.push_back(std::make_pair((double)s, (double)e));
+        cudaEventDestroy(kev[i].first);
+        cudaEventDestroy(kev[i].second);
+    }
+    std::sort(iv.begin(), iv.end());
+    double total = 0.0, cur_s = iv[0].first, cur_e = iv[0].second;
+    for (size_t i = 1; i < iv.size(); ++i) {
+        if (iv[i].first <= cur_e) { if (iv[i].second > cur_e) cur_e = iv[i].second; }
+        else { total += cur_e - cur_s; cur_s = iv[i].first; cur_e = iv[i].second; }
+    }
+    total += cur_e - cur_s;
+    s_pipeline_wall_total_sec += total / 1000.0;
+}
 
 #define CHECKCUDAERROR(error) \
         do{\
@@ -395,6 +439,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
         fprintf(stderr, "[ERROR] Invalid stream_id %d for alignment.\n", stream_id);
         return;
     }
+
+    // Pure KSW kernel device-time measurement: event pairs bracketing each
+    // KSW_LONG_KERNEL launch, drained (interval-union) after the final sync.
+    std::vector<std::pair<cudaEvent_t, cudaEvent_t>> _ksw_kev;
 
     // Always reset arena to short-align layout before capturing local GPU pointers below.
     // If the previous call left dev_mem in long-align state (current_phase==GPU_PHASE_ALIGN),
@@ -731,6 +779,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
 
         // Reset counter and launch C kernel
         cudaMemsetAsync(d_counter_C_conc, 0, sizeof(int), s_stream_C_conc);
+        KSW_TIME_KERNEL(s_stream_C_conc,
         KSW_LONG_KERNEL<<<sC_conc, 32, KSW_LONG_SMEM, s_stream_C_conc>>>(
             d_counter_C_conc,
             dev_mem->d_long_c_packed_query, dev_mem->d_long_c_packed_target,
@@ -746,7 +795,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
             cigar_buffer ? dev_mem->d_long_c_cigar_lengths : NULL,
             (int)conc_cigar_len,
             0  // task_id_base = 0 for concurrent C (uses own result arrays)
-        );
+        ));
         c_conc_done = nC_b;
         PLOG_INFO(stderr, "[Info::CConc] Launched %d C tasks on s_stream_C_conc concurrently "
                   "(sC=%d stride=%.1fMB bt_p=%.2fGB)\n",
@@ -1123,6 +1172,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 // Launch class A on align_stream (task_id_base = 0)
                 if (nA_b > 0) {
 
+                    KSW_TIME_KERNEL(align_stream,
                     KSW_LONG_KERNEL<<<sA_eff, par_threads, KSW_LONG_SMEM, align_stream>>>(
                         d_task_counter,
                         d_packed_query, d_packed_target,
@@ -1138,11 +1188,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         cigar_buffer ? d_cigar_lengths : NULL,
                         (int)current_max_cigar_len,
                         0  // task_id_base
-                    );
+                    ));
                 }
 
                 // Launch class B on s_stream_B (task_id_base = nA_b)
                 if (nB_b > 0) {
+                    KSW_TIME_KERNEL(s_stream_B,
                     KSW_LONG_KERNEL<<<sB_eff, par_threads, KSW_LONG_SMEM, s_stream_B>>>(
                         d_counter_B,
                         d_packed_query, d_packed_target,
@@ -1158,11 +1209,12 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         cigar_buffer ? d_cigar_lengths : NULL,
                         (int)current_max_cigar_len,
                         nA_b  // task_id_base
-                    );
+                    ));
                 }
 
                 // Launch class C on s_stream_C (task_id_base = nA_b + nB_b)
                 if (nC_b > 0) {
+                    KSW_TIME_KERNEL(s_stream_C,
                     KSW_LONG_KERNEL<<<sC_eff, par_threads, KSW_LONG_SMEM, s_stream_C>>>(
                         d_counter_C,
                         d_packed_query, d_packed_target,
@@ -1178,7 +1230,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         cigar_buffer ? d_cigar_lengths : NULL,
                         (int)current_max_cigar_len,
                         nA_b + nB_b  // task_id_base
-                    );
+                    ));
                 }
 
                 // Sync B and C back to align_stream
@@ -1590,6 +1642,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                 int parallel_threads = 32;
 
                 {
+                    KSW_TIME_KERNEL(align_stream,
                     KSW_LONG_KERNEL<<<phase_concurrent_slots, parallel_threads,
                                                   KSW_LONG_SMEM, align_stream>>>(
                         d_task_counter,
@@ -1618,7 +1671,7 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
                         cigar_buffer ? d_cigar_lengths : NULL,
                         (int)current_max_cigar_len,
                         0  // task_id_base: short phase always starts at 0
-                    );
+                    ));
                 }
             }
 
@@ -1894,8 +1947,10 @@ void gpu_align_batch_execute(const mm_mapopt_t *opt, gpu_align_task_t *tasks, in
     }
     // ===== END Collect concurrent C results =====
 
+    // Pure KSW kernel device time (union of kernel intervals; kernels complete here).
+    ksw_drain_kernel_union(_ksw_kev);
+
     double _e2e_ms = std::chrono::duration<double>(std::chrono::steady_clock::now() - _t0).count() * 1000.0;
-    s_pipeline_wall_total_sec += _e2e_ms / 1000.0;
     PLOG_INFO(stderr, "[Info] Alignment complete: %d tasks in %d batches  %.1f ms\n",
             n_tasks, batch_num, _e2e_ms);
 

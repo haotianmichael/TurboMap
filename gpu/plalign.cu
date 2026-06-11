@@ -88,12 +88,17 @@ static void ksw_drain_kernel_union(std::vector<std::pair<cudaEvent_t, cudaEvent_
     cudaEvent_t base = kev[0].first;
     std::vector<std::pair<double, double>> iv;
     iv.reserve(kev.size());
+    // Compute all intervals relative to `base` FIRST — do not destroy any event
+    // here, because `base` aliases kev[0].first and is needed for every entry.
     for (size_t i = 0; i < kev.size(); ++i) {
         float s = 0.f, e = 0.f;
         cudaEventSynchronize(kev[i].second);
         cudaEventElapsedTime(&s, base, kev[i].first);
         cudaEventElapsedTime(&e, base, kev[i].second);
         iv.push_back(std::make_pair((double)s, (double)e));
+    }
+    // Now it is safe to destroy every event.
+    for (size_t i = 0; i < kev.size(); ++i) {
         cudaEventDestroy(kev[i].first);
         cudaEventDestroy(kev[i].second);
     }

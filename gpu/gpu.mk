@@ -10,9 +10,10 @@ CONFIG			+= $(if $(NVTX),-DNVTX_ENABLE)
 # make SHARED=1.  Default OFF → legacy ksw_fused_persistent_kernel.
 CONFIG			+= $(if $(SHARED),-DSHARED)
 # Raw extension benchmark: compile out the Z-drop split re-extension so each read
-# is aligned in a single forward pass (G3SA-comparable). make RAW=1.  Default OFF
-# → full pipeline with exact Z-drop handling. NOTE: RAW output SAM is not correct.
-CONFIG			+= $(if $(RAW),-DRAW_EXT_ONLY)
+# is aligned in a single forward pass (G3SA-comparable). make RAW=1.  RAW=0 or
+# unset = OFF (full pipeline with exact Z-drop handling). NOTE: RAW output SAM is
+# not correct. (filter-out 0 so that RAW=0 means OFF, not "non-empty -> ON".)
+CONFIG			+= $(if $(filter-out 0,$(RAW)),-DRAW_EXT_ONLY)
 
 ###################################################
 ############  	CPU Compile 	###################

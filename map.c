@@ -1338,10 +1338,14 @@ extern void ksw_gen_simple_mat(int m, int8_t *mat, int8_t a, int8_t b, int8_t sc
 static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
 {
     gpu_align_batch_t *gpu_batch = (gpu_align_batch_t*)kcalloc(km, 1, sizeof(gpu_align_batch_t));
-    gpu_batch->km = km;   // used by gpu_batch_add_task to grow the buffers on demand
+    // The three large, growable buffers (tasks/seq/cigar) use the SYSTEM allocator
+    // (malloc/realloc/free), NOT km.  They are freed explicitly anyway, and keeping
+    // them out of km means gpu_batch_add_task's realloc-on-demand can never corrupt
+    // the read data (anchors etc.) that lives in the same km pool.
+    gpu_batch->km = NULL;   // -> krealloc(NULL,...) in gpu_batch_add_task == system realloc
 
-    // Initial estimates only — gpu_batch_add_task grows these buffers (krealloc) if a
-    // batch needs more, so they can start modest instead of the old 9 MB/read (which
+    // Initial estimates only — gpu_batch_add_task grows these buffers if a batch
+    // needs more, so they can start modest instead of the old 9 MB/read (which
     // OOM-killed the host when many short reads packed into one anchor-capped batch).
     int estimated_tasks = n_reads * 512 + 1024;            // ~200 tasks/read avg; grows if exceeded
     size_t estimated_seq_size = (size_t)n_reads * (256ULL * 1024ULL) + (1ULL<<20);   // query+target bytes
@@ -1349,14 +1353,14 @@ static gpu_align_batch_t* gpu_align_batch_init(int n_reads, void *km)
     size_t estimated_cigar_size = estimated_cigar_bytes / sizeof(uint32_t); // Convert to uint32_t count
 
     gpu_batch->max_tasks = estimated_tasks;
-    gpu_batch->tasks = (gpu_align_task_t*)kcalloc(km, estimated_tasks, sizeof(gpu_align_task_t));
-    
+    gpu_batch->tasks = (gpu_align_task_t*)calloc(estimated_tasks, sizeof(gpu_align_task_t));
+
     gpu_batch->seq_buffer_size = estimated_seq_size;
-    gpu_batch->seq_buffer = (uint8_t*)kmalloc(km, estimated_seq_size);
-    
+    gpu_batch->seq_buffer = (uint8_t*)malloc(estimated_seq_size);
+
     gpu_batch->cigar_buffer_size = estimated_cigar_size;  // Now in uint32_t count, not bytes!
-    gpu_batch->cigar_buffer = (uint32_t*)kmalloc(km, estimated_cigar_bytes); 
-	
+    gpu_batch->cigar_buffer = (uint32_t*)malloc(estimated_cigar_bytes);
+
     gpu_batch->n_reads = n_reads;
     gpu_batch->read_ctxs = (read_align_ctx_t*)kcalloc(km, n_reads, sizeof(read_align_ctx_t));
 
@@ -2334,9 +2338,9 @@ static void flush_r2_carry_pool(r2_carry_pool_t *pool, step_t *s, int stream_id)
     for (int i = 0; i < n; i++)
         finalize_one_read_gpu(s, gpu_batch, i, pool->reads, i, km);
 
-    kfree(km, gpu_batch->tasks);
-    kfree(km, gpu_batch->seq_buffer);
-    kfree(km, gpu_batch->cigar_buffer);
+    free(gpu_batch->tasks);          // system-allocated (see gpu_align_batch_init)
+    free(gpu_batch->seq_buffer);
+    free(gpu_batch->cigar_buffer);
     kfree(km, gpu_batch->read_ctxs);
     kfree(km, gpu_batch);
 
@@ -2381,9 +2385,9 @@ static void flush_retry_pool(retry_pool_t *pool, step_t *s, int stream_id) {
     for (int i = 0; i < n; i++)
         finalize_one_read_gpu(s, gpu_batch, i, pool->reads, i, km);
 
-    kfree(km, gpu_batch->tasks);
-    kfree(km, gpu_batch->seq_buffer);
-    kfree(km, gpu_batch->cigar_buffer);
+    free(gpu_batch->tasks);          // system-allocated (see gpu_align_batch_init)
+    free(gpu_batch->seq_buffer);
+    free(gpu_batch->cigar_buffer);
     kfree(km, gpu_batch->read_ctxs);
     kfree(km, gpu_batch);
 
@@ -2508,9 +2512,9 @@ static void prepare_align_batch_gpu(mm_batch_trbuf_t *batch, mm_tbuf_t *b, step_
 
     if (has_retry) free(has_retry);
 
-    kfree(batch->km, gpu_batch->tasks);
-    kfree(batch->km, gpu_batch->seq_buffer);
-    kfree(batch->km, gpu_batch->cigar_buffer);
+    free(gpu_batch->tasks);          // system-allocated (see gpu_align_batch_init)
+    free(gpu_batch->seq_buffer);
+    free(gpu_batch->cigar_buffer);
     kfree(batch->km, gpu_batch->read_ctxs);
     kfree(batch->km, gpu_batch);
 

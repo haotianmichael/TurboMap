@@ -1,0 +1,9 @@
+[submodule "lib/simde"]
+	path = lib/simde
+	url = https://github.com/nemequ/simde.git
+[submodule "cJSON"]
+	path = cJSON
+	url = https://github.com/DaveGamble/cJSON.git
+[submodule "external/CUDASW4"]
+	path = external/CUDASW4
+	url = https://github.com/asbschmidt/CUDASW4.git

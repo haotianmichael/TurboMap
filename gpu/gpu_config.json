@@ -1,0 +1,28 @@
+{
+    "num_streams": 1,
+    "//num_streams": "Number of GPU streams. Memory auto-scales from actual VRAM.",
+    "min_n": 512,
+    "//min_n": "queries with less anchors will be handled on cpu",
+    "long_cigar_batch": 0,
+    "//long_cigar_batch": "Long-task CIGAR buffer cap. 0=auto (formula-derived, recommended). Set e.g. 1024 only to reduce VRAM for CIGAR at the cost of more kernel launches.",
+    "max_align_task_len": 10000,
+    "//max_align_task_len": "Max sequence length per alignment task (query or target). All KSW buffers scale linearly with this value. Reduce to e.g. 10000 if gap-fills/extensions are short to increase concurrent slots.",
+    "range_kernel": {
+        "blockdim": 512,
+        "cut_check_anchors": 10,
+        "//cut_check_anchors": "Number of anchors to check to attemp a cut",
+        "anchor_per_block": 32768,
+        "//anchor_per_block": "Number of anchors each block handle. Must be int * blockdim"
+    },
+    "score_kernel": {
+        "micro_batch": 4,
+        "//micro_batch": "Number of micro batches to aggregate into one long kernel. Make sure your host memory size is at least micro_batch * device mem size * 2",
+        "mid_blockdim": 512,
+        "short_griddim": 2688,
+        "long_griddim": 144,
+        "//long_griddim": "To achieve the best occupancy for the long kernel, long_griddim is usually optimal at 2* No. of CUs ",
+        "mid_griddim": 2688,
+        "long_seg_cutoff": 20,
+        "mid_seg_cutoff": 3
+    }
+}
